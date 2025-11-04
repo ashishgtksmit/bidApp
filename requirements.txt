@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic 
+python-dotenv 
+mysql-connector-python 
+requests
+pymysql
+email-validator
+httpx
+aiosmtplib
+Pillow
+pyjwt[crypto]
+python-jose[cryptography]
+passlib[bcrypt]
