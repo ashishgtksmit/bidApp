@@ -1,1 +1,1 @@
-# bidApp_python
+# bidApp
