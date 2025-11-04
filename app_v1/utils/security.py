@@ -33,6 +33,8 @@ def verify_and_update_password(plain: str, hashed: str):
     """
     try:
         ok, new_hash = pwd_context.verify_and_update(plain, hashed)
+        print(ok)
+        print(new_hash)
         return ok, new_hash
     except (ValueError, UnknownHashError):
         # Legacy plaintext fallback – ONLY if you knowingly had plaintext stored.

@@ -16,7 +16,8 @@ from fastapi.responses import JSONResponse
 # 🔐 ADDED: to customize Swagger/OpenAPI so it knows about Bearer + X-Client-Id
 from fastapi.openapi.utils import get_openapi
 
-app = FastAPI(title="OpenBid",dependencies=[Depends(get_current_user_id)])
+# app = FastAPI(title="OpenBid",dependencies=[Depends(get_current_user_id)])
+app = FastAPI(title="OpenBid")
 
 app.include_router(auth_router, tags=['Auth'])
 app.include_router(location_router, tags=['Location'])
