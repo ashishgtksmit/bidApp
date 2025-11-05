@@ -25,7 +25,7 @@ from ..crud.bid import delete_bid_with_bid
 
 def get_all_open_requests(db : Session):
     try:
-        with db.begin():
+        # with db.begin():
             request_status = 'BID - OPEN'
             requests = db.query(Request).filter(Request.requestStatus == request_status).all()
             if not requests : 
