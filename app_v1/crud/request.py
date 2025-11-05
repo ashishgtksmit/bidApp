@@ -51,8 +51,9 @@ def get_all_open_requests(db : Session):
                 NOOFBIDS=req.noOfBids,
                 TABLETIMESTAMP=req.tableTimestamp
             ) for req in requests]
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
         db.rollback()
+        print(str(e))
         return NoBidsResponse(message="ERROR_PREPARE")
     finally:
         db.close()
