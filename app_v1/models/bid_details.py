@@ -2,7 +2,8 @@ from sqlalchemy import Column, BigInteger, ForeignKey, DECIMAL,String,TIMESTAMP,
 from ..database import Base
 
 class BidDetail(Base):
-    __tablename__ = 'bidDetails'
+    # __tablename__ = 'bidDetails'
+    __tablename__ = 'biddetails'
 
     BID = Column(BigInteger, primary_key=True, autoincrement=True)
     rID = Column(BigInteger, ForeignKey("requestTable.RID"), nullable=False)

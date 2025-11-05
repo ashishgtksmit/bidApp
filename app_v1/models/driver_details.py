@@ -3,7 +3,8 @@ from ..database import Base
 
 
 class DriverDetail(Base):
-    __tablename__ = 'driverDetails'
+    # __tablename__ = 'driverDetails'
+    __tablename__ = 'driverdetails'
     DDID = Column(BigInteger, autoincrement=True, primary_key=True)
     userAppId = Column(String(10),nullable=False)
     driverName = Column(String(200),nullable=False)

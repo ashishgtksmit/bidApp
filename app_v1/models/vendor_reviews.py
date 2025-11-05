@@ -3,7 +3,8 @@ from ..database import Base
 
 
 class VendorReview(Base):
-    __tablename__ = 'vendorReviews'
+    # __tablename__ = 'vendorReviews'
+    __tablename__ = 'vendorreviews'
 
     VRID = Column(BigInteger, autoincrement=True, primary_key=True)
     customerAppId = Column(String(10), nullable=False)

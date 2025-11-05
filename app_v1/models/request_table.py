@@ -2,7 +2,8 @@ from sqlalchemy import Column, BigInteger, String, Date, Time, Integer, Boolean,
 from ..database import Base
 
 class Request(Base):
-    __tablename__ = 'requestTable'
+    # __tablename__ = 'requestTable'
+    __tablename__ = 'requesttable'
 
     RID = Column(BigInteger, primary_key=True, autoincrement=True)
     WIZZPNR = Column(String(20), nullable=True)

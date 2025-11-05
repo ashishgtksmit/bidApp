@@ -3,7 +3,8 @@ from ..database import Base
 
 
 class CustomerReview(Base):
-    __tablename__ = 'customerReviews'
+    # __tablename__ = 'customerReviews'
+    __tablename__ = 'customerreviews'
 
     CR = Column(BigInteger, primary_key=True, autoincrement=True)
     RID = Column(String(20), nullable=False)

@@ -3,7 +3,8 @@ from sqlalchemy import Column, BigInteger, Text, Integer, String, Date, TIMESTAM
 from ..database import Base
 
 class User(Base):
-    __tablename__ = "userTable"
+    # __tablename__ = "userTable"
+    __tablename__ = "usertable"
 
     UID = Column(BigInteger,primary_key=True,autoincrement=True)
     userAppId = Column(String(10),unique=True,nullable=False)
