@@ -17,7 +17,9 @@ DB_NAME = os.getenv("DB_NAME")
 # Build SQLAlchemy URL
 SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(SQLALCHEMY_DATABASE_URL,
+                       pool_pre_ping=True,
+    connect_args={"ssl": {"ca": "DigiCertGlobalRootG2.crt.pem"}},)
 SessionLocal = sessionmaker(autoflush=False, autocommit = False, bind=engine)
 Base = declarative_base()
 
