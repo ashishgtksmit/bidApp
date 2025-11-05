@@ -26,6 +26,7 @@ CA_PATH = APP_DIR.parent / "DigiCertGlobalRootG2.crt.pem"
 #     connect_args={"ssl": {"ca": "DigiCertGlobalRootG2.crt.pem"}},)
 
 assert Path(CA_PATH).exists(), f"CA file not found at {CA_PATH}"
+
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_pre_ping=True,
