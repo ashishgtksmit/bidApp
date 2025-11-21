@@ -1,12 +1,13 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
-from ..schemas.user_table import UserLogin,LoginResponseWithTokens,TokenPair
+from ..schemas.user_table import UserLogin,LoginResponseWithTokens,TokenPair,UserCreate
 from ..utils.common import EmailErrorResponse
 from ..models.user_table import User
 from ..utils.security import verify_and_update_password
 from ..auth.jwt import create_token,decode_token,ACCESS_TOKEN_EXPIRE_MINUTES
 from typing import Optional
+from datetime import date, datetime
 
 # app_v1/crud/auth.py  (your file, patched)
 
@@ -187,5 +188,62 @@ def refresh_tokens(
     except Exception:
         db.rollback()
         return EmailErrorResponse(message="INVALID_REFRESH_TOKEN")
+    finally:
+        db.close()
+
+def insert_user(db : Session, user_data : UserCreate):
+    try:
+        with db.begin():
+            # Check for Existing User
+            existing_user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
+            if existing_user:
+                return EmailErrorResponse(message="USER ALREADY PRESENT")
+            
+            #Set Defaults
+            dob = user_data.dob if user_data.dob else date.today()
+            gender = user_data.gender if user_data.gender and user_data.gender.strip() != "" else "Male"
+            joining_date = date.today()
+            new_user = User(
+                userAppId = user_data.userAppId,
+                password = user_data.password,
+                alternateNumber=user_data.alternateNumber,
+                fullName=user_data.fullName,
+                dob=dob,
+                city=user_data.city,
+                gender=gender,
+                custSignUpDate=joining_date,
+                emailId=user_data.emailId,
+                rating=user_data.rating,
+                totalNoOfReviews=user_data.totalCustomerRevies,
+                alsoVendor=False,
+                vendorApproved=False,
+                lockApp=False,
+                tableTimestamp=datetime.now()
+            )
+
+            db.add(new_user)
+            db.commit()
+
+            return EmailErrorResponse(message="INSERTED")
+
+    except SQLAlchemyError as e:
+        print(str(e))
+        db.rollback()
+        return EmailErrorResponse(message="ERROR")
+    finally:
+        db.close()
+
+def update_password(db:Session, user_app_id : int, password : str):
+    try:
+        update = db.query(User).filter(User.userAppId == user_app_id).update({
+            User.password:password
+        })
+        db.commit()
+        if update == 0:
+            return EmailErrorResponse(message="FAILED")        
+        return EmailErrorResponse(message="UPDATED")
+    except SQLAlchemyError:
+        db.rollback()
+        return EmailErrorResponse(message="ERROR")
     finally:
         db.close()

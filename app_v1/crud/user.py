@@ -11,7 +11,7 @@ from ..models.car_details import CarDetail
 from ..models.car_type_details import CarTypeDetail
 from ..models.tags_table import Tag
 from ..schemas.user_table import (NoUserResponse,BidderDetail,UserBankDetailsResponse,
-                                  UserCreate,LogoutResponse,UserDelete,UserBankDetailsUpdate,
+                                  LogoutResponse,UserDelete,UserBankDetailsUpdate,
                                   UserImageUpload,VendorUpdate,VendorResponse,VendorKycCreate, 
                                   UpdateRequestTypeSelectionsRequest,UpdateRegionCitySelectionsRequest,
                                   RequestTypeResponse,GetUserDetailsResponse)
@@ -273,20 +273,6 @@ def get_user_bank_details(db:Session, userappid : int):
     finally:
         db.close()
     
-def update_password(db:Session, user_app_id : int, password : str):
-    try:
-        update = db.query(User).filter(User.userAppId == user_app_id).update({
-            User.password:password
-        })
-        db.commit()
-        if update == 0:
-            return ErrorResponse(message="FAILED")        
-        return ErrorResponse(message="UPDATED")
-    except SQLAlchemyError:
-        db.rollback()
-        return ErrorResponse(message="ERROR")
-    finally:
-        db.close()
     
 def fcm_token_update(db:Session, user_app_id : int, fcm_token : int):
     try:
@@ -304,47 +290,6 @@ def fcm_token_update(db:Session, user_app_id : int, fcm_token : int):
     finally:
         db.close()
 
-def insert_user(db : Session, user_data : UserCreate):
-    try:
-        with db.begin():
-            # Check for Existing User
-            existing_user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
-            if existing_user:
-                return ErrorResponse(message="USER ALREADY PRESENT")
-            
-            #Set Defaults
-            dob = user_data.dob if user_data.dob else date.today()
-            gender = user_data.gender if user_data.gender and user_data.gender.strip() != "" else "Male"
-            joining_date = date.today()
-            new_user = User(
-                userAppId = user_data.userAppId,
-                password = user_data.password,
-                alternateNumber=user_data.alternateNumber,
-                fullName=user_data.fullName,
-                dob=dob,
-                city=user_data.city,
-                gender=gender,
-                custSignUpDate=joining_date,
-                emailId=user_data.emailId,
-                rating=user_data.rating,
-                totalNoOfReviews=user_data.totalCustomerRevies,
-                alsoVendor=False,
-                vendorApproved=False,
-                lockApp=False,
-                tableTimestamp=datetime.now()
-            )
-
-            db.add(new_user)
-            db.commit()
-
-            return ErrorResponse(message="INSERTED")
-
-    except SQLAlchemyError as e:
-        print(str(e))
-        db.rollback()
-        return ErrorResponse(message="ERROR")
-    finally:
-        db.close()
     
 # def login_user(db:Session, login_data : UserLogin):
 #     try:

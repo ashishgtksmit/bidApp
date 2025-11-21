@@ -8,7 +8,7 @@ from typing import Union, List
 from ..database import get_db
 from sqlalchemy.orm import Session
 from ..crud.user import (get_user_details,check_user,get_all_vendors,get_vendor_by_rid,
-                         get_user_bank_details,update_password,fcm_token_update,insert_user,logout_user,
+                         get_user_bank_details,fcm_token_update,logout_user,
                          delete_user,update_vendor_bank_details,profile_image_upload,get_users_all,vendor_update,
                          vendor_update_with_kyc,update_request_type_selections,update_region_city_selections,
                          get_request_type_selections)
@@ -59,23 +59,12 @@ def read_user_bank_account(db:Session = Depends(get_db),
                            userAppId : str = Query(...)):
     return get_user_bank_details(db,userappid=userAppId)
 
-@router.put("/updatepassword",response_model=ErrorResponse)
-def user_update_password(db:Session=Depends(get_db), 
-                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                         userAppId : int = Query(...), password : str = Query(...)):
-    return update_password(db,user_app_id=userAppId,password=password)
 
 @router.put("/fcmtokenupdate",response_model=ErrorResponse)
 def user_fcm_token_udpate(db:Session=Depends(get_db), 
                           user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
                           userAppId : int = Query(...), fcmToken : str = Query(...)):
     return fcm_token_update(db,user_app_id=userAppId,fcm_token=fcmToken)
-
-@router.post("/insertuser",response_model=ErrorResponse)
-def create_user(user_data:UserCreate, db:Session=Depends(get_db),
-                user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                ):
-    return insert_user(db,user_data)
 
 # @router.post("/login",response_model=Union[LoginResponse,ErrorResponse])
 # def login_user_endpoint(login_data:UserLogin, db:Session=Depends(get_db)):
