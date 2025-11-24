@@ -128,15 +128,18 @@ def send_notification(
             },
             "apns": {
                 "payload": {
-                    "aps": {
-                        "alert": {
-                            "title": title,
-                            "body": body
-                        },
-                        "sound": f"{sound_file}.caf",
-                        "category": "customCategory",
-                        "custom_data": common_data
+                    "aps":{
+                        "content-available":1
                     }
+                    # "aps": {
+                    #     "alert": {
+                    #         "title": title,
+                    #         "body": body
+                    #     },
+                    #     "sound": f"{sound_file}.caf",
+                    #     "category": "customCategory",
+                    #     "custom_data": common_data
+                    # }
                 },
                 "headers": {
                     "apns-priority": "10"
