@@ -167,12 +167,11 @@ def delete_car_by_id(db: Session, car_data : CarDetailsDelete):
              #Send Email 
             ist_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             registration_doc_html = f'<a href="{html.escape(car_details["registrationDoc"])}" target="_blank">{html.escape(car_details["registrationDoc"])}</a>' if car_details["registrationDoc"] else '<span class="muted">Not provided</span>'
-            power_of_attorney_html = f'<a href="{html.escape(car_details["powerOfAttorneyDoc"])}" target="_blank">{html.escape(car_details["powerOfAttorneyDoc"])}</a>' if car_details["powerOfAttorneyDoc"] else '<span class="muted">Not provided</span>'
-            # reason_html = f'<div class="code">{html.escape(car_data.reason.replace("\n", "<br>"))}</div>' if car_data.reason else '<span class="muted">Not provided</span>'
+            power_of_attorney_html = f'<a href="{html.escape(car_details["powerOfAttorneyDoc"])}" target="_blank">{html.escape(car_details["powerOfAttorneyDoc"])}</a>' if car_details["powerOfAttorneyDoc"] else '<span class="muted">Not provided</span>'            
             if car_data.reason:
-                # Convert newlines to <br> and escape HTML
-                safe_reason = html.escape(car_data.reason.replace("\n", "<br>"))
-                reason_html = '<div class="code">{}</div>'.format(safe_reason)
+                reason_text = car_data.reason.replace("\n", "<br>")
+                safe_reason = html.escape(reason_text)
+                reason_html = f'<div class="code">{safe_reason}</div>'
             else:
                 reason_html = '<span class="muted">Not provided</span>'
             deleted_by_html = html.escape(car_data.deletedBy) if car_data.deletedBy else '<span class="muted">Not provided</span>'
