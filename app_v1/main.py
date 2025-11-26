@@ -12,6 +12,7 @@ from .database import Base, engine
 import traceback
 from .auth.deps import get_current_user_id
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # 🔐 ADDED: to customize Swagger/OpenAPI so it knows about Bearer + X-Client-Id
 from fastapi.openapi.utils import get_openapi
@@ -28,6 +29,14 @@ app.include_router(bid_router, tags=['Bids'])
 app.include_router(user_router, tags=['User'])
 app.include_router(driver_router, tags=['Driver'])
 app.include_router(utils_router, tags=['Utilities'])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # only for dev!
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 Base.metadata.create_all(bind=engine)
 
