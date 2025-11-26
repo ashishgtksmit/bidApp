@@ -345,5 +345,19 @@ class LoginResponseWithTokens(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+
+# -------- NEW: used only for WebSocket auth -------- #
+
+class WsAuthRequest(BaseModel):
+    token: str        # access token
+    client_id: str    # X-Client-Id
+    flag: str         # "Customer" or "Vendor"
+
+
+class WsAuthResponse(BaseModel):
+    appid: str        # userAppId / phone (comes from DB, not client)
+    flag: str         # normalized "Customer" / "Vendor"
+    exp: int          # unix timestamp from JWT
     
 
