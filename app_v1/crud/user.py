@@ -32,6 +32,52 @@ import re
 import os
 import html
 
+def _vendor_rating_float(rating) -> float | None:
+    if rating is None:
+        return None
+    try:
+        return float(rating)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_get_user_details_response(user: User, *, include_timestamp: bool = False) -> GetUserDetailsResponse:
+    """Map a User ORM row to the authenticated session profile contract (PR6)."""
+    also_vendor = bool(getattr(user, "alsoVendor", False))
+    vendor_rating = _vendor_rating_float(user.rating) if also_vendor else None
+    total_vendor_rating = user.totalNoOfReviews if also_vendor else None
+
+    payload = dict(
+        USERAPPID=user.userAppId,
+        ALTERNATEMNUM=user.alternateNumber or "",
+        FULLNAME=user.fullName,
+        EMAILID=user.emailId,
+        EMAIL=user.emailId,
+        DOB=user.dob,
+        CITY=user.city,
+        GENDER=user.gender,
+        PROFILEPIC=user.profilePicture,
+        # Legacy fields: vendor rating columns (do not use as customer rating).
+        RATING=_vendor_rating_float(user.rating),
+        TOTALREVIEWS=user.totalNoOfReviews,
+        CUSTOMERRATING=(
+            str(user.customerRating)
+            if user.customerRating is not None
+            else None
+        ),
+        TOTALCUSTOMERRATING=user.totalCustomerReviews,
+        VENDORRATING=vendor_rating,
+        TOTALVENDORRATING=total_vendor_rating,
+        FCMTOKEN=user.fcmToken,
+        USERLOGINSTATUS=user.user_login_status,
+        ALSOVENDOR=also_vendor,
+        VENDOR=also_vendor,
+    )
+    if include_timestamp:
+        payload["TABLETIMESTAMP"] = user.tableTimestamp
+    return GetUserDetailsResponse(**payload)
+
+
 def get_users_all(db:Session):
     try:
         with db.begin():
@@ -39,47 +85,24 @@ def get_users_all(db:Session):
             if not users:
                 return NoUserResponse(message="NO_USER")           
 
-            return [GetUserDetailsResponse(
-                USERAPPID=user.userAppId,
-                ALTERNATEMNUM=user.alternateNumber,
-                FULLNAME=user.fullName,
-                EMAILID=user.emailId,
-                DOB=user.dob,
-                CITY=user.city,
-                GENDER=user.gender,
-                PROFILEPIC=user.profilePicture,
-                RATING=user.rating,
-                TOTALREVIEWS=user.totalNoOfReviews,
-                FCMTOKEN=user.fcmToken,
-                USERLOGINSTATUS=user.user_login_status,
-                TABLETIMESTAMP=user.tableTimestamp
-            )for user in users]
+            return [
+                _to_get_user_details_response(user, include_timestamp=True)
+                for user in users
+            ]
     except SQLAlchemyError as e : 
         db.rollback()
         return EmailErrorResponse(message="ERROR_",error=str(e))
     finally:
         db.close()
     
-def get_user_details(db: Session, userAppId : int):
+def get_user_details(db: Session, userAppId : str):
     try:
-        users = db.query(User).filter(User.userAppId == userAppId).all()
+        users = db.query(User).filter(User.userAppId == str(userAppId).strip()).all()
 
         if not users:
             return NoUserResponse(message="NO REGISTERED")
         
-        return [GetUserDetailsResponse(
-            ALTERNATEMNUM=user.alternateNumber,
-            FULLNAME=user.fullName,
-            EMAILID=user.emailId,
-            DOB=user.dob,
-            CITY=user.city,
-            GENDER=user.gender,
-            PROFILEPIC=user.profilePicture,
-            RATING=user.rating,
-            TOTALREVIEWS=user.totalNoOfReviews,
-            FCMTOKEN=user.fcmToken,
-            USERLOGINSTATUS=user.user_login_status
-        ) for user in users]
+        return [_to_get_user_details_response(user) for user in users]
     except SQLAlchemyError:
         return ErrorResponse(message="ERROR_PREPARE")
     finally:

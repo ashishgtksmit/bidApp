@@ -34,6 +34,7 @@ class CarTypeDetailResponse(BaseModel):
     CARTYPE: str
     CARSUBTYPE:str
     CAPACITY:str
-    IMAGEURL:str
+    # Nullable for legacy rows / Flutter null-safe image rendering.
+    IMAGEURL: Optional[str] = None
 
     model_config = {"from_attributes": True}

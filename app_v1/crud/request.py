@@ -391,9 +391,7 @@ def get_all_open_requests_for_vendor(db: Session, vendor_id : int):
 def get_request_type(db:Session):
     try:
         types = db.query(RequestType).all()
-        if not types:
-            return ErrorResponse(message="NO_REQUEST_TYPES_FOUND")
-        return [RequestTypeBase.from_orm(type) for type in types]
+        return [RequestTypeBase.model_validate(type) for type in types]
     except SQLAlchemyError:
         return ErrorResponse(message="ERROR_PREPARE")
     finally:

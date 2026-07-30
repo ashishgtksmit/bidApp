@@ -30,4 +30,24 @@ Public check / OTP endpoints use DB table `api_rate_limit_buckets` (multi-instan
 ```bash
 OTP_TEST_BYPASS_SMS=1 OTP_TEST_FIXED_OTP=1234 \
   python -m pytest tests/test_pr5_otp_reset.py -q
+
+python -m pytest tests/test_pr6_getuserdetails.py -q
 ```
+
+## PR6 — GET /getuserdetails session profile contract
+
+Authenticated cold-start / session refresh uses `GET /getuserdetails?userAppId=`.
+
+| Field | Semantics |
+|-------|-----------|
+| `USERAPPID` | Canonical app user id / phone |
+| `FULLNAME`, `EMAILID` / `EMAIL`, `DOB`, `CITY`, `GENDER`, `PROFILEPIC` | Profile fields for session rebuild |
+| `ALSOVENDOR` / `VENDOR` | Whether the user can operate in vendor mode |
+| `CUSTOMERRATING`, `TOTALCUSTOMERRATING` | Passenger / customer ratings |
+| `VENDORRATING`, `TOTALVENDORRATING` | Vendor ratings (`null` for non-vendors) |
+
+`RATING` / `TOTALREVIEWS` remain for legacy consumers and mirror **vendor** rating columns. Do **not** overload `RATING` as customer rating when explicit customer/vendor fields are present.
+
+Missing user → `{ "message": "NO REGISTERED" }`.
+
+FCM: `POST /login` persists `fcmToken`; authenticated `PUT /fcmtokenupdate` also runs server-side topic subscription.

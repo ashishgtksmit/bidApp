@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from ..models.location_details import LocationDetail
-from ..schemas.location_details import Location,CityDetail,RegionDetail,LocationResponse
+from ..schemas.location_details import CityDetail,RegionDetail,LocationResponse
 from ..schemas.user_table import NoUserResponse
 from ..models.city_list import City
 from ..schemas.city_list import CityListDetail
@@ -9,7 +9,6 @@ from ..models.region_details import Region
 from ..schemas.region_details import RegionDetailBase
 from ..utils.common import ErrorResponse
 from ..models.user_table import User
-from ..models.region_details import Region
 
 
 def get_all_locations(db:Session):
@@ -20,9 +19,9 @@ def get_all_locations(db:Session):
                 LocationDetail.location,
                 LocationDetail.location_shortCode,
                 LocationDetail.regionId,
-                RegionDetail.REGION_NAME
+                Region.regionName
             )
-            .outerjoin(RegionDetail, LocationDetail.regionId == RegionDetail.RDID)
+            .outerjoin(Region, LocationDetail.regionId == Region.RDID)
             .order_by(LocationDetail.location.asc())
             .all()
         )
@@ -41,7 +40,7 @@ def get_all_locations(db:Session):
 
 def get_all_cities(db:Session):
     try:
-        cities = db.query(City).all().order_by(City.cities.asc())
+        cities = db.query(City).order_by(City.cities.asc()).all()
         return [CityListDetail(
             CITYID=city.CLID,
             CITY=city.cities,
@@ -57,9 +56,6 @@ def get_all_regions(db:Session):
             Region.regionName
         ).all()
 
-        if not regions:
-            return NoUserResponse(message="NO_REGIONS")
-        
         return [RegionDetailBase(
             regionId=region_id,
             regionName=region_name

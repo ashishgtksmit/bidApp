@@ -317,19 +317,36 @@ class RequestTypeResponse(TrimmedBaseModel):
 
 
 class GetUserDetailsResponse(TrimmedBaseModel):
+    """Authenticated profile row for GET /getuserdetails (and related list endpoints).
+
+    Session-critical fields (PR6):
+    - USERAPPID: canonical app user id / phone
+    - ALSOVENDOR / VENDOR: whether the user can operate in vendor mode
+    - CUSTOMERRATING / TOTALCUSTOMERRATING: passenger ratings
+    - VENDORRATING / TOTALVENDORRATING: vendor ratings (null for non-vendors)
+
+    Do not overload RATING for both customer and vendor ratings.
+    RATING / TOTALREVIEWS remain for legacy consumers and mirror vendor rating columns.
+    """
     USERAPPID : Optional[str] = None
-    ALTERNATEMNUM:str
+    ALTERNATEMNUM:Optional[str] = None
     FULLNAME:str
     EMAILID:EmailStr
+    EMAIL:Optional[EmailStr] = None
     DOB:str
     CITY:str
     GENDER:Optional[str] = None
     PROFILEPIC:Optional[str] = None
-    RATING:float
-    TOTALREVIEWS:int
+    RATING:Optional[float] = None
+    TOTALREVIEWS:Optional[int] = None
+    CUSTOMERRATING:Optional[str] = None
+    TOTALCUSTOMERRATING:Optional[int] = None
+    VENDORRATING:Optional[float] = None
+    TOTALVENDORRATING:Optional[int] = None
     FCMTOKEN:Optional[str] = None
     USERLOGINSTATUS:Optional[str] = None
     ALSOVENDOR:Optional[bool] = None
+    VENDOR:Optional[bool] = None
     TABLETIMESTAMP:Optional[datetime] = None
 
     model_config = {
