@@ -51,3 +51,21 @@ Authenticated cold-start / session refresh uses `GET /getuserdetails?userAppId=`
 Missing user → `{ "message": "NO REGISTERED" }`.
 
 FCM: `POST /login` persists `fcmToken`; authenticated `PUT /fcmtokenupdate` also runs server-side topic subscription.
+
+## PR8 — POST /insertrequest (create request)
+
+| Rule | Behaviour |
+|------|-----------|
+| Auth | Bearer JWT + `X-Client-Id` |
+| Ownership | Body `customerAppId` must equal JWT `sub`; mismatch → **HTTP 403**; persisted id is always JWT `sub` |
+| Status | Forced `BID - OPEN` (client `requestStatus` ignored) |
+| `requestType` | Defaults to **1** when omitted |
+| Duplicate | Open requests only (`requestStatus == "BID - OPEN"`) → `REQUEST_ALREADY_PRESENT` |
+| `tableTimestamp` | `Asia/Kolkata` (naive local wall clock stored) |
+| Notify | `notify=True`; background task opens its own `SessionLocal()` (not the request-scoped session) |
+| Response | `{ "message": "INSERTED" \| "REQUEST_ALREADY_PRESENT" \| "CUSTOMER_NOT_FOUND" \| "ERROR_INSERT" }` — **no RID** |
+| Errors | Internal SQL exception strings are not returned to clients |
+
+```bash
+python -m pytest tests/test_pr8_insertrequest.py -q
+```

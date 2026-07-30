@@ -145,7 +145,8 @@ def create_new_request(create_data : RequestCreate, background_taks : Background
                        db:Session = Depends(get_db),
                        user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
                        ):
-    return create_request(db,create_data,background_taks)
+    # JWT sub is authoritative customerAppId — ownership enforced inside create_request
+    return create_request(db, create_data, background_taks, user_id=user_id)
 
 @router.put("/updatedrivertorequest",response_model=EmailErrorResponse)
 def driver_assign_to_request(request_data : AssignDriverRequest, db:Session=Depends(get_db),

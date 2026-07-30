@@ -2,7 +2,9 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime,timedelta
-from fastapi import BackgroundTasks
+from typing import Optional
+from zoneinfo import ZoneInfo
+from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -1155,13 +1157,28 @@ def create_request(
     db: Session,
     create_data: RequestCreate,
     background_tasks: BackgroundTasks,
+    user_id: Optional[str] = None,
     notify: bool = True,
     emit: bool = True,
 ):
     """
     Create a new request in requestTable.
+
+    When ``user_id`` is provided (JWT ``sub`` from POST /insertrequest),
+    body ``customerAppId`` must match; persisted identity is always the JWT sub.
     """
     try:
+        # 0) Ownership: JWT sub is authoritative when provided by the endpoint
+        if user_id is not None:
+            body_customer = (create_data.customerAppId or "").strip()
+            if not body_customer or body_customer != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Customer identity does not match authenticated user",
+                )
+            persisted_customer_id = user_id
+        else:
+            persisted_customer_id = create_data.customerAppId
 
         request_status = "BID - OPEN"
         ac_request = bool(create_data.acRequest)
@@ -1171,12 +1188,12 @@ def create_request(
 
         # 1) Validate customer exists
         existing_customer = db.query(User).filter(
-            User.userAppId == create_data.customerAppId
+            User.userAppId == persisted_customer_id
         ).first()
         if not existing_customer:
             return EmailErrorResponse(message="CUSTOMER_NOT_FOUND")
 
-        # 2) Check duplicate
+        # 2) Check duplicate (open requests only — do not block reopen flows)
         existing_request = db.query(Request).filter(
             Request.fromLocation == create_data.fromLocation.strip(),
             Request.toLocation == create_data.toLocation.strip(),
@@ -1208,24 +1225,17 @@ def create_request(
             specialRequest=create_data.specialRequest.strip() if create_data.specialRequest else None,
             bidEndTime=create_data.bidEndTime,
             requestStatus=request_status,
-            customerAppId=create_data.customerAppId,
+            customerAppId=persisted_customer_id,
             requestType=request_type,
-            tableTimestamp=datetime.now()
+            tableTimestamp=datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None),
         )
 
         db.add(new_request)
         db.commit()
         db.refresh(new_request)
 
-        # 4) Background notification (optional)
+        # 4) Background notification (optional). Task opens its own DB session.
         if notify:
-            # background_tasks.add_task(
-            #     send_notification_to_all_vendors,
-            #     "🚖 New Cab Request Alert! 🚖",
-            #     f"A customer has just created a new cab request from {create_data.fromLocation} to {create_data.toLocation}! 🏁💨 Submit your bid now and secure the ride.",
-            #     "passenger_notification",
-            #     "alarm_notification",
-            # )
             vendor_ids = get_vendors_for_request(
                 db,
                 create_data.fromLocation,
@@ -1239,12 +1249,15 @@ def create_request(
                     create_data,
                 )
 
-        # If your model has an RID (auto or generated), include it in the response
-        return EmailErrorResponse(message="INSERTED", RID=getattr(new_request, "RID", None))
+        # RID is not part of EmailErrorResponse schema — message only for clients
+        return EmailErrorResponse(message="INSERTED")
 
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_INSERT", error=str(e))
+        print(f"[create_request] ERROR_INSERT: {e}")
+        return EmailErrorResponse(message="ERROR_INSERT")
     finally:
         db.close()
 

@@ -620,11 +620,17 @@ def notify_driver_assigned_to_customer(
     return result
 
 
-def notify_vendors_for_request(vendor_ids: List[str], create_data, db: Session) -> None:
+def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
     """
     Notify selected vendors about a newly created request.
-    Intended for background task use.
+
+    Intended for background task use. Creates and closes its own DB session so
+    it does not depend on the request-scoped SQLAlchemy session lifetime.
+    Notification failures are logged and must not affect the committed request.
     """
+    from ..database import SessionLocal
+
+    db = SessionLocal()
     try:
         if not vendor_ids:
             return
@@ -642,7 +648,8 @@ def notify_vendors_for_request(vendor_ids: List[str], create_data, db: Session) 
         )
 
         send_notification_to_selected_users(db, notification_data)
-
+    except Exception as e:
+        print(f"[FCM ERROR] notify_vendors_for_request err={e}")
     finally:
         db.close()
 
