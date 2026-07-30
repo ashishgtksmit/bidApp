@@ -233,14 +233,37 @@ def insert_user(db : Session, user_data : UserCreate):
     finally:
         db.close()
 
-def update_password(db:Session, user_app_id : int, password : str):
+def update_password(
+        db: Session,
+        user_app_id: str,
+        password: str,
+        reset_token: str,
+):
+    """
+    Update password only when a valid one-time reset_token (from POST /verifyotp)
+    is presented. Direct callers without OTP proof are rejected.
+    """
+    from ..utils.otp import consume_reset_token
+
     try:
+        user_app_id = str(user_app_id).strip() if user_app_id is not None else ""
+        if not user_app_id:
+            return EmailErrorResponse(message="FAILED")
+
+        token_error = consume_reset_token(
+            db,
+            user_app_id=user_app_id,
+            reset_token=reset_token,
+        )
+        if token_error is not None:
+            return EmailErrorResponse(message=token_error)
+
         update = db.query(User).filter(User.userAppId == user_app_id).update({
-            User.password:password
+            User.password: password
         })
         db.commit()
         if update == 0:
-            return EmailErrorResponse(message="FAILED")        
+            return EmailErrorResponse(message="FAILED")
         return EmailErrorResponse(message="UPDATED")
     except SQLAlchemyError:
         db.rollback()

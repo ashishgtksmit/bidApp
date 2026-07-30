@@ -16,23 +16,52 @@ from ..utils.common import ErrorResponse,EmailErrorResponse
 from datetime import datetime
            
 
-def get_reviews_for_vendor(db: Session, vendor_id : str):
+def get_reviews_for_vendor(db: Session, vendor_id: str):
     try:
         reviews = db.query(
-            VendorReview, User.fullName, User.profilePicture,
-            Request.fromLocation,Request.fromLandmark,Request.toLocation,
-            Request.toLandmark,Request.pickUpDate,Request.pickUpTime,Request.noOfAdults,
-            Request.noOfKids,Request.carType,Request.acRequest,Request.carrierRequest,Request.specialRequest,
-            BidDetail.bidAmount,BidDetail.CARID,
-            CarDetail.carRegNo,CarDetail.carModel,CarDetail.carColor,CarDetail.ownerName,                       
-            CarTypeDetail.car_type, DriverDetail.driverName
-            
+            VendorReview,
+            User.fullName,
+            User.profilePicture,
+
+            # request
+            Request.fromLocation,
+            Request.fromLandmark,
+            Request.toLocation,
+            Request.toLandmark,
+            Request.pickUpDate,
+            Request.pickUpTime,
+            Request.noOfAdults,
+            Request.noOfKids,
+            Request.carType,
+            Request.acRequest,
+            Request.carrierRequest,
+            Request.specialRequest,
+
+            # bid
+            BidDetail.bidAmount,
+            BidDetail.CARID,
+
+            # car
+            CarDetail.carRegNo,
+            CarDetail.carModel,
+            CarDetail.modelYear,
+            CarDetail.carColor,
+            CarDetail.ownerName,
+
+            # car type
+            CarTypeDetail.car_type,
+
+            # driver
+            DriverDetail.driverName
+
         ).join(
             User, VendorReview.customerAppId == User.userAppId
         ).join(
             Request, Request.RID == VendorReview.RID
         ).outerjoin(
-            BidDetail, BidDetail.rID == VendorReview.RID
+            BidDetail,
+            (BidDetail.rID == VendorReview.RID) &
+            (BidDetail.bidderID == VendorReview.VENDORID)
         ).outerjoin(
             CarDetail, CarDetail.CARID == BidDetail.CARID
         ).outerjoin(
@@ -41,55 +70,95 @@ def get_reviews_for_vendor(db: Session, vendor_id : str):
             DriverDetail, DriverDetail.DDID == Request.driverAssignedID
         ).filter(
             VendorReview.VENDORID == vendor_id
-        ).order_by(VendorReview.VRID.desc()).all()
+        ).order_by(
+            VendorReview.VRID.desc()
+        ).all()
 
         if not reviews:
             return NoReviewResponse(message="NO REVIEWS FOUND")
-        
+
         return [
             ReviewDetail(
-                CUSTOMERID= review.customerAppId,
-                CUSTOMERNAME= full_name,
-                REQUESTID= review.RID,
+                CUSTOMERID=review.customerAppId,
+                CUSTOMERNAME=full_name,
+                REQUESTID=review.RID,
                 VENDORID=review.VENDORID,
+
                 DRIVERBEHAVIOUR=review.driverBehaviour,
                 PUNCTUALITY=review.punctuality,
                 CARCONDITION=review.carCondition,
                 CLEANLINESS=review.cleanliness,
                 REFRESHMENTS=review.refreshments,
                 COMMENTS=review.comments,
+
                 CUSTOMER_PROFILEPIC=profile_picture,
+
+                # request
                 REQ_FROMLOCATION=from_location,
-                REQ_FROMLANKDMARK=from_landmark,
+                REQ_FROMLANDMARK=from_landmark,
                 REQ_TOLOCATION=to_location,
                 REQ_TOLANDMARK=to_landmark,
                 REQ_PICKUPDATE=pickup_date,
                 REQ_PICKUPTIME=pickup_time,
                 REQ_NOOFADULTS=no_of_adults,
                 REQ_NOOFKIDS=no_of_kids,
-                REQ_CARTYPE=car_type,
+                REQ_CARTYPE=req_car_type,
                 REQ_ACREQUEST=ac_request,
                 REQ_CARRIERREQUEST=carrier_request,
                 REQ_SPECIALREQUEST=special_request,
+
+                # bid
                 BID_BIDAMOUNT=bid_amount,
                 BID_CARID=car_id,
+
+                # car
                 CAR_REGNO=car_reg_no,
                 CAR_MODEL=car_model,
+                CAR_MODELYEAR=model_year,
                 CAR_COLOR=car_color,
                 CAR_OWNERNAME=owner_name,
-                CARTYPE=car_type_other,
+
+                # car type
+                CARTYPE=car_type_label,
+
+                # driver
                 DRIVER_NAME=driver_name
-            ) for review, full_name, profile_picture,
-                from_location,from_landmark,to_location,to_landmark,pickup_date,pickup_time,no_of_adults,
-                no_of_kids,car_type,ac_request,carrier_request,special_request,bid_amount,car_id,car_reg_no,
-                car_model,car_color,owner_name,car_type_other,driver_name
-                
-                in reviews
+            )
+            for (
+                review,
+                full_name,
+                profile_picture,
+
+                from_location,
+                from_landmark,
+                to_location,
+                to_landmark,
+                pickup_date,
+                pickup_time,
+                no_of_adults,
+                no_of_kids,
+                req_car_type,
+                ac_request,
+                carrier_request,
+                special_request,
+
+                bid_amount,
+                car_id,
+
+                car_reg_no,
+                car_model,
+                model_year,
+                car_color,
+                owner_name,
+
+                car_type_label,
+                driver_name
+            ) in reviews
         ]
-    except SQLAlchemyError:
-        return NoReviewResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        return NoReviewResponse(message="ERROR_PREPARE", error=str(e))
 
 def get_reviews_for_customer(db : Session, customer_id : str):
     try:

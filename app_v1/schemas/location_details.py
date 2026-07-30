@@ -44,3 +44,10 @@ class RegionDetail(BaseModel):
 
     model_config={"from_attributes":True}
 
+
+class LocationResponse(BaseModel):
+    LOCATIONCODE: int
+    LOCATION: str
+    LOCATIONSHORTCODE: Optional[str] = None
+    REGIONID: int
+    REGIONNAME: Optional[str] = None

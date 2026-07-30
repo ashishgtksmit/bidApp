@@ -70,6 +70,9 @@ class BidDetail(BaseModel):
 
     # model_config = {"from_attributes":True}
 
-
+class UpdateCarIdForBidRequest(BaseModel):
+    BID : int
+    CARID : int
+    
 class NoBidResponse(BaseModel):
     message : str

@@ -117,6 +117,7 @@ def cancel_handshake_of_request(db:Session=Depends(get_db),
 def cancel_by_user(db:Session=Depends(get_db),
                    user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
                    RID : int = Query(...), 
+                   bidder_id : int = Query(...),
                    rejectionReason : str = Query(...)):
     return booking_cancelled_by_user(db,rid=RID,rejection_reason=rejectionReason)
 

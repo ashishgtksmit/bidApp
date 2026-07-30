@@ -1,8 +1,18 @@
 # project_root/api/endpoints/auth.py
-from fastapi import APIRouter, Depends, Header, Query, HTTPException, status
+from fastapi import APIRouter, Depends, Header, Query, HTTPException, Request, status
 from typing import Optional, Union
-from ..schemas.user_table import (UserLogin,LoginResponseWithTokens, TokenPair, 
-                                  RefreshRequest, UserCreate, WsAuthRequest, WsAuthResponse)
+import os
+from ..schemas.user_table import (
+    UserLogin,
+    LoginResponseWithTokens,
+    TokenPair,
+    RefreshRequest,
+    UserCreate,
+    WsAuthRequest,
+    WsAuthResponse,
+    OtpVerifyRequest,
+    OtpVerifyResponse,
+)
 from ..models.user_table import User
 from ..utils.common import ErrorResponse
 from ..database import get_db
@@ -10,6 +20,8 @@ from sqlalchemy.orm import Session
 from ..crud.auth import login_user_auth, refresh_tokens, insert_user, update_password
 from ..auth.deps import get_current_user_id
 from ..auth.jwt import decode_token
+from ..utils.otp import verify_otp_for_user
+from ..utils.rate_limit import client_ip_from_request, enforce_rate_limit
 
 
 router = APIRouter()
@@ -28,11 +40,58 @@ def login_user_endpoint(
 ):
     return login_user_auth(db=db, login_data=login_data, client_id=x_client_id)
 
-@router.put("/updatepassword",response_model=ErrorResponse)
-def user_update_password(db:Session=Depends(get_db), 
-                        #  user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                         userAppId : int = Query(...), password : str = Query(...)):
-    return update_password(db,user_app_id=userAppId,password=password)
+
+@router.post(
+    "/verifyotp",
+    response_model=Union[OtpVerifyResponse, ErrorResponse],
+)
+def verify_otp_endpoint(
+    request: Request,
+    body: OtpVerifyRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Public OTP verification (PR5).
+
+    On success returns OTP_VERIFIED + short-lived one-time reset_token.
+    Never returns the OTP itself.
+    """
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"verifyotp:ip:{client_ip_from_request(request)}",
+        max_hits=int(os.getenv("RATE_LIMIT_VERIFYOTP_PER_IP", "60")),
+        window_seconds=int(os.getenv("RATE_LIMIT_VERIFYOTP_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        return limited
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"verifyotp:user:{body.userAppId}",
+        max_hits=int(os.getenv("RATE_LIMIT_VERIFYOTP_PER_APPID", "20")),
+        window_seconds=int(os.getenv("RATE_LIMIT_VERIFYOTP_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        return limited
+    return verify_otp_for_user(db, user_app_id=body.userAppId, otp=body.otp)
+
+
+@router.put("/updatepassword", response_model=ErrorResponse)
+def user_update_password(
+    db: Session = Depends(get_db),
+    userAppId: str = Query(...),
+    password: str = Query(...),
+    resetToken: str = Query(..., description="One-time token from POST /verifyotp"),
+):
+    """
+    Password reset requires a valid resetToken issued by POST /verifyotp.
+    Direct API callers without OTP proof are rejected.
+    """
+    return update_password(
+        db,
+        user_app_id=userAppId,
+        password=password,
+        reset_token=resetToken,
+    )
 
 @router.post("/refresh", response_model=Union[TokenPair, ErrorResponse])
 def refresh_token_endpoint(

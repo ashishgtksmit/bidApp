@@ -23,6 +23,7 @@ class User(Base):
     fcmToken = Column(Text,nullable=True)
     joiningDate = Column(Date,nullable=True)
     custSignUpDate = Column(Date,nullable=True)
+    custNoOfTripsCompleted = Column(Integer,nullable=True)
     baseLocation = Column(String(200),nullable=True)
     user_login_status = Column(String(200),nullable=True)
     alsoVendor = Column(Boolean, nullable=False)

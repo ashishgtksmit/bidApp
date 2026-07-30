@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from typing import Optional,List,Union,Dict
+from typing import Literal, Optional,List,Union,Dict
 from datetime import date, datetime
 
 import re
@@ -137,6 +137,17 @@ class UserLogin(TrimmedBaseModel):
     userAppId : str
     password : str
     fcmToken : Optional[str] = None
+
+
+class OtpVerifyRequest(TrimmedBaseModel):
+    userAppId: str
+    otp: str
+
+
+class OtpVerifyResponse(TrimmedBaseModel):
+    message: str
+    reset_token: str
+
 
 class LoginResponse(TrimmedBaseModel):
     message : str
@@ -360,4 +371,128 @@ class WsAuthResponse(BaseModel):
     flag: str         # normalized "Customer" / "Vendor"
     exp: int          # unix timestamp from JWT
     
+
+class CustomerListItem(BaseModel):
+    UID :int
+    USERAPPID : int
+    ALTERNATENUMBER : Optional[str] = None
+    FULLNAME : Optional [str] = None
+    EMAILID : Optional [str] = None
+    DOB : Optional [str] = None
+    CITY : Optional [str] = None
+    GENDER : Optional [str] = None
+    PROFILEPICTURE : Optional[str] = None
+    CUSTOMERRATING : Optional[str] = None
+    TOTALCUSTOMERREVIEWS : Optional[str] = None
+    FCMTOKEN : Optional[str] = None
+    JOININGDATE : Optional[date] = None
+    CUSTSIGNUPDATE : Optional[int] = None
+    CUSTNOOFTRIPSCOMPLETED : Optional[int] = None
+    BASELOCATION : Optional[str] = None
+    USERLOGINSTATUS : Optional[str] = None
+    LOCKAPP : Optional[bool] = None
+    TABLETIMESTAMP : Optional[datetime] = None
+    model_config = {
+        "from_attributes": True,
+        "json_encoders": {
+            datetime: lambda v: v.strftime('%Y-%m-%d %H:%M:%S') if v else None
+        }
+    }
+
+class GetAllVendorsWithUnapprovedResponse(BaseModel):
+    UID : int
+    USERAPPID : Optional[str] = None
+    FULLNAME : Optional[str] = None
+    EMAILID : Optional[str] = None
+    ALTERNATENUMBER : Optional[str] = None
+    DOB : Optional[str] = None
+    GENDER: Optional[str] = None
+    PROFILEPICTURE: Optional[str] = None
+    RATING: Optional[float] = None
+    TOTALNOOFREVIEWS: Optional[int] = None
+    BASELOCATION: Optional[str] = None
+    USERLOGINSTATUS: Optional[int] = None
+    ALSOVENDOR: Optional[int] = None
+    VENDORAPPROVED: Optional[int] = None
+    LOCKAPP: Optional[int] = None
+    NOOFTRIPSCOMPLETED: Optional[int] = None
+    ADDRESS: Optional[str] = None
+    STATE: Optional[str] = None
+    BANKACCOUNTHOLDERNAME: Optional[str] = None
+    BANKACCOUNTNO: Optional[str] = None
+    BANKIFSC: Optional[str] = None
+    BANKNAME: Optional[str] = None
+    IMAGEAADHAR: Optional[str] = None
+    IMAGEPAN: Optional[str] = None
+    IMAGEBANKACCOUNT: Optional[str] = None
+
+    REGIONPREFERENCES: Optional[str] = None
+    CITYPREFERENCES: Optional[str] = None
+    REQUESTTYPEPREFERENCES: Optional[str] = None
+
+    # Human readable names (most important for frontend)
+    REGIONPREFERENCE_NAMES: Optional[str] = None
+    CITYPREFERENCE_NAMES: Optional[str] = None
+    REQUESTTYPEPREFERENCENAMES: Optional[str] = None
+
+    TABLETIMESTAMP: Optional[datetime] = None
+
+
+    model_config = {"from_attributes": True}
+
+
+class AdminNumberResponse (BaseModel):
+    phonenumber : str
+
+    model_config = {"from_attributes":True}
+
+
+class UpdateVendorApprovalRequest(BaseModel):
+    UID: int
+    vendorApproved: bool
+
+class UpdateVendorLockAppStatusRequest(BaseModel):
+    UID: int
+    lockApp: bool
+
+class RejectUserRequest(BaseModel):
+    userid:int
+    deletedBy : Optional[str] = None
+    reason : Optional[str] = None
+
+
+class UploadVendorDocumentRequest(BaseModel):
+    vendorid: str
+    docType: Literal["PROFILEPICTURE", "IMAGEAADHAR", "IMAGEPAN", "IMAGEBANKACCOUNT"]
+    uploadFile: Union[str, List[str]]
+
+    @field_validator("vendorid", mode="before")
+    @classmethod
+    def normalize_vendorid(cls, v):
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else ""
+        return str(v).strip()
+
+    @field_validator("docType", mode="before")
+    @classmethod
+    def normalize_doctype(cls, v):
+        if isinstance(v, list):
+            return str(v[0]).strip().upper() if v else ""
+        return str(v).strip().upper()
+
+    @field_validator("uploadFile", mode="before")
+    @classmethod
+    def normalize_upload_file(cls, v):
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else ""
+        return str(v).strip()
+    
+class UploadVendorDocumentResponse(BaseModel):
+    status : str
+    docType : str
+    column : str
+    vendor : str
+    url : str
+
+
 

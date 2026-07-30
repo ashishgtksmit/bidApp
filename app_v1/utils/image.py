@@ -1,97 +1,20 @@
-
-# import re
-# import base64
-# from PIL import Image
-# import pathlib
-# import urllib.parse
-# import io
-# from typing import Optional, Tuple
-
 import base64
 import binascii
 import io
 import pathlib
 import re
 import urllib.parse
-from typing import Set, Dict
 import os
-
+import hmac
+import hashlib
+import uuid
 from PIL import Image
+from typing import Any, List, Optional, Set, Dict, Tuple
+from datetime import datetime, time, timedelta, timezone
+from urllib.parse import unquote, urlencode
 
-# def upload_image(
-#     base64_image: str,   # Base64 image string (text)
-#     base_dir: str,       # Folder path where we’ll save the image
-#     file_stem: str,      # File name (without extension)
-#     base_url: str,       # Base URL to build a public link
-#     allowed_extensions: set = {"jpg", "jpeg", "png", "gif", "webp"},
-#     max_size_mb: int = 10
-# ) -> dict:
-    
-#     """
-#     Upload an image from Base64 and return its public URL.
-#     Args:
-#         base64_image: Base64-encoded image (with or without data URI)
-#         base_dir: Absolute path to store the image
-#         file_stem: Base file name (without extension)
-#         base_url: Base URL for the public file
-#         allowed_extensions: Allowed image extensions
-#         max_size_mb: Maximum file size in MB
-#     Returns:
-#         Dict with message and optional url or error
-#     """
+import httpx
 
-#     # Strip Data URI if present
-#     if re.match(r'^data:image/\w+;base64,', base64_image):
-#         base64_image = re.sub(r'^data:image/\w+;base64,', '', base64_image)
-    
-#     #Decode Base 64
-#     try:
-#         image_data = base64.b64decode(base64_image, validate=True)
-#     except base64.binascii.Error :
-#         return {"message" : "INVALID_IMAGE_DATA"}
-    
-#     #Validate Data
-#     if len(image_data) > max_size_mb * 1024 * 1024:
-#         return {"message" : "ERROR_IMAGE_TOO_LARGE"}
-    
-#     #Detect Extension
-#     try : 
-#         img = Image.open(io.BytesIO(image_data))
-#         mime_to_ext = {
-#             "image/jpeg" : "jpg",
-#             "image/png" : "png",
-#             "image/gif" : "gif",
-#             "image/webp" : "webp"
-#         }
-
-#         ext = mime_to_ext.get(img.format.lower(),"png")
-#         if ext not in allowed_extensions:
-#             return {"message":"ERROR_INVALID_IMAGE_FORMAT"}
-        
-#         #Sanitize file stem
-#         file_stem = re.sub(r'[^A-Za-z0-9_\-\.]', '', file_stem.replace(' ', '_'))
-
-#         #Create Directory
-#         path = pathlib.Path(base_dir)
-#         try:
-#             path.mkdir(mode=0o777, parents=False, exist_ok=False)
-#         except Exception as e:
-#             return {"message":"ERROR_CANNOT_CREATE_DIR","error":str(e)}
-        
-#         #Save File
-#         file_path = path / f"{file_stem}.{ext}"
-#         try:
-#             with open(file_path, "wb") as f:
-#                 f.write(image_data)
-#         except Exception as e:
-#             print(str(e))
-#             return {"message":"ERROR_SAVING_FILE","error":str(e)}
-        
-#         public_url = f"{base_url.rstrip('/')}/{urllib.parse.quote(file_stem + '.' + ext)}"
-#         return {"message":"UPLOADED", "url":public_url}
-
-#     except Exception:
-#         return {"message":"ERROR_INAVLID_IMAGE"}
     
 def upload_image(
     base64_image: str,                 # Base64 image string (with or without data URI)
@@ -152,18 +75,6 @@ def upload_image(
     if not safe_stem or safe_stem in {".", ".."}:
         return {"message": "ERROR_INVALID_FILE_NAME"}
 
-    # # 7) Ensure directory exists (only create if missing; handle race conditions)
-    # try:
-    #     path = pathlib.Path(base_dir).resolve(strict=False)
-    #     if path.exists() and not path.is_dir():
-    #         return {"message": "ERROR_PATH_NOT_DIR"}
-
-    #     if not path.exists():
-    #         # Use safer default perms; umask may still reduce these.
-    #         path.mkdir(mode=0o755, parents=True, exist_ok=False)
-    # except OSError as e:
-    #     return {"message": "ERROR_CANNOT_CREATE_DIR", "error": str(e)}
-
     # 7) Ensure directory exists (only create if missing; handle race conditions)
     try:
         # Prefer not to force absolute root unless you intend it.
@@ -220,3 +131,495 @@ def upload_image(
     public_url = f"{base_url.rstrip('/')}/{public_name}"
 
     return {"message": "UPLOADED", "url": public_url, "filename": file_path.name}
+
+def generate_vendor_document_sas(blob_path: str) -> str:
+    account_name = os.getenv("AZURE_ACCOUNT_NAME", "")
+    account_key = os.getenv("AZURE_ACCOUNT_KEY", "")
+    container = os.getenv("AZURE_CONTAINER", "vendor-documents")
+
+    if not account_name or not account_key or not container:
+        raise ValueError("Azure blob configuration is missing")
+
+    return generate_azure_blob_sas(
+        blob_path=blob_path,
+        account_name=account_name,
+        account_key=account_key,
+        container=container,
+    )
+
+def normalize_blob_path(blob_path: Any, account_name: str, container: str) -> str:
+    """
+    Normalize Azure blob input into a path relative to the container.
+
+    Accepted inputs:
+    - dict with {"blobPath": "..."}
+    - "vendor-documents/8637/file.jpg"
+    - "/vendor-documents/8637/file.jpg"
+    - "https://<account>.blob.core.windows.net/vendor-documents/8637/file.jpg"
+    - "8637/file.jpg"
+
+    Returns:
+    - "8637/file.jpg"
+    """
+    if isinstance(blob_path, dict):
+        blob_path = blob_path.get("blobPath", "")
+
+    blob_path = str(blob_path or "").strip()
+
+    if not blob_path:
+        return ""
+
+    prefix = f"https://{account_name}.blob.core.windows.net/{container}/"
+    if blob_path.startswith(prefix):
+        blob_path = blob_path[len(prefix):]
+
+    blob_path = blob_path.lstrip("/")
+
+    container_prefix = f"{container}/"
+    while blob_path.startswith(container_prefix):
+        blob_path = blob_path[len(container_prefix):]
+
+    return urllib.parse.unquote(blob_path)
+  
+
+def generate_azure_blob_sas(
+    blob_path: Any,
+    account_name: str,
+    account_key: str,
+    container: str,
+    expiry_minutes: int = 5,
+    start_skew_seconds: int = 60,
+    sas_version: str = "2023-11-03",
+) -> str:
+    """
+    Generate a read-only SAS URL for a single blob.
+
+    The returned URL is valid for a short time and is suitable for temporary reads.
+    """
+
+    normalized_blob_path = normalize_blob_path(blob_path, account_name, container)
+    if not normalized_blob_path:
+        raise ValueError("Invalid blob path")
+    
+    sp = "r"          # permissions: read
+    sr = "b"          # resource: blob
+    spr = "https"
+
+    now_utc = datetime.now(timezone.utc)
+    start = (now_utc - timedelta(seconds=start_skew_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expiry = (now_utc + timedelta(minutes=expiry_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    canonical_resource = f"/blob/{account_name}/{container}/{normalized_blob_path}"
+
+    signed_identifier = ""
+    signed_ip = ""
+    signed_snapshot_time = ""
+    signed_encryption_scope = ""
+    rscc = rscd = rsce = rscl = rsct = ""
+
+    string_to_sign = (
+        f"{sp}\n"
+        f"{start}\n"
+        f"{expiry}\n"
+        f"{canonical_resource}\n"
+        f"{signed_identifier}\n"
+        f"{signed_ip}\n"
+        f"{spr}\n"
+        f"{sas_version}\n"
+        f"{sr}\n"
+        f"{signed_snapshot_time}\n"
+        f"{signed_encryption_scope}\n"
+        f"{rscc}\n"
+        f"{rscd}\n"
+        f"{rsce}\n"
+        f"{rscl}\n"
+        f"{rsct}"
+    )
+
+    decoded_key = base64.b64decode(account_key)
+    signature = base64.b64encode(
+        hmac.new(decoded_key, string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    query = urlencode(
+        {
+            "sp": sp,
+            "st": start,
+            "se": expiry,
+            "spr": spr,
+            "sv": sas_version,
+            "sr": sr,
+            "sig": signature,
+        }
+    )
+
+    return (
+        f"https://{account_name}.blob.core.windows.net/"
+        f"{container}/{normalized_blob_path}?{query}"
+    )
+
+
+def _sanitize_blob_name(blob_name: str) -> str:
+    """
+    Keep folder separators, sanitize each segment.
+    """
+    blob_name = str(blob_name or "").strip().replace("\\", "/")
+    blob_name = re.sub(r"/+", "/", blob_name).strip("/")
+
+    segments = []
+    for segment in blob_name.split("/"):
+        safe = re.sub(r"[^A-Za-z0-9._\- ]", "", segment).strip()
+        safe = safe.replace(" ", "_")
+        if safe and safe not in {".", ".."}:
+            segments.append(safe)
+
+    if not segments:
+        raise ValueError("Invalid blob name")
+
+    return "/".join(segments)
+
+
+def _detect_image_type(
+    image_bytes: bytes,
+    mime_from_header: Optional[str] = None,
+    allowed_mimes: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """
+    Returns (mime, ext)
+    """
+    if allowed_mimes is None:
+        allowed_mimes = {
+            "image/jpeg",
+            "image/jpg",
+            "image/png",
+            "image/webp",
+            "image/gif",
+        }
+
+    mime = mime_from_header.lower() if mime_from_header else None
+
+    if not mime:
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                img.verify()
+                fmt = (img.format or "").lower()
+        except Exception:
+            raise ValueError("INVALID_IMAGE")
+
+        format_to_mime_ext = {
+            "jpeg": ("image/jpeg", "jpg"),
+            "jpg": ("image/jpeg", "jpg"),
+            "png": ("image/png", "png"),
+            "webp": ("image/webp", "webp"),
+            "gif": ("image/gif", "gif"),
+        }
+
+        if fmt not in format_to_mime_ext:
+            raise ValueError("INVALID_IMAGE")
+
+        mime, ext = format_to_mime_ext[fmt]
+    else:
+        mime_to_ext = {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/gif": "gif",
+        }
+        ext = mime_to_ext.get(mime)
+        if not ext:
+            raise ValueError("UNSUPPORTED_IMAGE_TYPE")
+
+    if mime not in allowed_mimes:
+        raise ValueError("UNSUPPORTED_IMAGE_TYPE")
+
+    return mime, ext
+
+
+def azure_blob_upload(
+    blob_name: str,
+    base64_data: str,
+    make_public: bool = False,
+    max_upload_bytes: int = 20 * 1024 * 1024,
+) -> Tuple[bool, str]:
+    """
+    Upload a base64 image to Azure Blob Storage.
+
+    Env required:
+    - AZURE_VENDOR_SAS
+    - AZURE_VENDOR_CONTAINER_URL
+    - optionally AZURE_PUBLIC_READ_SAS
+    """
+    sas_token = os.getenv("AZURE_VENDOR_SAS", "").strip()
+    base_url = os.getenv("AZURE_VENDOR_CONTAINER_URL", "").strip()
+    public_read_sas = os.getenv("AZURE_PUBLIC_READ_SAS", "").strip()
+
+    if not sas_token or not base_url:
+        return False, "AZURE_CONFIG_MISSING"
+
+    mime_from_header = None
+
+    header_match = re.match(
+        r"^data:(image/[a-zA-Z0-9.+-]+);base64,",
+        base64_data,
+        flags=re.IGNORECASE,
+    )
+    if header_match:
+        mime_from_header = header_match.group(1).lower()
+        base64_data = base64_data[len(header_match.group(0)):]
+
+    clean_base64 = re.sub(r"\s+", "", base64_data or "")
+    if not clean_base64:
+        return False, "INVALID_BASE64"
+
+    try:
+        image_bytes = base64.b64decode(clean_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return False, "INVALID_BASE64"
+
+    if not image_bytes:
+        return False, "INVALID_BASE64"
+
+    if len(image_bytes) > max_upload_bytes:
+        return False, "FILE_TOO_LARGE"
+
+    try:
+        mime, ext = _detect_image_type(image_bytes, mime_from_header=mime_from_header)
+    except ValueError as e:
+        return False, str(e)
+
+    try:
+        safe_blob_name = _sanitize_blob_name(blob_name)
+    except ValueError as e:
+        return False, str(e)
+
+    final_blob = f"{safe_blob_name}.{ext}"
+
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in final_blob.split("/")
+    )
+
+    upload_url = f"{base_url.rstrip('/')}/{encoded_path}?{sas_token.lstrip('?')}"
+
+    headers = {
+        "x-ms-blob-type": "BlockBlob",
+        "Content-Type": mime,
+    }
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.put(upload_url, content=image_bytes, headers=headers)
+    except Exception as e:
+        return False, f"UPLOAD_EXCEPTION: {str(e)}"
+
+    if response.status_code != 201:
+        return False, f"UPLOAD_FAIL:{response.status_code} | {response.text}"
+
+    final_url = f"{base_url.rstrip('/')}/{encoded_path}"
+    if make_public and public_read_sas:
+        final_url = f"{final_url}?{public_read_sas.lstrip('?')}"
+
+    return True, final_url
+
+
+def azure_blob_delete_by_url(file_url: Optional[str]) -> bool:
+    """
+    Delete a blob from Azure by its URL.
+    Uses AZURE_VENDOR_SAS, which must include delete permission.
+    """
+    if not file_url:
+        return True
+
+    sas_token = os.getenv("AZURE_VENDOR_SAS", "").strip()
+    if not sas_token:
+        return False
+
+    base_url = file_url.split("?", 1)[0]
+    delete_url = f"{base_url}?{sas_token.lstrip('?')}"
+
+    headers = {
+        "x-ms-version": "2024-11-04",
+    }
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.delete(delete_url, headers=headers)
+    except Exception:
+        return False
+
+    return response.status_code in (202, 404)
+
+
+def mime_to_extension(mime_type: str) -> str:
+    mime_map = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "application/pdf": "pdf",
+        "application/msword": "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "application/vnd.ms-excel": "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+        "application/vnd.ms-powerpoint": "ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+        "text/plain": "txt",
+        "text/csv": "csv",
+        "application/zip": "zip",
+        "application/x-zip-compressed": "zip",
+    }
+    return mime_map.get(mime_type.lower(), "bin")
+
+
+def _sanitize_blob_segment(value: str) -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._\- ]", "", value)
+    value = value.replace(" ", "_")
+    return value
+
+
+def azure_blob_upload_base64_file(
+    blob_name_without_ext: str,
+    base64_file: str,
+    container_url: str,
+    sas_token: str,
+    max_upload_bytes: int = 5 * 1024 * 1024,
+    allowed_mime_types: Optional[set[str]] = None,
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    Upload a generic base64 file to Azure Blob.
+
+    Returns:
+        (success, message_or_url, mime_type)
+    """
+    if allowed_mime_types is None:
+        allowed_mime_types = {
+            "image/jpeg",
+            "image/jpg",
+            "image/png",
+            "image/webp",
+            "image/gif",
+            "application/pdf",
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "text/plain",
+            "text/csv",
+            "application/zip",
+            "application/x-zip-compressed",
+        }
+
+    base64_file = str(base64_file or "").strip()
+    if ";base64," not in base64_file:
+        return False, "INVALID_FILE_FORMAT", None
+
+    parts = base64_file.split(";base64,", 1)
+    if len(parts) != 2:
+        return False, "INVALID_FILE_FORMAT", None
+
+    mime_info, base64_data = parts
+
+    mime_match = re.match(r"^data:(.+)$", mime_info.strip(), flags=re.IGNORECASE)
+    if not mime_match:
+        return False, "INVALID_MIME_TYPE", None
+
+    mime_type = mime_match.group(1).strip().lower()
+    if mime_type not in allowed_mime_types:
+        return False, "UNSUPPORTED_FILE_TYPE", mime_type
+
+    clean_base64 = re.sub(r"\s+", "", base64_data)
+    try:
+        file_data = base64.b64decode(clean_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return False, "INVALID_BASE64", mime_type
+
+    if not file_data:
+        return False, "INVALID_BASE64", mime_type
+
+    if len(file_data) > max_upload_bytes:
+        return False, "FILE_TOO_LARGE", mime_type
+
+    ext = mime_to_extension(mime_type)
+
+    safe_name = _sanitize_blob_segment(blob_name_without_ext)
+    if not safe_name:
+        return False, "INVALID_FILE_NAME", mime_type
+
+    final_blob_name = f"{safe_name}.{ext}"
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in final_blob_name.split("/")
+    )
+
+    upload_url = f"{container_url.rstrip('/')}/{encoded_path}?{sas_token.lstrip('?')}"
+
+    headers = {
+        "x-ms-blob-type": "BlockBlob",
+        "Content-Type": mime_type or "application/octet-stream",
+    }
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.put(upload_url, content=file_data, headers=headers)
+    except Exception as e:
+        return False, f"UPLOAD_EXCEPTION: {str(e)}", mime_type
+
+    if response.status_code != 201:
+        return False, f"UPLOAD_FAIL:{response.status_code}", mime_type
+
+    blob_url = f"{container_url.rstrip('/')}/{encoded_path}"
+    return True, blob_url, mime_type
+
+
+def upload_support_docs_to_azure(files: List[str]) -> Dict[str, object]:
+    """
+    Upload chat support documents to Azure chat-docs container.
+    """
+    container_url = os.getenv("AZURE_CHAT_DOCS_CONTAINER_URL", "").strip()
+    sas_token = os.getenv("AZURE_CHAT_DOCS_SAS", "").strip()
+
+    if not container_url or not sas_token:
+        return {"status": "error", "message": "Azure chat docs config missing"}
+
+    uploaded_urls: List[str] = []
+
+    for base64_file in files:
+        unique_name = f"{int(time.time())}_{uuid.uuid4().hex}"
+
+        success, result, _mime = azure_blob_upload_base64_file(
+            blob_name_without_ext=unique_name,
+            base64_file=base64_file,
+            container_url=container_url,
+            sas_token=sas_token,
+            max_upload_bytes=5 * 1024 * 1024,
+        )
+
+        if success:
+            uploaded_urls.append(result)
+
+    if uploaded_urls:
+        return {"status": "success", "urls": uploaded_urls}
+
+    return {"status": "error", "message": "No files uploaded to Azure"}
+
+def upload_vendor_profile_picture_azure(user_app_id: str, base64_data: str) -> dict:
+    """
+    Azure replacement for profile picture upload.
+    Returns old-style dict for smoother migration.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    blob_name = f"{user_app_id}/Profile_{timestamp}"
+
+    success, result = azure_blob_upload(
+        blob_name=blob_name,
+        base64_data=base64_data,
+        make_public=False,
+    )
+
+    if not success:
+        return {"message": result}
+
+    return {"message": "UPLOADED", "url": result}

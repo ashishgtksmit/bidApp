@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from ..models.location_details import LocationDetail
-from ..schemas.location_details import Location,CityDetail,RegionDetail
+from ..schemas.location_details import Location,CityDetail,RegionDetail,LocationResponse
 from ..schemas.user_table import NoUserResponse
 from ..models.city_list import City
 from ..schemas.city_list import CityListDetail
@@ -14,14 +14,34 @@ from ..models.region_details import Region
 
 def get_all_locations(db:Session):
     try:
-        locations = db.query(LocationDetail).all()
-        return [Location.from_orm(loc) for loc in locations]
+        locations = (
+                db.query(
+                LocationDetail.LID,
+                LocationDetail.location,
+                LocationDetail.location_shortCode,
+                LocationDetail.regionId,
+                RegionDetail.REGION_NAME
+            )
+            .outerjoin(RegionDetail, LocationDetail.regionId == RegionDetail.RDID)
+            .order_by(LocationDetail.location.asc())
+            .all()
+        )
+        return [
+            LocationResponse(
+                LOCATIONCODE=LID,
+                LOCATION=location,
+                LOCATIONSHORTCODE=location_shortCode,
+                REGIONID=regionId,
+                REGIONNAME=regionName
+            )
+        for LID, location, location_shortCode, regionId, regionName in locations
+        ]
     except SQLAlchemyError:
         return NoUserResponse(message="ERROR_PREPEARE")
 
 def get_all_cities(db:Session):
     try:
-        cities = db.query(City).all()
+        cities = db.query(City).all().order_by(City.cities.asc())
         return [CityListDetail(
             CITYID=city.CLID,
             CITY=city.cities,

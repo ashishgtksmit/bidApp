@@ -7,10 +7,13 @@ from ..models.tags_table import Tag
 from ..models.request_table import Request
 from ..models.car_details import CarDetail
 from ..models.car_type_details import CarTypeDetail
-from ..schemas.bid_details import BidDetail as BidDetailSchema, NoBidResponse, BidInsert
+from ..schemas.bid_details import BidDetail as BidDetailSchema, NoBidResponse, BidInsert,UpdateCarIdForBidRequest
 from ..utils.common import ErrorResponse,EmailErrorResponse
 from datetime import datetime
 from ..utils.common import parse_dob
+from ..services.vendor_filtering import get_vendors_who_bid_on_request
+from ..services.notifications import send_notification_to_selected_users, send_notification_to_user, FCMSendDrivers, FCMSend
+from zoneinfo import ZoneInfo
 
 
 
@@ -141,8 +144,7 @@ def delete_bid_with_bid(db : Session, rid : int, bid : int):
         
         updated = db.query(Request).filter(Request.RID == rid).update(
             {
-                Request.noOfBids: Request.noOfBids - 1,
-                Request.tableTimestamp: func.current_timestamp()
+                Request.noOfBids: Request.noOfBids - 1
             }
         )        
         if updated ==0:
@@ -172,70 +174,321 @@ def update_bid(db:Session, bid : int, bidamount : float):
     finally:
         db.close()
     
-def accept_bid(db:Session, rid :int, vendor_id :int):
+# def accept_bid(db:Session, rid :int, vendor_id :int):
+#     try : 
+#         requestupdate = db.query(Request).filter(Request.RID == rid).update({
+#             Request.requestStatus:"BID - CONFIRMED",
+#             Request.tableTimestamp:func.current_timestamp()
+#         })        
+#         if requestupdate==0:
+#             return ErrorResponse(message="INSER ERROR IN FUNCTION")
+        
+#         bidupdate = db.query(BidDetail).filter((BidDetail.rID == rid)&(BidDetail.bidderID == vendor_id)).update({
+#             BidDetail.bidStatus:"BID - CONFIRMED",
+#             BidDetail.tableTimestamp:func.current_timestamp()
+#         })
+        
+#         if bidupdate==0:
+#             return ErrorResponse(message="NOT UPDATED")
+#         db.commit()
+#         return ErrorResponse(message="UPDATED")
+#     except SQLAlchemyError:
+#         db.rollback()
+#         return ErrorResponse(message="ERROR")
+#     finally:
+#         db.close()
+
+def accept_bid(
+    db: Session,
+    rid: int,
+    vendor_id: str,
+    bid_id: int,
+    car_id: str,
+    notification_type: str = "default",
+):
+    """
+    PHP-equivalent, transaction-safe version of acceptBid():
+    - requires bid_id and car_id
+    - marks request as BID - CONFIRMED
+    - marks only the exact accepted bid row as BID - CONFIRMED
+    - notifies only the accepted vendor
+    """
+
+    try:
+        if not bid_id or not car_id:
+            return ErrorResponse(message="Missing BIDID/CARID")
+
+        accepted_vendor_user_app_id = None
+
+        # ----------------------------------
+        # 1) TRANSACTION
+        # ----------------------------------
+        with db.begin():
+            # Update request
+            request_updated = (
+                db.query(Request)
+                .filter(Request.RID == rid)
+                .update(
+                    {
+                        Request.requestStatus: "BID - CONFIRMED",
+                    },
+                    synchronize_session=False,
+                )
+            )
+
+            if request_updated == 0:
+                return ErrorResponse(message="INSER ERROR IN FUNCTION")
+
+            # Update exact accepted bid row
+            bid_updated = (
+                db.query(BidDetail)
+                .filter(
+                    BidDetail.BID == bid_id,
+                    BidDetail.rID == rid,
+                    BidDetail.bidderID == vendor_id,
+                    BidDetail.CARID == car_id,
+                )
+                .update(
+                    {
+                        BidDetail.bidStatus: "BID - CONFIRMED",
+                    },
+                    synchronize_session=False,
+                )
+            )
+
+            if bid_updated == 0:
+                return ErrorResponse(message="NOT UPDATED")
+
+            accepted_vendor_user_app_id = str(vendor_id)
+
+        # ----------------------------------
+        # 2) NOTIFY ONLY ACCEPTED VENDOR
+        # ----------------------------------
+        try:
+            if accepted_vendor_user_app_id:
+                send_notification_to_user(
+                    db,
+                    FCMSend(
+                        userAppId=accepted_vendor_user_app_id,
+                        title="Your Bid has won. Confirm Fast !!",
+                        body="Accept OR Reject this Booking. Click here.",
+                        url="Your Bid has won. Confirm Fast !!",
+                        type=notification_type,
+                        soundFile="alarm_notification",
+                        source=None,
+                        destination=None,
+                        travelDate=None,
+                        pickupTime=None,
+                    ),
+                )
+        except Exception:
+            pass
+
+        return ErrorResponse(message="UPDATED")
+
+    except SQLAlchemyError:
+        db.rollback()
+        return ErrorResponse(message="ERROR")
+
+    except Exception:
+        db.rollback()
+        return ErrorResponse(message="ERROR")
+    
+# def insert_bid(db: Session, bid_data : BidInsert):    
+#     try :         
+#         existing_bid = db.query(BidDetail).filter((BidDetail.rID == bid_data.RID) &
+#                                                 (BidDetail.bidderID == bid_data.bidderID) &
+#                                                 (BidDetail.CARID == bid_data.assignedVehicleID)).first()
+#         if existing_bid:
+#             return ErrorResponse(message="BID ALREADY PRESENT")
+        
+#         # Insert new bid
+#         new_bid = BidDetail(
+#             rID = bid_data.RID,
+#             bidderID = bid_data.bidderID,
+#             CARID = bid_data.assignedVehicleID,
+#             bidAmount = bid_data.bidAmount,
+#             bidStatus = "BID - OPEN",
+#             tableTimestamp = datetime.utcnow()
+#         )
+#         db.add(new_bid)
+        
+#         # Update requestTable 
+#         updated = db.query(Request).filter(Request.RID == bid_data.RID).update({
+#             Request.noOfBids: Request.noOfBids + 1,
+#             Request.tableTimestamp: func.current_timestamp()
+#         })
+        
+#         if updated ==0 :
+#             raise RuntimeError("UPDATE REQUEST TABLE FAILED")
+        
+#         db.commit()
+#         return ErrorResponse(message="UPDATED")
+#     except SQLAlchemyError as e:
+#         db.rollback()
+#         return ErrorResponse(message=f"ERROR: {e.__class__.__name__}")
+#     finally:
+#         db.close()
+
+
+def insert_bid(db: Session, bid_data):
+    """
+    Production-safe version of insertBid():
+    - duplicate check depends on whether CARID exists
+    - insert bid + increment request count in one DB transaction
+    - notifications happen after commit
+    - returns INSERTED on success
+    """
+    tz = ZoneInfo("Asia/Kolkata")
+
+    try:
+        car_id = (
+            bid_data.assignedVehicleID
+            if getattr(bid_data, "assignedVehicleID", None) not in ("", None)
+            else None
+        )
+
+        customer_app_id = None
+
+        # -------------------------
+        # 1) TRANSACTION
+        # -------------------------
+        with db.begin():
+            # Duplicate check
+            if car_id is not None:
+                existing_bid = (
+                    db.query(BidDetail)
+                    .filter(
+                        BidDetail.rID == bid_data.RID,
+                        BidDetail.bidderID == bid_data.bidderID,
+                        BidDetail.CARID == car_id,
+                    )
+                    .first()
+                )
+            else:
+                existing_bid = (
+                    db.query(BidDetail)
+                    .filter(
+                        BidDetail.rID == bid_data.RID,
+                        BidDetail.bidderID == bid_data.bidderID,
+                    )
+                    .first()
+                )
+
+            if existing_bid:
+                return ErrorResponse(message="BID ALREADY PRESENT")
+
+            # Load request before update so we can notify customer later
+            request_row = db.query(Request).filter(Request.RID == bid_data.RID).first()
+            if not request_row:
+                return ErrorResponse(message="INSER ERROR IN FUNCTION")
+
+            customer_app_id = request_row.customerAppId
+
+            # Insert bid
+            new_bid = BidDetail(
+                rID=bid_data.RID,
+                bidderID=bid_data.bidderID,
+                bidAmount=bid_data.bidAmount,
+                CARID=car_id,
+                tableTimestamp=datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S"),
+                bidStatus="BID - OPEN",
+            )
+            db.add(new_bid)
+
+            # Increment bid count
+            updated = (
+                db.query(Request)
+                .filter(Request.RID == bid_data.RID)
+                .update(
+                    {
+                        Request.noOfBids: Request.noOfBids + 1,
+                    },
+                    synchronize_session=False,
+                )
+            )
+
+            if updated == 0:
+                raise ValueError("INSER ERROR IN FUNCTION")
+
+        # -------------------------
+        # 2) NOTIFICATIONS AFTER COMMIT
+        # -------------------------
+        try:
+            # Notify other vendors who already bid on same request
+            vendor_ids = get_vendors_who_bid_on_request(db, bid_data.RID)
+            other_vendor_ids = [
+                vid for vid in vendor_ids
+                if str(vid).strip().lower() != str(bid_data.bidderID).strip().lower()
+            ]
+
+            if other_vendor_ids:
+                send_notification_to_selected_users(
+                    db,
+                    FCMSendDrivers(
+                        title="Someone Else Bid on Your Same Request!",
+                        body="Check your bid now. Another driver also gave a price.",
+                        url="Someone Else Bid on Your Same Request!",
+                        type=getattr(bid_data, "type", "default"),
+                        soundFile="normal_notification",
+                        driverIds=other_vendor_ids,
+                    ),
+                )
+
+            # Notify customer
+            if customer_app_id:
+                send_notification_to_user(
+                    db,
+                    FCMSend(
+                        userAppId=customer_app_id,
+                        title="New Bid on your Request",
+                        body="A Vendor has made a New Bid on your Request. Check it.",
+                        url="New Bid on Your Request",
+                        type=getattr(bid_data, "type", "default"),
+                        soundFile="normal_notification",
+                        source=None,
+                        destination=None,
+                        travelDate=None,
+                        pickupTime=None,
+                    ),
+                )
+        except Exception:
+            # best-effort notifications, same spirit as PHP
+            pass
+
+        return ErrorResponse(message="INSERTED")
+
+    except ValueError as e:
+        db.rollback()
+        return ErrorResponse(message=str(e))
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        return ErrorResponse(message=f"ERROR: {e.__class__.__name__}")
+
+    except Exception:
+        db.rollback()
+        return ErrorResponse(message="INSER ERROR IN FUNCTION")
+
+
+
+def update_car_id_bid(db:Session, data : UpdateCarIdForBidRequest):
     try : 
-        requestupdate = db.query(Request).filter(Request.RID == rid).update({
-            Request.requestStatus:"BID - CONFIRMED",
-            Request.tableTimestamp:func.current_timestamp()
-        })        
-        if requestupdate==0:
-            return ErrorResponse(message="INSER ERROR IN FUNCTION")
+        bid = db.query(BidDetail).filter(BidDetail.BID == data.BID).first()
         
-        bidupdate = db.query(BidDetail).filter((BidDetail.rID == rid)&(BidDetail.bidderID == vendor_id)).update({
-            BidDetail.bidStatus:"BID - CONFIRMED",
-            BidDetail.tableTimestamp:func.current_timestamp()
-        })
+        if not bid:
+            return ErrorResponse(message="BID NOT FOUND")
         
-        if bidupdate==0:
-            return ErrorResponse(message="NOT UPDATED")
+        if bid.CARID == data.CARID:
+            return ErrorResponse(message="SAME CARID")
+        
+        bid.CARID = data.CARID
+        bid.tableTimestamp = func.current_timestamp()
         db.commit()
+        
         return ErrorResponse(message="UPDATED")
     except SQLAlchemyError:
         db.rollback()
         return ErrorResponse(message="ERROR")
     finally:
         db.close()
-    
-def insert_bid(db: Session, bid_data : BidInsert):    
-    try :         
-        existing_bid = db.query(BidDetail).filter((BidDetail.rID == bid_data.RID) &
-                                                (BidDetail.bidderID == bid_data.bidderID) &
-                                                (BidDetail.CARID == bid_data.assignedVehicleID)).first()
-        if existing_bid:
-            return ErrorResponse(message="BID ALREADY PRESENT")
-        
-        # Insert new bid
-        new_bid = BidDetail(
-            rID = bid_data.RID,
-            bidderID = bid_data.bidderID,
-            CARID = bid_data.assignedVehicleID,
-            bidAmount = bid_data.bidAmount,
-            bidStatus = "BID - OPEN",
-            tableTimestamp = datetime.utcnow()
-        )
-        db.add(new_bid)
-        
-        # Update requestTable 
-        updated = db.query(Request).filter(Request.RID == bid_data.RID).update({
-            Request.noOfBids: Request.noOfBids + 1,
-            Request.tableTimestamp: func.current_timestamp()
-        })
-        
-        if updated ==0 :
-            raise RuntimeError("UPDATE REQUEST TABLE FAILED")
-        
-        db.commit()
-        return ErrorResponse(message="UPDATED")
-    except SQLAlchemyError as e:
-        db.rollback()
-        return ErrorResponse(message=f"ERROR: {e.__class__.__name__}")
-    finally:
-        db.close()
-
-
-
-
-
-
-
-

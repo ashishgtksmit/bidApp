@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from ..crud.location import get_all_locations,get_all_cities,get_all_regions,get_region_city_selections
-from ..schemas.location_details import Location,CityDetail,RegionDetail
+from ..schemas.location_details import Location,CityDetail,RegionDetail,LocationResponse
 from ..schemas.city_list import CityListDetail
 from ..schemas.region_details import RegionDetailBase
 from ..utils.common import ErrorResponse
@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 # @router.get("/getlocations", response_model=List[Location],openapi_extra={"security": [{"BearerAuth": [], "ClientIdHeader": []}]})
-@router.get("/getlocations", response_model=List[Location])
+@router.get("/getlocations", response_model=Union[List[LocationResponse],ErrorResponse])
 def read_locations(
     db:Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id),  # ⬅️ now protected

@@ -15,6 +15,8 @@ from .endpoints.utils import router as utils_router
 from .endpoints.auth import router as auth_router
 from .database import Base, engine
 from .auth.deps import get_current_user_id
+# Ensure PR5 OTP / reset-token / rate-limit tables are registered before create_all.
+from .models import otp_challenge as _otp_challenge_models  # noqa: F401
 import traceback
 
 

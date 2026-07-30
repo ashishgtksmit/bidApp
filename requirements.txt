@@ -12,6 +12,7 @@ aiosmtplib
 Pillow
 pyjwt[crypto]
 python-jose[cryptography]
+firebase-admin
 # passlib[bcrypt]
 
 passlib==1.7.4

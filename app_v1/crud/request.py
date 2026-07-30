@@ -1,6 +1,12 @@
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime,timedelta
+from fastapi import BackgroundTasks
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
 from ..models.request_table import Request
 from ..models.bid_details import BidDetail
 from ..models.user_table import User
@@ -15,13 +21,10 @@ from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRid
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
                                      RequestConfirmedCommonResponse,GetBookingReportResponse)
 from ..schemas.request_type_details import RequestTypeBase
-from ..utils.common import ErrorResponse,EmailErrorResponse
-from ..services.notifications import send_notification_to_all_vendors,send_notification
-from datetime import datetime,timedelta
-from fastapi import BackgroundTasks
-from ..crud.bid import delete_bid_with_bid
-
-
+from ..utils.common import ErrorResponse,EmailErrorResponse, FCMSend
+from ..services.notifications import (FCMSendDrivers, notify_driver_assigned_to_customer,
+                                      notify_vendors_for_request,notify_vendors_request_cancelled, send_notification_to_selected_users, send_notification_to_user)
+from ..services.vendor_filtering import get_other_vendors_who_bid_on_request, get_vendors_for_request,get_vendors_who_bid_on_request
 
 def get_all_open_requests(db : Session):
     try:
@@ -59,98 +62,208 @@ def get_all_open_requests(db : Session):
         db.close()
 
 
-def get_all_requests_for_user(db : Session, customer_app_id : str):    
-    try:
-        requests = db.query(
-                Request,
-                DriverDetail.driverName,
-                DriverDetail.driverNumber,
-                DriverDetail.driverPhoto,
-                DriverDetail.driverDOB,
-                DriverDetail.driverGender,
-                DriverDetail.driverCity,
-                DriverDetail.driverLicense,
-                BidDetail.bidAmount,
-                BidDetail.CARID,
-                CarDetail.carRegNo,
-                CarDetail.carModel,
-                CarDetail.modelYear,
-                CarDetail.carColor,
-                CarDetail.ownerName,
-                CarDetail.registrationDoc,
-                CarDetail.powerOfAttorneyDoc,
-                CarDetail.registeredOn,
-                CarDetail.carOwnedBySameVendor,
-                CarDetail.CTD,
-                CarTypeDetail.car_type
-            ).outerjoin(
-            DriverDetail, DriverDetail.DDID == Request.driverAssignedID
-            ).outerjoin(
-                BidDetail, BidDetail.rID == Request.RID
-            ).outerjoin(
-                CarDetail, CarDetail.CARID == BidDetail.CARID
-            ).outerjoin(
-                CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD
-            ).filter(Request.customerAppId == customer_app_id).order_by(Request.tableTimestamp.desc()).all()
-        if not requests:
-            return NoBidsResponse(message="NO REQUESTS FOUND")
-        return [
-                RequestForUserResponse(
-                    REQUESTID=req.RID,
-                    FROMLOCATION=req.fromLocation,
-                    FROMLANDMARK=req.fromLandmark,
-                    TOLOCATION=req.toLocation,
-                    TOLANDMARK=req.toLandmark,
-                    PICKUPDATE=req.pickUpDate,                    
-                    PICKUPTIME=req.pickUpTime,
-                    NOOFADULTS=req.noOfAdults,
-                    NOOFKIDS=req.noOfKids,
-                    CARTYPE=req.carType,
-                    ACREQUEST=req.acRequest,
-                    CARRIERREQUES=req.carrierRequest,
-                    BIDENDTIME=req.bidEndTime,
-                    REQUESTSTATUS=req.requestStatus,
-                    PAYMENTSTATUS=req.paymentStatus,
-                    CUSTOMERAPPID=req.customerAppId,
-                    REQUESTWONBY=req.requestWonBy,
-                    FINALAMOUNT=req.finalAmount,
-                    NOOFBIDS=req.noOfBids,
-                    REJECTIONREASON=req.rejectionReason,
-                    REOPENBOOKING=req.requestReopened,
-                    TABLETIMESTAMP=req.tableTimestamp,
-                    REVIEWDONE=req.reviewDone,
-                    DRIVERNAME=driver_name,
-                    DRIVERNUMBER=driver_number,
-                    DRIVERPHOTO=driver_photo,
-                    DRIVERDOB=driver_dob,
-                    DRIVERGENDER=driver_gender,
-                    DRIVERCITY=driver_city,
-                    DRIVERLICENSE=driver_license,
-                    BIDAMOUNT=bid_amount,
-                    CARID=car_id,
-                    CARREGNO=car_reg_no,
-                    CARMODEL=car_model,
-                    MODELYEAR=model_year,
-                    CARCOLOR=car_color,
-                    OWNERNAME=owner_name,
-                    REGISTRATIONDOC=registration_doc,
-                    POWEROFATTORNEYDOC=power_of_attorney_doc,
-                    REGISTEREDON=registered_on,
-                    CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
-                    CTD=ctd,
-                    CAR_TYP=car_type
+# def get_all_requests_for_user(db : Session, customer_app_id : str):    
+#     try:
+#         requests = db.query(
+#                 Request,
+#                 DriverDetail.driverName,
+#                 DriverDetail.driverNumber,
+#                 DriverDetail.driverPhoto,
+#                 DriverDetail.driverDOB,
+#                 DriverDetail.driverGender,
+#                 DriverDetail.driverCity,
+#                 DriverDetail.driverLicense,
+#                 BidDetail.bidAmount,
+#                 BidDetail.CARID,
+#                 CarDetail.carRegNo,
+#                 CarDetail.carModel,
+#                 CarDetail.modelYear,
+#                 CarDetail.carColor,
+#                 CarDetail.ownerName,
+#                 CarDetail.registrationDoc,
+#                 CarDetail.powerOfAttorneyDoc,
+#                 CarDetail.registeredOn,
+#                 CarDetail.carOwnedBySameVendor,
+#                 CarDetail.CTD,
+#                 CarTypeDetail.car_type
+#             ).outerjoin(
+#             DriverDetail, DriverDetail.DDID == Request.driverAssignedID
+#             ).outerjoin(
+#                 BidDetail, BidDetail.rID == Request.RID
+#             ).outerjoin(
+#                 CarDetail, CarDetail.CARID == BidDetail.CARID
+#             ).outerjoin(
+#                 CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD
+#             ).filter(Request.customerAppId == customer_app_id).order_by(Request.tableTimestamp.desc()).all()
+#         if not requests:
+#             return NoBidsResponse(message="NO REQUESTS FOUND")
+#         return [
+#                 RequestForUserResponse(
+#                     REQUESTID=req.RID,
+#                     FROMLOCATION=req.fromLocation,
+#                     FROMLANDMARK=req.fromLandmark,
+#                     TOLOCATION=req.toLocation,
+#                     TOLANDMARK=req.toLandmark,
+#                     PICKUPDATE=req.pickUpDate,                    
+#                     PICKUPTIME=req.pickUpTime,
+#                     NOOFADULTS=req.noOfAdults,
+#                     NOOFKIDS=req.noOfKids,
+#                     CARTYPE=req.carType,
+#                     ACREQUEST=req.acRequest,
+#                     CARRIERREQUES=req.carrierRequest,
+#                     BIDENDTIME=req.bidEndTime,
+#                     REQUESTSTATUS=req.requestStatus,
+#                     PAYMENTSTATUS=req.paymentStatus,
+#                     CUSTOMERAPPID=req.customerAppId,
+#                     REQUESTWONBY=req.requestWonBy,
+#                     FINALAMOUNT=req.finalAmount,
+#                     NOOFBIDS=req.noOfBids,
+#                     REJECTIONREASON=req.rejectionReason,
+#                     REOPENBOOKING=req.requestReopened,
+#                     TABLETIMESTAMP=req.tableTimestamp,
+#                     REVIEWDONE=req.reviewDone,
+#                     DRIVERNAME=driver_name,
+#                     DRIVERNUMBER=driver_number,
+#                     DRIVERPHOTO=driver_photo,
+#                     DRIVERDOB=driver_dob,
+#                     DRIVERGENDER=driver_gender,
+#                     DRIVERCITY=driver_city,
+#                     DRIVERLICENSE=driver_license,
+#                     BIDAMOUNT=bid_amount,
+#                     CARID=car_id,
+#                     CARREGNO=car_reg_no,
+#                     CARMODEL=car_model,
+#                     MODELYEAR=model_year,
+#                     CARCOLOR=car_color,
+#                     OWNERNAME=owner_name,
+#                     REGISTRATIONDOC=registration_doc,
+#                     POWEROFATTORNEYDOC=power_of_attorney_doc,
+#                     REGISTEREDON=registered_on,
+#                     CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
+#                     CTD=ctd,
+#                     CAR_TYP=car_type
 
-                )
-                    for req,driver_name,driver_number,driver_photo,driver_dob,
-                    driver_gender,driver_city,driver_license,bid_amount,car_id,car_reg_no,
-                     car_model,model_year,car_color,owner_name,registration_doc,
-                      power_of_attorney_doc,registered_on,car_owned_by_same_vendor,
-                       ctd,car_type in requests
-            ]
-    except SQLAlchemyError:
-        return NoBidsResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
+#                 )
+#                     for req,driver_name,driver_number,driver_photo,driver_dob,
+#                     driver_gender,driver_city,driver_license,bid_amount,car_id,car_reg_no,
+#                      car_model,model_year,car_color,owner_name,registration_doc,
+#                       power_of_attorney_doc,registered_on,car_owned_by_same_vendor,
+#                        ctd,car_type in requests
+#             ]
+#     except SQLAlchemyError:
+#         return NoBidsResponse(message="ERROR_PREPARE")
+#     finally:
+#         db.close()
+
+def get_all_requests_for_user(db: Session, customer_app_id: str):
+    try:
+        if not customer_app_id or customer_app_id.strip() == "":
+            return NoBidsResponse(message="ERROR_MISSING_CUSTOMERAPPID")
+
+        requests = db.query(
+            Request,
+            DriverDetail.driverName,
+            DriverDetail.driverNumber,
+            DriverDetail.driverPhoto,
+            DriverDetail.driverDOB,
+            DriverDetail.driverGender,
+            DriverDetail.driverCity,
+            DriverDetail.driverLicense,
+            BidDetail.bidAmount,
+            BidDetail.CARID,
+            CarDetail.carRegNo,
+            CarDetail.carModel,
+            CarDetail.modelYear,
+            CarDetail.carColor,
+            CarDetail.ownerName,
+            CarDetail.registrationDoc,
+            CarDetail.powerOfAttorneyDoc,
+            CarDetail.registeredOn,
+            CarDetail.carOwnedBySameVendor,
+            CarDetail.CTD,
+            CarTypeDetail.car_type
+        ).outerjoin(
+            DriverDetail, DriverDetail.DDID == Request.driverAssignedID
+        ).outerjoin(
+            BidDetail,
+            (BidDetail.rID == Request.RID) &
+            (BidDetail.bidderID == Request.requestWonBy)
+        ).outerjoin(
+            CarDetail, CarDetail.CARID == BidDetail.CARID
+        ).outerjoin(
+            CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD
+        ).filter(
+            Request.customerAppId == customer_app_id
+        ).order_by(
+            Request.tableTimestamp.desc()
+        ).all()
+
+        if not requests:
+            return []
+
+        return [
+            RequestForUserResponse(
+                REQUESTID=req.RID,
+                FROMLOCATION=req.fromLocation,
+                FROMLANDMARK=req.fromLandmark,
+                TOLOCATION=req.toLocation,
+                TOLANDMARK=req.toLandmark,
+                PICKUPDATE=req.pickUpDate,
+                PICKUPTIME=req.pickUpTime,
+                NOOFADULTS=req.noOfAdults,
+                NOOFKIDS=req.noOfKids,
+                CARTYPE=req.carType,
+                ACREQUEST=req.acRequest,
+                CARRIERREQUEST=req.carrierRequest,
+                SPECIALREQUEST=req.specialRequest,
+                BIDENDTIME=req.bidEndTime,
+                REQUESTSTATUS=req.requestStatus,
+                PAYMENTSTATUS=req.paymentStatus,
+                CUSTOMERAPPID=req.customerAppId,
+                REQUESTWONBY=req.requestWonBy,
+                FINALAMOUNT=req.finalAmount,
+                NOOFBIDS=req.noOfBids,
+                REJECTIONREASON=req.rejectionReason,
+                REOPENBOOKING=req.requestReopened,
+                TABLETIMESTAMP=req.tableTimestamp,
+                REVIEWDONE=req.reviewDone,
+
+                DRIVERNAME=driver_name,
+                DRIVERNUMBER=driver_number,
+                DRIVERPHOTO=driver_photo,
+                DRIVERDOB=driver_dob,
+                DRIVERGENDER=driver_gender,
+                DRIVERCITY=driver_city,
+                DRIVERLICENSE=driver_license,
+
+                BIDAMOUNT=bid_amount,
+                CARID=car_id,
+                CARREGNO=car_reg_no,
+                CARMODEL=car_model,
+                MODELYEAR=model_year,
+                CARCOLOR=car_color,
+                OWNERNAME=owner_name,
+                REGISTRATIONDOC=registration_doc,
+                POWEROFATTORNEYDOC=power_of_attorney_doc,
+                REGISTEREDON=registered_on,
+                CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
+                CTD=ctd,
+                CAR_TYPE=car_type
+            )
+            for (
+                req,
+                driver_name, driver_number, driver_photo, driver_dob,
+                driver_gender, driver_city, driver_license,
+                bid_amount, car_id, car_reg_no, car_model, model_year,
+                car_color, owner_name, registration_doc,
+                power_of_attorney_doc, registered_on,
+                car_owned_by_same_vendor, ctd, car_type
+            ) in requests
+        ]
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        return NoBidsResponse(message="ERROR_PREPARE", error=str(e))
 
 def get_rid_by_details(db : Session, from_location : str, to_location : str, pick_up_date : str, 
                        pick_up_time : str, no_of_adults : int, no_of_kids : int, car_type : str):
@@ -207,7 +320,8 @@ def get_booking_report(db:Session, start_date : str, end_date :str):
 
         return [
             GetBookingReportResponse(
-                REQUESTID=req.RID,                
+                REQUESTID=req.RID,
+                WIZZPNR=req.WIZZPNR,
                 FROMLOCATION=req.fromLocation,
                 FROMLANDMARK=req.fromLandmark,
                 TOLOCATION=req.toLocation,
@@ -217,20 +331,18 @@ def get_booking_report(db:Session, start_date : str, end_date :str):
                 NOOFADULTS=req.noOfAdults,
                 NOOFKIDS=req.noOfKids,
                 CARTYPE=req.carType,
-                ACREQUEST=req.acRequest,
-                CARRIERREQUES=req.carrierRequest,
-                BIDENDTIME=req.bidEndTime,
+                ACREQUEST="Required" if req.acRequest else "Not Required",
+                CARRIERREQUEST="Required" if req.carrierRequest else "Not Required",
+                BIDENDTIME=req.bidEndTime.strftime("%d-%m-%Y %H:%M:%S") if req.bidEndTime else None,
                 REQUESTSTATUS=req.requestStatus,
-                PAYMENTSTATUS=req.paymentStatus,
                 CUSTOMERAPPID=req.customerAppId,
                 REQUESTWONBY=req.requestWonBy,
-                NOOFBIDS=req.noOfBids,
-                TABLETIMESTAMP=req.tableTimestamp,
-                WIZZPNR=req.WIZZPNR,
                 FINALAMOUNT=req.finalAmount,
+                NOOFBIDS=req.noOfBids,
                 REJECTIONREASON=req.rejectionReason,
                 REQUESTOPENED=req.requestReopened,
-                REVIEWDONE=req.reviewDone                
+                REVIEWDONE=req.reviewDone,
+                TABLETIMESTAMP=req.tableTimestamp.strftime("%d-%m-%Y %H:%M:%S") if req.tableTimestamp else None,
         ) for req in requests]
     except SQLAlchemyError:
         return NoBidsResponse(message="ERROR_PREPARE")
@@ -288,7 +400,7 @@ def get_request_type(db:Session):
         db.close()
     
 
-def delete_request(db: Session, r_id : int):
+def delete_request(db: Session, r_id : int, background_tasks : BackgroundTasks):
     try:
         updated = db.query(Request).filter(Request.RID == r_id).update(
             {Request.requestStatus: "REQUEST - CANCELLED BY USER"}
@@ -297,6 +409,12 @@ def delete_request(db: Session, r_id : int):
 
         if updated==0:
             return ErrorResponse(message="NO ROWS DELETED")
+        
+        background_tasks.add_task(
+            notify_vendors_request_cancelled,
+            db,
+            r_id
+        )
         
         return ErrorResponse(message="DELETED")
     except SQLAlchemyError:
@@ -350,35 +468,176 @@ def update_request(db : Session, request_data : RequestUpdate):
     finally:
         db.close()
     
-def accept_by_vendor(db: Session, rid : int, vendor_id : int, final_amount : float):
+# def accept_by_vendor(db: Session, rid : int, vendor_id : int, final_amount : float):
+#     try:
+#         requestupdate = db.query(Request).filter(Request.RID == rid).update({
+#             Request.requestStatus: "REQUEST - CONFIRMED",
+#             Request.requestWonBy: vendor_id,
+#             Request.finalAmount:final_amount,
+#             Request.tableTimestamp:func.current_timestamp()
+
+#         })
+#         db.commit()
+
+#         if requestupdate==0:
+#             return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")
+        
+#         bidupdate = db.query(BidDetail).filter((BidDetail.rID == rid)&(BidDetail.bidderID == vendor_id)).update({
+#             BidDetail.bidStatus: "BID - CONFIRMED",
+#             BidDetail.tableTimestamp: func.current_timestamp()
+#         })
+#         db.commit()
+
+#         if bidupdate==0:
+#             return ErrorResponse(message="BID UPDATE STATUS FAILED")
+        
+#         return ErrorResponse(message="UPDATED")
+#     except SQLAlchemyError:
+#         db.rollback()
+#         return ErrorResponse(message="ERROR") 
+#     finally:
+#         db.close()
+
+def accept_by_vendor(db: Session, rid: int, vendor_id: int, final_amount: float,bid_id : int = None, car_id : int = None):
     try:
-        requestupdate = db.query(Request).filter(Request.RID == rid).update({
-            Request.requestStatus: "REQUEST - CONFIRMED",
-            Request.requestWonBy: vendor_id,
-            Request.finalAmount:final_amount,
-            Request.tableTimestamp:func.current_timestamp()
+        with db.begin():
+            # =========================
+            # 1) UPDATE REQUEST
+            # =========================
+            request_update = db.query(Request).filter(Request.RID == rid).update({
+                Request.requestStatus: "REQUEST - CONFIRMED",
+                Request.requestWonBy: vendor_id,
+                Request.finalAmount: final_amount,
+                Request.tableTimestamp: func.current_timestamp()
+            })
 
-        })
-        db.commit()
+            if request_update == 0:
+                db.rollback()
+                return ErrorResponse(message="REQUEST UPDATE FAILED")
+            
+            # =========================
+            # 2) UPDATE BID (PHP LOGIC)
+            # =========================
 
-        if requestupdate==0:
-            return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")
-        
-        bidupdate = db.query(BidDetail).filter((BidDetail.rID == rid)&(BidDetail.bidderID == vendor_id)).update({
-            BidDetail.bidStatus: "BID - CONFIRMED",
-            BidDetail.tableTimestamp: func.current_timestamp()
-        })
-        db.commit()
+            if bid_id: 
+                bid_query = db.query(BidDetail).filter(
+                    BidDetail.BID == bid_id,
+                    BidDetail.rID == rid,
+                    BidDetail.bidderID == vendor_id
+                )
+            
+            elif car_id:
+                bid_query = db.query(BidDetail).filter(
+                    BidDetail.rID == rid,
+                    BidDetail.bidderID == vendor_id,
+                    BidDetail.CARID == car_id
+                )   
 
-        if bidupdate==0:
-            return ErrorResponse(message="BID UPDATE STATUS FAILED")
-        
-        return ErrorResponse(message="UPDATED")
-    except SQLAlchemyError:
+            else : 
+                # fallback → latest bid
+                latest_bid = db.query(BidDetail).filter(
+                    BidDetail.rID == rid,
+                    BidDetail.bidderID == vendor_id
+                ).order_by(BidDetail.tableTimestamp.desc()).first()
+
+                if not latest_bid:
+                    db.rollback()
+                    return ErrorResponse(message="NO BID FOUND")
+                
+                bid_query = db.query(BidDetail).filter(BidDetail.BID == latest_bid.BID)
+
+            updated = bid_query.update({
+                BidDetail.bidStatus: "REQUEST - CONFIRMED",
+                BidDetail.tableTimestamp: func.current_timestamp()
+            })
+
+            if updated == 0:
+                db.rollback()
+                return ErrorResponse(message="BID UPDATE FAILED")
+            
+            # fetch customer id before commit so we can notify later
+            request_row = db.query(Request.customerAppId).filter(Request.RID == rid).first()
+            customer_user_app_id = request_row.customerAppId if request_row else None
+
+            # =========================
+            # 3) NOTIFY LOSING VENDORS
+            # =========================
+            try : 
+                losing_vendor_ids = get_other_vendors_who_bid_on_request(
+                    db=db,
+                    rid=rid,
+                    excluded_vendor_id=vendor_id
+                )
+
+                if losing_vendor_ids:
+                    notify_data = FCMSendDrivers(
+                        title="The request was won by another vendor!",
+                        body="The request was won by another vendor!",
+                        url="The request was won by another vendor!",
+                        soundFile="normal_notification",
+                        driverIds=losing_vendor_ids
+                    )
+
+                    send_notification_to_selected_users(db, notify_data)
+            except Exception:
+                pass
+
+
+
+            # =========================
+            # 4) NOTIFY CUSTOMER
+            # =========================
+
+            try:
+                if customer_user_app_id:
+                    send_notification_to_user(
+                        db,
+                        FCMSend(
+                            userAppId=customer_user_app_id,
+                            title="Booking Confirmed!",
+                            body="Vendor has accepted your request!",
+                            url="Booking Confirmed!",
+                            type="passengernotification",
+                            soundFile="normal_notification",
+                            source="",
+                            destination="",
+                            travelDate="",
+                            pickupTime="",
+                        ),
+                    )
+            except Exception:
+                pass
+
+            # =========================
+            # 5) NOTIFY WINNING VENDOR
+            # =========================
+            try:
+                send_notification_to_user(
+                    db,
+                    FCMSend(
+                        userAppId=vendor_id,
+                        title="Trip Confirmed!",
+                        body="Your Trip has been Confirmed.",
+                        url="Trip Confirmed!",
+                        type="passengernotification",
+                        soundFile="normal_notification",
+                        source="",
+                        destination="",
+                        travelDate="",
+                        pickupTime="",
+                    ),
+                )
+            except Exception:
+                pass
+
+            return ErrorResponse(message="UPDATED")
+
+    except SQLAlchemyError as e:
         db.rollback()
-        return ErrorResponse(message="ERROR") 
-    finally:
-        db.close()
+        return ErrorResponse(message="ERROR", error=str(e))
+                        
+
+
 
 # def reject_request_by_vendor(db:Session, rid :int , bid_id : int, rejection_reason : str):
 #     try:
@@ -404,59 +663,172 @@ def accept_by_vendor(db: Session, rid : int, vendor_id : int, final_amount : flo
 #     finally:
 #         db.close()
 
+# def reject_request_by_vendor(
+#     db: Session,
+#     rid: int,
+#     bid_id: int,
+#     rejection_reason: str
+# ) -> EmailErrorResponse | ErrorResponse:
+#     try:
+#         # One atomic transaction: if any step fails, nothing is saved
+#         with db.begin():
+#             # 1) Delete the bid (must match both BID and rID)
+#             deleted = (
+#                 db.query(BidDetail)
+#                   .filter(BidDetail.BID == bid_id, BidDetail.rID == rid)
+#                   .delete(synchronize_session=False)
+#             )
+#             if deleted == 0:
+#                 # Raising inside `with db.begin()` will auto-rollback
+#                 raise ValueError("NO ROWS DELETED")
+
+#             # 2) Recompute accurate noOfBids for this request (safer than decrement)
+#             new_count = (
+#                 db.query(func.count(BidDetail.BID))
+#                   .filter(BidDetail.rID == rid)
+#                   .scalar()
+#             )
+
+#             # 3) Update the request row only if delete succeeded
+#             updated = (
+#                 db.query(Request)
+#                   .filter(Request.RID == rid)
+#                   .update(
+#                       {
+#                           Request.noOfBids: new_count,
+#                           Request.requestStatus: "BID - OPEN",
+#                           Request.rejectionReason: rejection_reason,
+#                           Request.tableTimestamp: func.current_timestamp(),
+#                       },
+#                       synchronize_session=False,
+#                   )
+#             )
+#             if updated == 0:
+#                 raise ValueError("REQUEST TABLE UPDATE FAILED")
+
+#         # If we reached here, the transaction committed successfully
+#         return EmailErrorResponse(message="UPDATED")
+
+#     except ValueError as ve:
+#         # Transaction already rolled back by context manager
+#         return ErrorResponse(message=str(ve))
+
+#     except SQLAlchemyError as e:
+#         # Any DB error → rollback (context manager handles it), return error
+#         return ErrorResponse(message="ERROR")
+
 def reject_request_by_vendor(
     db: Session,
     rid: int,
-    bid_id: int,
-    rejection_reason: str
+    bidder_id: str,
+    bid_id : int,
+    rejection_reason: str,
+    notification_type: str = "default",
 ) -> EmailErrorResponse | ErrorResponse:
     try:
-        # One atomic transaction: if any step fails, nothing is saved
+        customer_app_id = None
         with db.begin():
-            # 1) Delete the bid (must match both BID and rID)
-            deleted = (
+            # 1) Fetch request first
+            request_row = db.query(Request).filter(Request.RID == rid).first()
+            if not request_row:
+                return ErrorResponse(message="REQUEST NOT FOUND")
+            
+            customer_app_id = request_row.customerAppId
+
+            # 2) Load exact bid row to verify it belongs to this request
+            bid_row = (
                 db.query(BidDetail)
-                  .filter(BidDetail.BID == bid_id, BidDetail.rID == rid)
-                  .delete(synchronize_session=False)
+                .filter(BidDetail.BID == bid_id, BidDetail.rID == rid)
+                .first()
             )
-            if deleted == 0:
-                # Raising inside `with db.begin()` will auto-rollback
-                raise ValueError("NO ROWS DELETED")
+            if not bid_row:
+                return ErrorResponse(message="BID NOT FOUND")
 
-            # 2) Recompute accurate noOfBids for this request (safer than decrement)
-            new_count = (
-                db.query(func.count(BidDetail.BID))
-                  .filter(BidDetail.rID == rid)
-                  .scalar()
-            )
-
-            # 3) Update the request row only if delete succeeded
+            # 3) Update request
             updated = (
                 db.query(Request)
-                  .filter(Request.RID == rid)
-                  .update(
-                      {
-                          Request.noOfBids: new_count,
-                          Request.requestStatus: "BID - OPEN",
-                          Request.rejectionReason: rejection_reason,
-                          Request.tableTimestamp: func.current_timestamp(),
-                      },
-                      synchronize_session=False,
-                  )
+                .filter(Request.RID == rid)
+                .update(
+                    {
+                        Request.requestStatus: "BID - OPEN",
+                        Request.rejectionReason: rejection_reason,
+                        Request.tableTimestamp: func.current_timestamp(),
+                    },
+                    synchronize_session=False,
+                )
             )
-            if updated == 0:
-                raise ValueError("REQUEST TABLE UPDATE FAILED")
 
-        # If we reached here, the transaction committed successfully
+            if updated == 0:
+                return ErrorResponse(message="INSERT ERROR IN FUNCTION")
+            
+            # 4) Delete ONLY the exact bid row
+            deleted = (
+                db.query(BidDetail)
+                .filter(BidDetail.BID == bid_id, BidDetail.rID == rid)
+                .delete(synchronize_session=False)
+            )
+            if deleted == 0:
+                return ErrorResponse(message="REQUEST UPDATED BUT BID NOT DELETED")
+            
+            # 5) Recompute noOfBids
+            new_count = (
+                db.query(func.count(BidDetail.BID))
+                .filter(BidDetail.rID == rid)
+                .scalar()
+            ) or 0
+            db.query(Request).filter(Request.RID == rid).update(
+                {Request.noOfBids: new_count,
+                 Request.tableTimestamp: func.current_timestamp()
+                },
+                synchronize_session=False
+            )
+
+        # 6) Notify remaining vendors
+        try:
+            remaining_vendor_ids = get_vendors_who_bid_on_request(db, rid)
+
+            if remaining_vendor_ids:
+                send_notification_to_selected_users(
+                    db,
+                    FCMSendDrivers(
+                        title="Bidding Reopened!",
+                        body="⏳ The request has been opened again! 📂",
+                        url="Bidding Reopened!",
+                        soundFile="alarm_notification",
+                        driverIds=remaining_vendor_ids,
+                    ),
+                )
+        except Exception:
+            pass
+
+         # 7) Notify customer
+        try:
+            if customer_app_id:
+                send_notification_to_user(
+                    db,
+                    FCMSend(
+                        userAppId=customer_app_id,
+                        title="Vendor Rejected your Request!",
+                        body=rejection_reason,
+                        url="Vendor Rejected your Request!",
+                        type=notification_type,
+                        soundFile="normal_notification",
+                        source="",
+                        destination="",
+                        travelDate="",
+                        pickupTime="",
+                    ),
+                )
+        except Exception:
+            pass
+        
         return EmailErrorResponse(message="UPDATED")
 
-    except ValueError as ve:
-        # Transaction already rolled back by context manager
-        return ErrorResponse(message=str(ve))
-
     except SQLAlchemyError as e:
-        # Any DB error → rollback (context manager handles it), return error
-        return ErrorResponse(message="ERROR")
+        db.rollback()
+        return ErrorResponse(message="ERROR", error=str(e))
+
+            
     
 def cancel_handshake(db:Session, rid :int):
     try : 
@@ -484,23 +856,89 @@ def cancel_handshake(db:Session, rid :int):
         db.close()
     
 
-def booking_cancelled_by_user(db:Session, rid : int, rejection_reason : str):
+# def booking_cancelled_by_user(db:Session, rid : int, rejection_reason : str):
+#     try:
+#         update = db.query(Request).filter(Request.RID == rid).update({
+#             Request.requestStatus:"BOOKING - CANCELLED BY USER'",
+#             Request.rejectionReason:rejection_reason,
+#             Request.tableTimestamp:func.current_timestamp()
+#         })
+#         db.commit()
+#         if update==0:
+#             return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")        
+#         return ErrorResponse(message="UPDATED")
+#     except SQLAlchemyError:
+#         db.rollback()
+#         return ErrorResponse(message="ERROR")
+#     finally:
+#         db.close()
+
+
+def booking_cancelled_by_user(
+    db: Session,
+    rid: int,
+    bidder_id: str,
+    rejection_reason: str,
+    notification_type: str = "default",
+):
+    """
+    PHP-equivalent behavior of bookingCancelledByUser():
+    - update request status to BOOKING - CANCELLED BY USER
+    - set rejectionReason
+    - notify the winning vendor (BIDDERID)
+    - do not delete bid history
+    """
+
     try:
-        update = db.query(Request).filter(Request.RID == rid).update({
-            Request.requestStatus:"BOOKING - CANCELLED BY USER'",
-            Request.rejectionReason:rejection_reason,
-            Request.tableTimestamp:func.current_timestamp()
-        })
+        # 1) Update request
+        updated = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .update(
+                {
+                    Request.requestStatus: "BOOKING - CANCELLED BY USER",
+                    Request.rejectionReason: rejection_reason,
+                },
+                synchronize_session=False,
+            )
+        )
+
+        if updated == 0:
+            db.rollback()
+            return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")
+
         db.commit()
-        if update==0:
-            return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")        
+
+        # 2) Notify winning vendor (best effort, same spirit as PHP)
+        try:
+            if bidder_id and str(bidder_id).strip() != "":
+                send_notification_to_user(
+                    db,
+                    FCMSend(
+                        userAppId=str(bidder_id).strip(),
+                        title="Trip Cancelled!",
+                        body="Your trip has been cancelled by the passenger. 🚀",
+                        url="Trip Cancelled!",
+                        type=notification_type,
+                        soundFile="alarm_notification",
+                        source=None,
+                        destination=None,
+                        travelDate=None,
+                        pickupTime=None,
+                    ),
+                )
+        except Exception:
+            pass
+
         return ErrorResponse(message="UPDATED")
+
     except SQLAlchemyError:
         db.rollback()
         return ErrorResponse(message="ERROR")
-    finally:
-        db.close()
-    
+
+    except Exception:
+        db.rollback()
+        return ErrorResponse(message="INSER ERROR IN FUNCTION")
 def get_all_confirmed_requests_for_customer(db: Session, user_app_id : str):
     try:
         with db.begin():
@@ -552,57 +990,79 @@ def get_all_confirmed_requests_for_customer(db: Session, user_app_id : str):
         db.close()
     
 
-def get_all_confirmed_requests_for_vendor(db: Session, vendor_id : str):
+from sqlalchemy import func
+
+def get_all_confirmed_requests_for_vendor(db: Session, vendor_id: str):
     try:
         with db.begin():
-            confirmed_requests = db.query(Request,
-                                User.fullName, 
-                                User.city,
-                                User.userAppId,
-                                User.alternateNumber,
-                                User.profilePicture,
-                                CustomerReview.generalRating
-                                ).join(
-                BidDetail, BidDetail.rID == Request.RID
-                ).join(User, User.userAppId == Request.customerAppId).outerjoin(CustomerReview, CustomerReview.RID == Request.RID).filter(
-                    (Request.requestStatus == "REQUEST - CONFIRMED") &
-                    (BidDetail.bidderID == vendor_id)).all()
+
+            confirmed_requests = db.query(
+                Request,
+                User.fullName,
+                User.city,
+                User.userAppId,
+                User.alternateNumber,
+                User.profilePicture,
+                CustomerReview.generalRating
+            ).join(
+                User, User.userAppId == Request.customerAppId
+            ).outerjoin(
+                CustomerReview, CustomerReview.RID == Request.RID
+            ).filter(
+                (Request.requestStatus == "REQUEST - CONFIRMED") &
+                (Request.requestWonBy == vendor_id) &
+                (
+                    func.str_to_date(
+                        func.concat(Request.pickUpDate, ' ', Request.pickUpTime),
+                        '%Y-%m-%d %H:%i:%s'
+                    ) < func.now()
+                )
+            ).all()
+
             if not confirmed_requests:
-                return EmailErrorResponse(message="NO_REQUESTS",error="Database Error")
-            
-            return [RequestConfirmedForVendorResponse(
-                REQUESTID=requests.RID,
-                FROMLOCATION=requests.fromLocation,
-                FROMLANDMARK=requests.fromLandmark,                
-                TOLOCATION=requests.toLocation,
-                TOLANDMARK=requests.toLandmark,
-                PICKUPDATE=requests.pickUpDate,
-                PICKUPTIME=requests.pickUpTime,
-                NOOFADULTS=requests.noOfAdults,
-                NOOFKIDS=requests.noOfKids,
-                CARTYPE=requests.carType,
-                ACREQUEST=requests.acRequest,
-                CARRIERREQUES=requests.carrierRequest,
-                BIDENDTIME=requests.bidEndTime,
-                REQUESTSTATUS=requests.requestStatus,
-                PAYMENTSTATUS=requests.paymentStatus,
-                CUSTOMERAPPID=requests.customerAppId,
-                REQUESTWONBY=requests.requestWonBy,
-                USERFULLNAME=full_name,
-                CITY=city,
-                PHONENUMBER=user_app_id,
-                ALTNUMBER=alternate_number,
-                PROFILEPIC=profile_picture,
-                BIDAMOUNT=requests.finalAmount,
-                CUSTREVIEW_GENERALRATING=general_rating,
-                CANCELLATIONREASON=requests.rejectionReason
-            ) for requests, full_name,city,user_app_id,alternate_number,profile_picture,general_rating in confirmed_requests
+                return EmailErrorResponse(message="NO_REQUESTS_FOUND")
+
+            return [
+                RequestConfirmedForVendorResponse(
+                    REQUESTID=req.RID,
+                    FROMLOCATION=req.fromLocation,
+                    FROMLANDMARK=req.fromLandmark,
+                    TOLOCATION=req.toLocation,
+                    TOLANDMARK=req.toLandmark,
+                    PICKUPDATE=req.pickUpDate,
+                    PICKUPTIME=req.pickUpTime,
+                    NOOFADULTS=req.noOfAdults,
+                    NOOFKIDS=req.noOfKids,
+                    CARTYPE=req.carType,
+                    ACREQUEST=req.acRequest,
+                    CARRIERREQUEST=req.carrierRequest,
+                    BIDENDTIME=req.bidEndTime,
+                    REQUESTSTATUS=req.requestStatus,
+                    PAYMENTSTATUS=req.paymentStatus,
+                    CUSTOMERAPPID=req.customerAppId,
+                    REQUESTWONBY=req.requestWonBy,
+                    USERFULLNAME=full_name,
+                    CITY=city,
+                    PHONENUMBER=user_app_id,
+                    ALTNUMBER=alternate_number,
+                    PROFILEPIC=profile_picture,
+                    BIDAMOUNT=req.finalAmount,
+                    CUSTREVIEW_GENERALRATING=general_rating
+                )
+                for (
+                    req,
+                    full_name,
+                    city,
+                    user_app_id,
+                    alternate_number,
+                    profile_picture,
+                    general_rating
+                ) in confirmed_requests
             ]
+
     except SQLAlchemyError as e:
         db.rollback()
-        return EmailErrorResponse(message="ERROR",error=str(e))
-    finally:
-        db.close()
+        return EmailErrorResponse(message="ERROR", error=str(e))
     
 
 def reopen_request(db : Session, r_id : int, background_tasks : BackgroundTasks):
@@ -704,6 +1164,13 @@ def create_request(
     Create a new request in requestTable.
     """
     try:
+
+        request_status = "BID - OPEN"
+        ac_request = bool(create_data.acRequest)
+        carrier_request = bool(create_data.carrierRequest)
+        request_type = create_data.requestType if create_data.requestType else 1
+        wizzpnr = create_data.wizzpnr if create_data.wizzpnr else None
+
         # 1) Validate customer exists
         existing_customer = db.query(User).filter(
             User.userAppId == create_data.customerAppId
@@ -728,7 +1195,7 @@ def create_request(
 
         # 3) Build new request row
         new_request = Request(
-            WIZZPNR=create_data.wizzpnr.strip() if create_data.wizzpnr else None,
+            WIZZPNR=wizzpnr,
             fromLocation=create_data.fromLocation.strip(),
             fromLandmark=create_data.fromLandmark.strip() if create_data.fromLandmark else None,
             toLocation=create_data.toLocation.strip(),
@@ -738,13 +1205,13 @@ def create_request(
             noOfAdults=create_data.noOfAdults,
             noOfKids=create_data.noOfKids,
             carType=create_data.carType.strip() if create_data.carType else None,
-            acRequest=create_data.acRequest,
-            carrierRequest=create_data.carrierRequest,
+            acRequest=ac_request,
+            carrierRequest=carrier_request,
             specialRequest=create_data.specialRequest.strip() if create_data.specialRequest else None,
             bidEndTime=create_data.bidEndTime,
-            requestStatus="BID - OPEN",
+            requestStatus=request_status,
             customerAppId=create_data.customerAppId,
-            requestType=create_data.requestType if create_data.requestType else 1,
+            requestType=request_type,
             tableTimestamp=datetime.now()
         )
 
@@ -754,13 +1221,25 @@ def create_request(
 
         # 4) Background notification (optional)
         if notify:
-            background_tasks.add_task(
-                send_notification_to_all_vendors,
-                "🚖 New Cab Request Alert! 🚖",
-                f"A customer has just created a new cab request from {create_data.fromLocation} to {create_data.toLocation}! 🏁💨 Submit your bid now and secure the ride.",
-                "passenger_notification",
-                "alarm_notification",
+            # background_tasks.add_task(
+            #     send_notification_to_all_vendors,
+            #     "🚖 New Cab Request Alert! 🚖",
+            #     f"A customer has just created a new cab request from {create_data.fromLocation} to {create_data.toLocation}! 🏁💨 Submit your bid now and secure the ride.",
+            #     "passenger_notification",
+            #     "alarm_notification",
+            # )
+            vendor_ids = get_vendors_for_request(
+                db,
+                create_data.fromLocation,
+                create_data.toLocation,
             )
+
+            if vendor_ids:
+                background_tasks.add_task(
+                    notify_vendors_for_request,
+                    vendor_ids,
+                    create_data,
+                )
 
         # If your model has an RID (auto or generated), include it in the response
         return EmailErrorResponse(message="INSERTED", RID=getattr(new_request, "RID", None))
@@ -771,114 +1250,266 @@ def create_request(
     finally:
         db.close()
 
-def assign_driver_to_request(db:Session, request_data : AssignDriverRequest):
-    try : 
+# def assign_driver_to_request(db:Session, request_data : AssignDriverRequest):
+#     try : 
+#         with db.begin():
+#             # CHECK IF REQUEST EXISTS OR NOT
+#             request = db.query(Request).filter(Request.RID == request_data.RID).first()
+#             if not request:
+#                 return EmailErrorResponse(message="NOT FOUND")
+#             user_app_id = request.customerAppId
+
+#             #Get Driver Details            
+#             driver_details = db.query(DriverDetail).filter(DriverDetail.DDID == request_data.DRIVERID).first()
+#             driver_name = driver_details.driverName if driver_details else None
+#             driver_number = driver_details.driverNumber if driver_details else None
+
+#             #Update the request with driver assignment
+#             request.driverAssignedID = request_data.DRIVERID
+#             request.tableTimestamp = datetime.now()
+            
+
+#             #Fetch Customer FCM Token to notify
+#             customer = db.query(User).filter(User.userAppId == user_app_id).first()
+#             fcm_token = ""
+#             if customer and customer.fcmToken:
+#                 fcm_token = customer.fcmToken.strip()
+
+#             #Send Notifciaton 
+#             if fcm_token and fcm_token.lower() not in ["","null"]:
+#                 if driver_name or driver_number: 
+#                     who = driver_name or "your driver"
+#                     num = f" ({driver_number})" if driver_number else ""
+#                     body = f"{who}{num} has been assigned to your request #{request_data.RID}."
+#                 else:
+#                     body = body = f"A driver has been assigned to your request #{request_data.RID}."
+
+#                 try:
+#                     notification = send_notification(
+#                         title="Driver Assigned",
+#                         body=body,
+#                         fcm_token=fcm_token,
+#                         url="//mytrips",
+#                         type="passengernotification",
+#                         sound_file="alarm_notification"
+#                     )
+#                 except Exception as e:
+#                     print(f"[FCM] Failed for {request.customerAppId}: {e}")
+#             return EmailErrorResponse(message="UPDATED")     
+#     except SQLAlchemyError as e:
+#         print(str(e))
+#         db.rollback()
+#         return EmailErrorResponse(message="DB ERROR")
+#     except Exception as e:
+#         db.rollback()
+#         return EmailErrorResponse(message="INSER ERROR IN FUNCTION")
+#     finally:
+#         db.close()
+
+def assign_driver_to_request(db: Session, request_data: AssignDriverRequest):
+    try:
         with db.begin():
-            # CHECK IF REQUEST EXISTS OR NOT
             request = db.query(Request).filter(Request.RID == request_data.RID).first()
             if not request:
                 return EmailErrorResponse(message="NOT FOUND")
-            user_app_id = request.customerAppId
 
-            #Get Driver Details            
-            driver_details = db.query(DriverDetail).filter(DriverDetail.DDID == request_data.DRIVERID).first()
+            driver_details = db.query(DriverDetail).filter(
+                DriverDetail.DDID == request_data.DRIVERID
+            ).first()
+
             driver_name = driver_details.driverName if driver_details else None
             driver_number = driver_details.driverNumber if driver_details else None
 
-            #Update the request with driver assignment
             request.driverAssignedID = request_data.DRIVERID
             request.tableTimestamp = datetime.now()
-            
 
-            #Fetch Customer FCM Token to notify
-            customer = db.query(User).filter(User.userAppId == user_app_id).first()
-            fcm_token = ""
-            if customer and customer.fcmToken:
-                fcm_token = customer.fcmToken.strip()
+        # send after DB transaction succeeds
+        try:
+            notify_driver_assigned_to_customer(
+                db,
+                customer_user_app_id=request.customerAppId,
+                request_id=request_data.RID,
+                driver_name=driver_name,
+                driver_number=driver_number,
+            )
+        except Exception:
+            pass
 
-            #Send Notifciaton 
-            if fcm_token and fcm_token.lower() not in ["","null"]:
-                if driver_name or driver_number: 
-                    who = driver_name or "your driver"
-                    num = f" ({driver_number})" if driver_number else ""
-                    body = f"{who}{num} has been assigned to your request #{request_data.RID}."
-                else:
-                    body = body = f"A driver has been assigned to your request #{request_data.RID}."
+        return EmailErrorResponse(message="UPDATED")
 
-                try:
-                    notification = send_notification(
-                        title="Driver Assigned",
-                        body=body,
-                        fcm_token=fcm_token,
-                        url="//mytrips",
-                        type="passengernotification",
-                        sound_file="alarm_notification"
-                    )
-                except Exception as e:
-                    print(f"[FCM] Failed for {request.customerAppId}: {e}")
-            return EmailErrorResponse(message="UPDATED")     
-    except SQLAlchemyError as e:
-        print(str(e))
+    except SQLAlchemyError:
         db.rollback()
         return EmailErrorResponse(message="DB ERROR")
-    except Exception as e:
+    except Exception:
         db.rollback()
-        return EmailErrorResponse(message="INSER ERROR IN FUNCTION")
-    finally:
-        db.close()
-    
+        return EmailErrorResponse(message="INSER ERROR IN FUNCTION")    
 
-def get_all_cancelled_requests_for_vendor(db: Session, vendor_id : str):
-    try:
-        with db.begin():
-            cancelled_requests = db.query(Request,
-                                User.fullName, 
-                                User.city,
-                                User.userAppId,
-                                User.alternateNumber,
-                                User.profilePicture,
-                                CustomerReview.generalRating
-                                ).join(
-                BidDetail, BidDetail.rID == Request.RID
-                ).join(User, User.userAppId == Request.customerAppId).outerjoin(CustomerReview, CustomerReview.RID == Request.RID).filter(
-                    (Request.requestStatus == "BOOKING - CANCELLED BY USER") &
-                    (BidDetail.bidderID == vendor_id)).all()
-            if not cancelled_requests:
-                return EmailErrorResponse(message="NO_REQUESTS",error="Database Error")
+# def get_all_cancelled_requests_for_vendor(db: Session, vendor_id : str):
+#     try:
+#         with db.begin():
+#             cancelled_requests = db.query(Request,
+#                                 User.fullName, 
+#                                 User.city,
+#                                 User.userAppId,
+#                                 User.alternateNumber,
+#                                 User.profilePicture,
+#                                 CustomerReview.generalRating
+#                                 ).join(
+#                 BidDetail, BidDetail.rID == Request.RID
+#                 ).join(User, User.userAppId == Request.customerAppId).outerjoin(CustomerReview, CustomerReview.RID == Request.RID).filter(
+#                     (Request.requestStatus == "BOOKING - CANCELLED BY USER") &
+#                     (BidDetail.bidderID == vendor_id)).all()
+#             if not cancelled_requests:
+#                 return EmailErrorResponse(message="NO_REQUESTS",error="Database Error")
             
-            return [RequestConfirmedForVendorResponse(
-                REQUESTID=requests.RID,
-                FROMLOCATION=requests.fromLocation,
-                FROMLANDMARK=requests.fromLandmark,                
-                TOLOCATION=requests.toLocation,
-                TOLANDMARK=requests.toLandmark,
-                PICKUPDATE=requests.pickUpDate,
-                PICKUPTIME=requests.pickUpTime,
-                NOOFADULTS=requests.noOfAdults,
-                NOOFKIDS=requests.noOfKids,
-                CARTYPE=requests.carType,
-                ACREQUEST=requests.acRequest,
-                CARRIERREQUES=requests.carrierRequest,
-                BIDENDTIME=requests.bidEndTime,
-                REQUESTSTATUS=requests.requestStatus,
-                PAYMENTSTATUS=requests.paymentStatus,
-                CUSTOMERAPPID=requests.customerAppId,
-                REQUESTWONBY=requests.requestWonBy,
-                USERFULLNAME=full_name,
+#             return [RequestConfirmedForVendorResponse(
+#                 REQUESTID=requests.RID,
+#                 FROMLOCATION=requests.fromLocation,
+#                 FROMLANDMARK=requests.fromLandmark,                
+#                 TOLOCATION=requests.toLocation,
+#                 TOLANDMARK=requests.toLandmark,
+#                 PICKUPDATE=requests.pickUpDate,
+#                 PICKUPTIME=requests.pickUpTime,
+#                 NOOFADULTS=requests.noOfAdults,
+#                 NOOFKIDS=requests.noOfKids,
+#                 CARTYPE=requests.carType,
+#                 ACREQUEST=requests.acRequest,
+#                 CARRIERREQUES=requests.carrierRequest,
+#                 BIDENDTIME=requests.bidEndTime,
+#                 REQUESTSTATUS=requests.requestStatus,
+#                 PAYMENTSTATUS=requests.paymentStatus,
+#                 CUSTOMERAPPID=requests.customerAppId,
+#                 REQUESTWONBY=requests.requestWonBy,
+#                 USERFULLNAME=full_name,
+#                 CITY=city,
+#                 PHONENUMBER=user_app_id,
+#                 ALTNUMBER=alternate_number,
+#                 PROFILEPIC=profile_picture,
+#                 BIDAMOUNT=requests.finalAmount,
+#                 CUSTREVIEW_GENERALRATING=general_rating,
+#                 CANCELLATIONREASON=requests.rejectionReason
+#             ) for requests, full_name,city,user_app_id,alternate_number,profile_picture,general_rating in cancelled_requests
+#             ]
+#     except SQLAlchemyError as e:
+#         db.rollback()
+#         return EmailErrorResponse(message="ERROR",error=str(e))
+#     finally:
+#         db.close()
+
+
+
+
+def get_all_cancelled_requests_for_vendor(db: Session, vendor_id: str):
+    try:
+        timestamp_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        request_status = "BOOKING - CANCELLED BY USER"
+
+        cancelled_requests = (
+            db.query(
+                Request.RID,
+                Request.fromLocation,
+                Request.fromLandmark,
+                Request.toLocation,
+                Request.toLandmark,
+                Request.pickUpDate,
+                Request.pickUpTime,
+                Request.noOfAdults,
+                Request.noOfKids,
+                Request.carType,
+                Request.acRequest,
+                Request.carrierRequest,
+                Request.bidEndTime,
+                Request.requestStatus,
+                Request.paymentStatus,
+                Request.customerAppId,
+                Request.requestWonBy,
+                Request.finalAmount,
+                Request.customerReviewDone,
+                Request.rejectionReason,
+                User.fullName,
+                User.city,
+                User.userAppId,
+                User.alternateNumber,
+                User.profilePicture,
+                CustomerReview.generalRating,
+            )
+            .join(User, User.userAppId == Request.customerAppId)
+            .outerjoin(CustomerReview, CustomerReview.RID == Request.RID)
+            .filter(
+                Request.requestStatus == request_status,
+                Request.requestWonBy == vendor_id,
+                func.str_to_date(
+                    func.concat(Request.pickUpDate, " ", Request.pickUpTime),
+                    "%Y-%m-%d %H:%i:%s",
+                ) < timestamp_value,
+            )
+            .all()
+        )
+
+        if not cancelled_requests:
+            return EmailErrorResponse(message="NO REQUESTS FOUND")
+
+        return [
+            RequestConfirmedForVendorResponse(
+                REQUESTID=RID,
+                FROMLOCATION=fromLocation,
+                FROMLANDMARK=fromLandmark,
+                TOLOCATION=toLocation,
+                TOLANDMARK=toLandmark,
+                PICKUPDATE=pickUpDate,
+                PICKUPTIME=pickUpTime,
+                NOOFADULTS=noOfAdults,
+                NOOFKIDS=noOfKids,
+                CARTYPE=carType,
+                ACREQUEST=acRequest,
+                CARRIERREQUEST=carrierRequest,
+                BIDENDTIME=bidEndTime,
+                REQUESTSTATUS=requestStatus,
+                PAYMENTSTATUS=paymentStatus,
+                CUSTOMERAPPID=customerAppId,
+                REQUESTWONBY=requestWonBy,
+                USERFULLNAME=fullName,
                 CITY=city,
-                PHONENUMBER=user_app_id,
-                ALTNUMBER=alternate_number,
-                PROFILEPIC=profile_picture,
-                BIDAMOUNT=requests.finalAmount,
-                CUSTREVIEW_GENERALRATING=general_rating,
-                CANCELLATIONREASON=requests.rejectionReason
-            ) for requests, full_name,city,user_app_id,alternate_number,profile_picture,general_rating in cancelled_requests
-            ]
+                PHONENUMBER=userAppId,
+                ALTNUMBER=alternateNumber,
+                PROFILEPIC=profilePicture,
+                BIDAMOUNT=finalAmount,
+                CUSTREVIEW_GENERALRATING=generalRating,
+                CANCELLATIONREASON=rejectionReason,
+            )
+            for (
+                RID,
+                fromLocation,
+                fromLandmark,
+                toLocation,
+                toLandmark,
+                pickUpDate,
+                pickUpTime,
+                noOfAdults,
+                noOfKids,
+                carType,
+                acRequest,
+                carrierRequest,
+                bidEndTime,
+                requestStatus,
+                paymentStatus,
+                customerAppId,
+                requestWonBy,
+                finalAmount,
+                customerReviewDone,
+                rejectionReason,
+                fullName,
+                city,
+                userAppId,
+                alternateNumber,
+                profilePicture,
+                generalRating,
+            ) in cancelled_requests
+        ]
+
     except SQLAlchemyError as e:
         db.rollback()
-        return EmailErrorResponse(message="ERROR",error=str(e))
-    finally:
-        db.close()
+        return EmailErrorResponse(message="ERROR", error=str(e))
 
 
 def get_all_requests_by_request_status(db: Session, customer_id : int, request_status : str):
@@ -902,7 +1533,8 @@ def get_all_requests_by_request_status(db: Session, customer_id : int, request_s
                 NOOFKIDS=req.noOfKids,
                 CARTYPE=req.carType,
                 ACREQUEST=req.acRequest,
-                CARRIERREQUES=req.carrierRequest,
+                CARRIERREQUEST=req.carrierRequest,
+                SPECIALREQUEST=req.specialRequest,
                 BIDENDTIME=req.bidEndTime,
                 REQUESTSTATUS=req.requestStatus,
                 PAYMENTSTATUS=req.paymentStatus,

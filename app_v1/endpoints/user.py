@@ -1,8 +1,12 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from ..schemas.user_table import (NoUserResponse,BidderDetail,UserBankDetailsResponse,UserCreate,
                                   LogoutResponse,UserDelete,UserBankDetailsUpdate,UserImageUpload,
                                   VendorUpdate,VendorKycCreate,UpdateRequestTypeSelectionsRequest,
-                                  UpdateRegionCitySelectionsRequest,GetUserDetailsResponse,RequestTypeResponse)
+                                  UpdateRegionCitySelectionsRequest,GetUserDetailsResponse,
+                                  RequestTypeResponse,CustomerListItem,GetAllVendorsWithUnapprovedResponse,
+                                  AdminNumberResponse,UpdateVendorApprovalRequest,
+                                  UpdateVendorLockAppStatusRequest,RejectUserRequest,
+                                  UploadVendorDocumentRequest,UploadVendorDocumentResponse)
 from ..utils.common import ErrorResponse,EmailErrorResponse,SMSErrorResponse,ImageResponse
 from typing import Union, List
 from ..database import get_db
@@ -11,9 +15,12 @@ from ..crud.user import (get_user_details,check_user,get_all_vendors,get_vendor_
                          get_user_bank_details,fcm_token_update,logout_user,
                          delete_user,update_vendor_bank_details,profile_image_upload,get_users_all,vendor_update,
                          vendor_update_with_kyc,update_request_type_selections,update_region_city_selections,
-                         get_request_type_selections)
+                         get_request_type_selections,get_all_customers,get_all_vendors_with_unapproved,get_admin_number,
+                         update_vendor_approved_status,update_vendor_lock_app_status,reject_user,upload_vendor_document_backend)
 from ..utils.otp import send_otp_to_user
+from ..utils.rate_limit import client_ip_from_request, enforce_rate_limit
 from ..auth.deps import get_current_user_id
+import os
 
 
 
@@ -33,11 +40,30 @@ def get_user(db:Session = Depends(get_db),
     return get_user_details(db,userAppId=userAppId)
 
 
-@router.get("/checkregistereduser",response_model=NoUserResponse)
-def check_registered_user(db:Session = Depends(get_db), 
-                          user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                          userAppId : str = Query(...)):
-    return check_user(db,user_app_id=userAppId)
+@router.get("/checkregistereduser", response_model=Union[NoUserResponse, ErrorResponse])
+def check_registered_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    userAppId: str = Query(...),
+):
+    """Public pre-login registration check (PR5). No JWT required."""
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"checkregistereduser:ip:{client_ip_from_request(request)}",
+        max_hits=int(os.getenv("RATE_LIMIT_CHECK_USER_PER_IP", "60")),
+        window_seconds=int(os.getenv("RATE_LIMIT_CHECK_USER_WINDOW_SECONDS", "60")),
+    )
+    if limited is not None:
+        return limited
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"checkregistereduser:user:{userAppId}",
+        max_hits=int(os.getenv("RATE_LIMIT_CHECK_USER_PER_APPID", "30")),
+        window_seconds=int(os.getenv("RATE_LIMIT_CHECK_USER_WINDOW_SECONDS", "60")),
+    )
+    if limited is not None:
+        return limited
+    return check_user(db, user_app_id=userAppId)
 
 
 @router.get("/getallvendors",response_model=Union[List[GetUserDetailsResponse],NoUserResponse])
@@ -76,11 +102,30 @@ def user_logout(userAppId : str, fcmToken : str,
                 db : Session = Depends(get_db)):
     return logout_user(db,user_app_id=userAppId,fcm_token=fcmToken,)
 
-@router.post("/otpcall",response_model=Union[ErrorResponse,SMSErrorResponse])
-def send_otp(userAppId: str, 
-             user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-             db : Session = Depends(get_db)):
-    return send_otp_to_user(db,user_app_id=userAppId)
+@router.post("/otpcall", response_model=Union[ErrorResponse, SMSErrorResponse])
+def send_otp(
+    request: Request,
+    userAppId: str,
+    db: Session = Depends(get_db),
+):
+    """Public OTP send (PR5). Stores OTP hash server-side; never returns OTP."""
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"otpcall:ip:{client_ip_from_request(request)}",
+        max_hits=int(os.getenv("RATE_LIMIT_OTPCALL_PER_IP", "20")),
+        window_seconds=int(os.getenv("RATE_LIMIT_OTPCALL_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        return limited
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"otpcall:user:{userAppId}",
+        max_hits=int(os.getenv("RATE_LIMIT_OTPCALL_PER_APPID", "5")),
+        window_seconds=int(os.getenv("RATE_LIMIT_OTPCALL_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        return limited
+    return send_otp_to_user(db, user_app_id=userAppId)
 
 @router.post("/deleteappuser",response_model=ErrorResponse)
 def delete_existing_user(user_delete_data : UserDelete, 
@@ -130,6 +175,51 @@ def get_user_request_type_preferences(db: Session = Depends(get_db),
                                       userAppId:str=Query(...)):
     return get_request_type_selections(db,user_app_id=userAppId)
 
-    
+
+@router.get("/getallcustomers",response_model=Union[List[CustomerListItem],NoUserResponse])
+def get_all_customers_(db:Session = Depends(get_db),
+                  user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                  ):
+    return get_all_customers(db)
+
+@router.get("/getallvendorswithunapproved",response_model=Union[List[GetUserDetailsResponse],NoUserResponse])
+def get_all_vendors_with_unapproved_(db:Session = Depends(get_db),
+                    user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                    ):
+        return get_all_vendors_with_unapproved(db)  
+
+@router.get("/getadminnumber",response_model=Union[AdminNumberResponse,NoUserResponse,EmailErrorResponse])
+def get_admin_number_endpoint(db:Session = Depends(get_db),
+                                user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                ):
+    return get_admin_number(db)
 
 
+@router.put("/updatevendorapprovedstatus",response_model=EmailErrorResponse)
+def update_vendor_approved_status_endpoint(data : UpdateVendorApprovalRequest,
+                                            user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                            db: Session = Depends(get_db) ):
+    return update_vendor_approved_status(db,data)
+
+
+@router.put("/updatevendorlockappstatus",response_model=EmailErrorResponse)
+def update_vendor_lock_app_status_endpoint(data : UpdateVendorLockAppStatusRequest,
+                                            user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                            db: Session = Depends(get_db) ):
+    return update_vendor_lock_app_status(db,data)
+
+
+@router.post("/rejectuser",response_model=EmailErrorResponse)
+
+def reject_user_endpoint(data : RejectUserRequest,
+                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                         db: Session = Depends(get_db) ):
+    return reject_user(db,data)
+
+
+@router.post("/uploadvendordocumentbackend",response_model=Union[UploadVendorDocumentResponse,EmailErrorResponse])
+
+def upload_vendor_document_endpoint(data : UploadVendorDocumentRequest,
+                                    user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                    db: Session = Depends(get_db) ):
+        return upload_vendor_document_backend(db,data)  

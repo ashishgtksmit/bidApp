@@ -1,5 +1,5 @@
 from pydantic import BaseModel, field_validator, constr
-from typing import Optional, List
+from typing import Literal, Optional, List, Union
 from datetime import date
 from enum import Enum
 import re
@@ -88,7 +88,62 @@ class DriverDetailResponse(TrimmedBaseModel):
 
     model_config={"from_attributes":True}
     
-                
+class GetAllDriversResponse(TrimmedBaseModel):
+    DDID : int
+    USERAPPID : Optional[str] = None
+    DRIVERNAME : Optional[str] = None
+    DRIVERNUMBER : Optional[str] = None
+    DRIVERDOB : Optional[str] = None
+    DRIVERGENDER : Optional[str] = None
+    DRIVERCITY : Optional[str] = None
+    DRIVERLICENSE : Optional[str] = None
+    DRIVERDOCUMENT : Optional[str] = None
+    DRIVERPHOTO : Optional[str] = None
+    TABLETIMESTAMP : Optional[str] = None
+    VENDORNAME : Optional[str] = None
+
+    model_config={"from_attributes":True}
+    
 class ErrorResponse(TrimmedBaseModel):
     message : str
-            
+
+
+class UploadDriverDocumentRequest(BaseModel):
+    driverId: int
+    docType: Literal[
+        "DRIVERLICENSE",
+        "DRIVERDOCUMENT",
+        "DRIVERPHOTO",
+    ]
+    uploadFile: Union[str, List[str]]
+
+    @field_validator("driverId", mode="before")
+    @classmethod
+    def normalize_driver_id(cls, v):
+        if isinstance(v, list):
+            return int(v[0]) if v else 0
+        return int(v)
+
+    @field_validator("docType", mode="before")
+    @classmethod
+    def normalize_doc_type(cls, v):
+        if isinstance(v, list):
+            return str(v[0]).strip().upper() if v else ""
+        return str(v).strip().upper()
+
+    @field_validator("uploadFile", mode="before")
+    @classmethod
+    def normalize_upload_file(cls, v):
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else ""
+        return str(v).strip()
+
+class UploadDriverDocumentResponse(BaseModel):
+    status: str
+    driverId: int
+    docType: str
+    column: str
+    url: str
+    userAppId: str
+    driverName: str
+    driverNumber: str

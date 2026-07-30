@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from typing import Union,List
 from ..utils.common import EmailErrorResponse, ErrorResponse
-from ..schemas.driver_details import UpdateDriverDetail,DeleteDriverDetail,CreateDriverDetail,DriverDetailResponse
+from ..schemas.driver_details import (UpdateDriverDetail,DeleteDriverDetail,CreateDriverDetail,
+                                      DriverDetailResponse,GetAllDriversResponse,UploadDriverDocumentRequest,UploadDriverDocumentResponse)
 from ..database import get_db
-from ..crud.driver import update_driver_details,delete_driver_by_id,insert_driver,get_all_driver_for_vendor
+from ..crud.driver import update_driver_details,delete_driver_by_id,insert_driver,get_all_driver_for_vendor,get_all_drivers,upload_driver_document_backend
 from ..auth.deps import get_current_user_id
 
 router = APIRouter()
@@ -32,3 +33,15 @@ def read_all_drivers_for_vendors(db:Session = Depends(get_db),
                                  user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
                                  userAppId : str = Query(...)):
     return get_all_driver_for_vendor(db,userappid=userAppId)
+
+@router.get("/getalldrivers", response_model=Union[GetAllDriversResponse,ErrorResponse])
+def get_all_drivers_endpoint(db:Session = Depends(get_db), 
+                                 user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                 ):
+    return get_all_drivers(db)
+
+@router.post("/uploaddriverdocumentbackend",response_model=Union[UploadDriverDocumentResponse,ErrorResponse])
+def upload_driver_document_endpoint(request: UploadDriverDocumentRequest, 
+                                    db: Session = Depends(get_db), 
+                                    user_id: str = Depends(get_current_user_id)):
+    return upload_driver_document_backend(db)

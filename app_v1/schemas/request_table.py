@@ -120,7 +120,8 @@ class RequestConfirmedCommonResponse(BaseModel):
     NOOFKIDS : int
     CARTYPE:str
     ACREQUEST:bool
-    CARRIERREQUES:bool
+    CARRIERREQUEST:bool
+    SPECIALREQUEST:str
     BIDENDTIME:datetime
     REQUESTSTATUS:str
     PAYMENTSTATUS:Optional[str] = None
@@ -212,17 +213,27 @@ class RequestForUserResponse(RequestConfirmedCommonResponse):
             }
         }
 
-class GetBookingReportResponse(RequestConfirmedCommonResponse):
-
+class GetBookingReportResponse(BaseModel):
+    REQUESTID: int
     WIZZPNR: Optional[str] = None
-    FINALAMOUNT : Optional[float] = None
-    REJECTIONREASON:Optional[str] = None
-    REQUESTOPENED:Optional[bool] = None
-    REVIEWDONE:Optional[str] = None
-
-    model_config = {
-        "from_attributes":True,
-        "json_encoders": {
-            datetime: lambda v: v.strftime('%Y-%m-%d %H:%M:%S') if v else None
-        }
-    }
+    FROMLOCATION: str
+    FROMLANDMARK: Optional[str] = None
+    TOLOCATION: str
+    TOLANDMARK: Optional[str] = None
+    PICKUPDATE: date
+    PICKUPTIME: time
+    NOOFADULTS: int
+    NOOFKIDS: int
+    CARTYPE: str
+    ACREQUEST: str
+    CARRIERREQUEST: str
+    BIDENDTIME: Optional[str] = None
+    REQUESTSTATUS: str
+    CUSTOMERAPPID: str
+    REQUESTWONBY: Optional[str] = None
+    FINALAMOUNT: Optional[float] = None
+    NOOFBIDS: Optional[int] = None
+    REJECTIONREASON: Optional[str] = None
+    REQUESTOPENED: Optional[bool] = None
+    REVIEWDONE: Optional[str] = None
+    TABLETIMESTAMP: Optional[str] = None
