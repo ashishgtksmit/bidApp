@@ -88,3 +88,19 @@ python -m pytest tests/test_pr8_insertrequest.py -q
 ```bash
 python -m pytest tests/test_pr9_update_delete_request.py -q
 ```
+
+## PR10 — Customer bids / accept / cancel handshake
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getallbidsforrequest?RID=` | JWT owner only; request must be `BID - OPEN`; returns selectable `BID - OPEN` bids sorted by amount; customer-safe schema (**no FCMTOKEN**); empty → `[]` |
+| `PUT /acceptbid?RID=&BIDID=` | Identity is RID+BIDID; derives vendor/car/amount from DB; request `BID - OPEN` → `BID - CONFIRMED`; selected bid → `BID - CONFIRMED`; competitors unchanged; does **not** set `requestWonBy`/`finalAmount`; does **not** enforce `bidEndTime`; same BIDID replay idempotent (no duplicate notify); conflicting BIDID → 409 |
+| `PUT /cancelhandshakerequest?RID=` | Owner only; `BID - CONFIRMED` → `BID - OPEN` + all bids `BID - OPEN` in one transaction; already `BID - OPEN` → idempotent `CANCELLED`; other statuses → 409; **no FCM** |
+
+Accept winner notification: `notify_vendor_bid_accepted` background task opens its own `SessionLocal()`; failures logged and do not undo commit.
+
+Vendor Flutter call sites for GET bids / insert/update/delete bid / accept/reject handshake remain on PHP.
+
+```bash
+python -m pytest tests/test_pr10_customer_bids.py -q
+```

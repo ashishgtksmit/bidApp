@@ -114,11 +114,13 @@ def reject_by_vendor(db:Session=Depends(get_db),
     return reject_request_by_vendor(db,rid=RID,bid_id=BID,rejection_reason=rejectionReason)
 
 @router.put("/cancelhandshakerequest", response_model=ErrorResponse)
-
-def cancel_handshake_of_request(db:Session=Depends(get_db),
-                                user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                RID : int = Query(...)):
-    return cancel_handshake(db,rid=RID)
+def cancel_handshake_of_request(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+):
+    """Customer cancel handshake. Ownership + status gate. No FCM in PR10."""
+    return cancel_handshake(db, rid=RID, user_id=user_id)
 
 @router.put("/bookingcancelledbyuser",response_model=ErrorResponse)
 

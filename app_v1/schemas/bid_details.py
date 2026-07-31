@@ -76,3 +76,37 @@ class UpdateCarIdForBidRequest(BaseModel):
     
 class NoBidResponse(BaseModel):
     message : str
+
+
+class CustomerBidDetail(BaseModel):
+    """Customer-safe bid list item for GET /getallbidsforrequest (PR10).
+
+    Excludes FCMTOKEN and unused KYC/document fields.
+    """
+
+    BIDID: int
+    BIDDERID: str
+    BIDAMOUNT: float
+    BIDSTATUS: Optional[str] = None
+    BIDDERNAME: Optional[str] = None
+    BIDDERRATING: float = 0.0
+    TOTALNOOFREVIEWS: int = 0
+    PROFILEPIC: Optional[str] = None
+    DOB: Optional[date] = None
+    JOININGDATE: Optional[date] = None
+    BASELOCATION: Optional[str] = None
+    TAGS: List[str] = []
+    NOOFTRIPSCOMPLETED: int = 0
+    CARID: Optional[int] = None
+    CARREGNO: Optional[str] = None
+    CARMODEL: Optional[str] = None
+    MODELYEAR: Optional[str] = None
+    CARCOLOR: Optional[str] = None
+    OWNERNAME: Optional[str] = None
+    REGISTEREDON: Optional[str] = None
+    IMAGEVEHICLEFRONT: Optional[str] = None
+    IMAGEVEHICLESIDE: Optional[str] = None
+    CAR_TYPE: Optional[str] = None
+    CAR_SUB_TYPE: Optional[str] = None
+
+    model_config = {"from_attributes": True}

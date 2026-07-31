@@ -1,136 +1,213 @@
-from sqlalchemy import func
+from sqlalchemy import String as SAString, cast, func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from fastapi import BackgroundTasks, HTTPException, status
+from typing import Optional
 from ..models.bid_details import BidDetail
 from ..models.user_table import User
 from ..models.tags_table import Tag
 from ..models.request_table import Request
 from ..models.car_details import CarDetail
 from ..models.car_type_details import CarTypeDetail
-from ..schemas.bid_details import BidDetail as BidDetailSchema, NoBidResponse, BidInsert,UpdateCarIdForBidRequest
+from ..schemas.bid_details import (
+    CustomerBidDetail,
+    BidInsert,
+    UpdateCarIdForBidRequest,
+)
 from ..utils.common import ErrorResponse,EmailErrorResponse
 from datetime import datetime
 from ..utils.common import parse_dob
 from ..services.vendor_filtering import get_vendors_who_bid_on_request
-from ..services.notifications import send_notification_to_selected_users, send_notification_to_user, FCMSendDrivers, FCMSend
+from ..services.notifications import (
+    send_notification_to_selected_users,
+    send_notification_to_user,
+    notify_vendor_bid_accepted,
+    FCMSendDrivers,
+    FCMSend,
+)
 from zoneinfo import ZoneInfo
 
 
+# Customer GET /getallbidsforrequest — only BID - OPEN requests (active review UI).
+_CUSTOMER_BID_REVIEW_STATUSES = frozenset({"BID - OPEN"})
+# Selectable bids for customer acceptance (null-as-open not used — insert always sets BID - OPEN).
+_SELECTABLE_BID_STATUSES = frozenset({"BID - OPEN"})
 
-def get_bids_for_request(db : Session, rid : int):    
+
+def _ist_now_naive() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+
+def _as_float_amount(value) -> float:
+    if value is None:
+        return 0.0
     try:
-        bids = db.query(BidDetail, 
-                        
-                        User.fullName, User.rating, User.totalNoOfReviews, User.fcmToken, User.profilePicture,
-                        User.dob, User.joiningDate, User.city, User.tags, User.noOfTripsCompleted,
-                        
-                        CarDetail.CARID,
-                        CarDetail.carRegNo,
-                        CarDetail.carModel,
-                        CarDetail.modelYear,
-                        CarDetail.carColor,
-                        CarDetail.ownerName,
-                        CarDetail.registrationDoc,
-                        CarDetail.powerOfAttorneyDoc,
-                        CarDetail.registeredOn,
-                        CarDetail.adminApproved,
-                        CarDetail.carOwnedBySameVendor,
-                        CarDetail.CTD,
-                        CarDetail.imageVehicleFront,
-                        CarDetail.imageVehicleSide,
-                        CarDetail.userAppId,
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
-                        CarTypeDetail.car_type,
-                        CarTypeDetail.car_sub_type,
-                        CarTypeDetail.capacity,
-                        CarTypeDetail.image_url                        
-                        ).join(
-                            User, User.userAppId == BidDetail.bidderID
-                        ).outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID).outerjoin(
-                            CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD
-                        ).filter(
-                            BidDetail.rID == rid
-                        ).all()
+
+def get_bids_for_request(
+    db: Session,
+    rid: int,
+    user_id: Optional[str] = None,
+):
+    """
+    Customer-owned bid list for a request (PR10).
+
+    Validation order: load request → 404 → ownership 403 → status gate →
+    return selectable BID - OPEN bids only, sorted by amount ascending.
+    Never returns FCMTOKEN.
+    Empty result is ``[]`` (preferred). Intentionally does not enforce bidEndTime.
+    """
+    try:
+        request_row = db.query(Request).filter(Request.RID == rid).first()
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and request_row.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to view bids for this request",
+            )
+
+        if request_row.requestStatus not in _CUSTOMER_BID_REVIEW_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        bids = (
+            db.query(
+                BidDetail,
+                User.fullName,
+                User.rating,
+                User.totalNoOfReviews,
+                User.profilePicture,
+                User.dob,
+                User.joiningDate,
+                User.city,
+                User.tags,
+                User.noOfTripsCompleted,
+                CarDetail.CARID,
+                CarDetail.carRegNo,
+                CarDetail.carModel,
+                CarDetail.modelYear,
+                CarDetail.carColor,
+                CarDetail.ownerName,
+                CarDetail.registeredOn,
+                CarDetail.imageVehicleFront,
+                CarDetail.imageVehicleSide,
+                CarTypeDetail.car_type,
+                CarTypeDetail.car_sub_type,
+            )
+            .join(User, User.userAppId == cast(BidDetail.bidderID, SAString))
+            .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
+            .outerjoin(CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD)
+            .filter(
+                BidDetail.rID == rid,
+                BidDetail.bidStatus.in_(list(_SELECTABLE_BID_STATUSES)),
+            )
+            .all()
+        )
+
         if not bids:
-            return ErrorResponse(message="NO BIDS FOUND")
-        
+            return []
+
         result = []
 
-        for (bid,fullName,rating,totalNoOfReviews,fcmToken,profilePicture,
-             dob,joiningDate,city,tags_str,noOfTripsCompleted,
-             car_id,car_reg_no,car_model,model_year,car_color,owner_name,registration_doc,
-             power_of_attorney_doc,registered_on,admin_approved,car_owned_by_same_vendor,ctd,
-             image_vehicle_front,image_vehicle_side,user_app_id,car_type,car_sub_type,capacity,image_url                          
-             ) in bids:
-            
-            tag_ids = []   # start with an empty list
-            if tags_str:   # check if tags_str is not None or empty
-                # split string by "," -> gives list like ["1", "2", "3"]
-                tag_parts = tags_str.split(",")
-
-                # go through each piece
-                for t in tag_parts:
-                    cleaned = t.strip()   # remove spaces
-                    if cleaned:          # if not empty string
-                        tag_ids.append(int(cleaned))   # convert to int and add to list
-            else:
-                tag_ids = []
-
-            #get tag names
+        for (
+            bid,
+            fullName,
+            rating,
+            totalNoOfReviews,
+            profilePicture,
+            dob,
+            joiningDate,
+            city,
+            tags_str,
+            noOfTripsCompleted,
+            car_id,
+            car_reg_no,
+            car_model,
+            model_year,
+            car_color,
+            owner_name,
+            registered_on,
+            image_vehicle_front,
+            image_vehicle_side,
+            car_type,
+            car_sub_type,
+        ) in bids:
+            tag_ids = []
+            if tags_str:
+                for t in tags_str.split(","):
+                    cleaned = t.strip()
+                    if cleaned.isdigit():
+                        tag_ids.append(int(cleaned))
 
             tag_names = []
-
             if tag_ids:
-                tags_rows = db.query(Tag.tagsName).filter(
-                    Tag.TAGID.in_(tag_ids)
-                ).all()
-
+                tags_rows = (
+                    db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
+                )
                 for r in tags_rows:
                     tag_names.append(r[0])
 
+            safe_rating = float(rating) if rating is not None else 0.0
+            safe_reviews = int(totalNoOfReviews) if totalNoOfReviews is not None else 0
+            safe_trips = (
+                int(noOfTripsCompleted) if noOfTripsCompleted is not None else 0
+            )
 
-            safe_rating = rating if rating is not None else 0.0    
-                    
+            registered_on_str = None
+            if registered_on is not None:
+                if hasattr(registered_on, "strftime"):
+                    registered_on_str = registered_on.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    registered_on_str = str(registered_on)
 
-            result.append(BidDetailSchema(
-                BIDID=bid.BID,
-                BIDDERID=bid.bidderID,
-                BIDAMOUNT=bid.bidAmount,
-                BIDDONEON=bid.tableTimestamp.strftime('%Y-%m-%d %H:%M:%S') if bid.tableTimestamp else None,
-                BIDDERNAME=fullName,
-                BIDDERRATING=safe_rating,
-                TOTALNOOFREVIEWS=totalNoOfReviews,
-                FCMTOKEN=fcmToken,
-                PROFILEPIC=profilePicture,
-                BIDSTATUS=bid.bidStatus,
-                DOB=parse_dob(dob),
-                JOININGDATE=joiningDate,
-                BASELOCATION=city,
-                TAGS=tag_names,
-                NOOFTRIPSCOMPLETED=noOfTripsCompleted,
-                CARID=car_id,
-                CARREGNO=car_reg_no,
-                CARMODEL=car_model,
-                MODELYEAR=model_year,
-                CARCOLOR=car_color,
-                OWNERNAME=owner_name,
-                REGISTRATIONDOC=registration_doc,
-                POWEROFATTORNEYDOC=power_of_attorney_doc,
-                REGISTEREDON=registered_on.strftime('%Y-%m-%d %H:%M:%S') if registered_on else None,
-                ADMINAPPROVED=admin_approved,
-                CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
-                CTD=ctd,
-                IMAGEVEHICLEFRONT=image_vehicle_front,
-                IMAGEVEHICLESIDE=image_vehicle_side,
-                CAR_USERAPPID=user_app_id,
-                CAR_TYPE=car_type,
-                CAR_SUB_TYPE=car_sub_type,
-                CAPACITY=capacity,
-                CAR_TYPE_IMAGE_URL=image_url    
-            ))
+            result.append(
+                CustomerBidDetail(
+                    BIDID=bid.BID,
+                    BIDDERID=str(bid.bidderID),
+                    BIDAMOUNT=_as_float_amount(bid.bidAmount),
+                    BIDSTATUS=bid.bidStatus,
+                    BIDDERNAME=fullName,
+                    BIDDERRATING=safe_rating,
+                    TOTALNOOFREVIEWS=safe_reviews,
+                    PROFILEPIC=profilePicture,
+                    DOB=parse_dob(dob) if isinstance(dob, str) else dob,
+                    JOININGDATE=joiningDate,
+                    BASELOCATION=city,
+                    TAGS=tag_names,
+                    NOOFTRIPSCOMPLETED=safe_trips,
+                    CARID=car_id,
+                    CARREGNO=car_reg_no,
+                    CARMODEL=car_model,
+                    MODELYEAR=str(model_year) if model_year is not None else None,
+                    CARCOLOR=car_color,
+                    OWNERNAME=owner_name,
+                    REGISTEREDON=registered_on_str,
+                    IMAGEVEHICLEFRONT=image_vehicle_front,
+                    IMAGEVEHICLESIDE=image_vehicle_side,
+                    CAR_TYPE=car_type,
+                    CAR_SUB_TYPE=car_sub_type,
+                )
+            )
 
+        result.sort(key=lambda item: (_as_float_amount(item.BIDAMOUNT), item.BIDID))
         return result
-    except SQLAlchemyError:
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        print(f"[get_bids_for_request] ERROR: {e}")
+        return ErrorResponse(message="ERROR_PREPARE")
+    except Exception as e:
+        print(f"[get_bids_for_request] ERROR_EXCEPTION: {e}")
         return ErrorResponse(message="ERROR_PREPARE")
     finally:
         db.close()
@@ -201,98 +278,173 @@ def update_bid(db:Session, bid : int, bidamount : float):
 def accept_bid(
     db: Session,
     rid: int,
-    vendor_id: str,
     bid_id: int,
-    car_id: str,
+    user_id: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
     notification_type: str = "default",
 ):
     """
-    PHP-equivalent, transaction-safe version of acceptBid():
-    - requires bid_id and car_id
-    - marks request as BID - CONFIRMED
-    - marks only the exact accepted bid row as BID - CONFIRMED
-    - notifies only the accepted vendor
+    Customer accept bid (PR10) — identity is RID + BIDID only.
+
+    Derives vendor, car, and amount from the bid row. Does not trust client
+    nested maps. Does not enforce bidEndTime (intentional PHP compatibility).
+    Does not set requestWonBy / finalAmount (vendor handshake still owns those).
+    Competing bids are left unchanged.
     """
 
+    should_notify = False
+    vendor_to_notify = None
+
     try:
-        if not bid_id or not car_id:
-            return ErrorResponse(message="Missing BIDID/CARID")
+        request_row = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .with_for_update()
+            .first()
+        )
 
-        accepted_vendor_user_app_id = None
-
-        # ----------------------------------
-        # 1) TRANSACTION
-        # ----------------------------------
-        with db.begin():
-            # Update request
-            request_updated = (
-                db.query(Request)
-                .filter(Request.RID == rid)
-                .update(
-                    {
-                        Request.requestStatus: "BID - CONFIRMED",
-                    },
-                    synchronize_session=False,
-                )
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
             )
 
-            if request_updated == 0:
-                return ErrorResponse(message="INSER ERROR IN FUNCTION")
-
-            # Update exact accepted bid row
-            bid_updated = (
-                db.query(BidDetail)
-                .filter(
-                    BidDetail.BID == bid_id,
-                    BidDetail.rID == rid,
-                    BidDetail.bidderID == vendor_id,
-                    BidDetail.CARID == car_id,
-                )
-                .update(
-                    {
-                        BidDetail.bidStatus: "BID - CONFIRMED",
-                    },
-                    synchronize_session=False,
-                )
+        if user_id is not None and request_row.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to accept a bid for this request",
             )
 
-            if bid_updated == 0:
-                return ErrorResponse(message="NOT UPDATED")
+        bid_row = db.query(BidDetail).filter(BidDetail.BID == bid_id).first()
+        if not bid_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Bid not found",
+            )
 
-            accepted_vendor_user_app_id = str(vendor_id)
+        if bid_row.rID != rid:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Bid does not belong to this request",
+            )
 
-        # ----------------------------------
-        # 2) NOTIFY ONLY ACCEPTED VENDOR
-        # ----------------------------------
-        try:
-            if accepted_vendor_user_app_id:
-                send_notification_to_user(
-                    db,
-                    FCMSend(
-                        userAppId=accepted_vendor_user_app_id,
-                        title="Your Bid has won. Confirm Fast !!",
-                        body="Accept OR Reject this Booking. Click here.",
-                        url="Your Bid has won. Confirm Fast !!",
-                        type=notification_type,
-                        soundFile="alarm_notification",
-                        source=None,
-                        destination=None,
-                        travelDate=None,
-                        pickupTime=None,
-                    ),
+        confirmed_bids = (
+            db.query(BidDetail)
+            .filter(
+                BidDetail.rID == rid,
+                BidDetail.bidStatus == "BID - CONFIRMED",
+            )
+            .all()
+        )
+
+        # Idempotent replay: already BID - CONFIRMED with same BIDID selected.
+        if request_row.requestStatus == "BID - CONFIRMED":
+            if len(confirmed_bids) > 1:
+                print(
+                    f"[accept_bid] integrity: multiple confirmed bids for RID={rid}"
                 )
-        except Exception:
-            pass
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Conflicting confirmed bids",
+                )
+            if len(confirmed_bids) == 1 and confirmed_bids[0].BID == bid_id:
+                # No mutation, no duplicate notification.
+                db.rollback()
+                return ErrorResponse(message="UPDATED")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Request already has a different confirmed bid",
+            )
+
+        if request_row.requestStatus != "BID - OPEN":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        if bid_row.bidStatus not in _SELECTABLE_BID_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Bid is not selectable",
+            )
+
+        if confirmed_bids:
+            # Should not happen while request is BID - OPEN; fail safe.
+            print(
+                f"[accept_bid] integrity: confirmed bid rows while BID - OPEN RID={rid}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Conflicting confirmed bids",
+            )
+
+        now = _ist_now_naive()
+        vendor_to_notify = str(bid_row.bidderID)
+
+        request_updated = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .update(
+                {
+                    Request.requestStatus: "BID - CONFIRMED",
+                    Request.tableTimestamp: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if request_updated == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        bid_updated = (
+            db.query(BidDetail)
+            .filter(
+                BidDetail.BID == bid_id,
+                BidDetail.rID == rid,
+            )
+            .update(
+                {
+                    BidDetail.bidStatus: "BID - CONFIRMED",
+                    BidDetail.tableTimestamp: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if bid_updated == 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Bid is not selectable",
+            )
+
+        # requestWonBy / finalAmount intentionally unchanged.
+        should_notify = True
+
+        db.commit()
+
+        if should_notify and background_tasks is not None and vendor_to_notify:
+            background_tasks.add_task(
+                notify_vendor_bid_accepted,
+                vendor_to_notify,
+                notification_type,
+            )
 
         return ErrorResponse(message="UPDATED")
 
-    except SQLAlchemyError:
+    except HTTPException:
         db.rollback()
-        return ErrorResponse(message="ERROR")
-
-    except Exception:
+        raise
+    except SQLAlchemyError as e:
         db.rollback()
+        print(f"[accept_bid] ERROR: {e}")
         return ErrorResponse(message="ERROR")
+    except Exception as e:
+        db.rollback()
+        print(f"[accept_bid] ERROR_EXCEPTION: {e}")
+        return ErrorResponse(message="ERROR")
+    finally:
+        db.close()
     
 # def insert_bid(db: Session, bid_data : BidInsert):    
 #     try :         

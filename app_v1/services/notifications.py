@@ -654,6 +654,45 @@ def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
         db.close()
 
 
+def notify_vendor_bid_accepted(
+    vendor_user_app_id: str,
+    notification_type: str = "default",
+) -> None:
+    """
+    Notify the selected/winning vendor after customer accept bid commits.
+
+    Intended for background task use. Creates and closes its own DB session so
+    it does not depend on the request-scoped SQLAlchemy session lifetime.
+    Notification failures are logged and must not undo the committed acceptance.
+    """
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not vendor_user_app_id or not str(vendor_user_app_id).strip():
+            return
+
+        send_notification_to_user(
+            db,
+            FCMSend(
+                userAppId=str(vendor_user_app_id).strip(),
+                title="Your Bid has won. Confirm Fast !!",
+                body="Accept OR Reject this Booking. Click here.",
+                url="Your Bid has won. Confirm Fast !!",
+                type=notification_type,
+                soundFile="alarm_notification",
+                source=None,
+                destination=None,
+                travelDate=None,
+                pickupTime=None,
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_vendor_bid_accepted err={e}")
+    finally:
+        db.close()
+
+
 def notify_vendors_request_cancelled(rid: int) -> None:
     """
     Notify all vendors who placed bids on this request.

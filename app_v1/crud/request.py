@@ -903,27 +903,101 @@ def reject_request_by_vendor(
 
             
     
-def cancel_handshake(db:Session, rid :int):
-    try : 
-        request_update = db.query(Request).filter(Request.RID == rid).update({
-            Request.requestStatus: "BID - OPEN",
-            Request.tableTimestamp: func.current_timestamp()
-        })
-        db.commit()
+def cancel_handshake(
+    db: Session,
+    rid: int,
+    user_id: Optional[str] = None,
+):
+    """
+    Customer cancel handshake (PR10).
 
-        if request_update == 0:
-            return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")
-        
-        bid_update = db.query(BidDetail).filter(BidDetail.rID == rid).update({
-            BidDetail.bidStatus:"BID - OPEN",
-            BidDetail.tableTimestamp:func.current_timestamp()
-        })
+    BID - CONFIRMED → BID - OPEN (request + all bids) in one transaction.
+    BID - OPEN → idempotent CANCELLED (repair bids to BID - OPEN if needed).
+    Other statuses → 409. No FCM in PR10.
+    Does not modify requestWonBy / finalAmount (typically unset at handshake).
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        request_row = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .with_for_update()
+            .first()
+        )
+
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and request_row.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to cancel handshake for this request",
+            )
+
+        now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+        if request_row.requestStatus == "BID - OPEN":
+            # Idempotent: already reopened. Repair bid statuses if needed.
+            db.query(BidDetail).filter(BidDetail.rID == rid).update(
+                {
+                    BidDetail.bidStatus: "BID - OPEN",
+                    BidDetail.tableTimestamp: now,
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            return ErrorResponse(message="CANCELLED")
+
+        if request_row.requestStatus != "BID - CONFIRMED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        request_updated = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .update(
+                {
+                    Request.requestStatus: "BID - OPEN",
+                    Request.tableTimestamp: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if request_updated == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        # requestWonBy / finalAmount intentionally unchanged.
+        db.query(BidDetail).filter(BidDetail.rID == rid).update(
+            {
+                BidDetail.bidStatus: "BID - OPEN",
+                BidDetail.tableTimestamp: now,
+            },
+            synchronize_session=False,
+        )
+
         db.commit()
-        if bid_update == 0:
-            return ErrorResponse(message="BID TABLE UPDATE FAILED")
         return ErrorResponse(message="CANCELLED")
-    except SQLAlchemyError:
+
+    except HTTPException:
         db.rollback()
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        print(f"[cancel_handshake] ERROR: {e}")
+        return ErrorResponse(message="ERROR")
+    except Exception as e:
+        db.rollback()
+        print(f"[cancel_handshake] ERROR_EXCEPTION: {e}")
         return ErrorResponse(message="ERROR")
     finally:
         db.close()
