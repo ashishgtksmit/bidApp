@@ -75,19 +75,27 @@ def read_all_request(db:Session=Depends(get_db),
     return get_request_type(db)
 
 
-@router.delete("/deleterequest",response_model=ErrorResponse)
+@router.delete("/deleterequest", response_model=ErrorResponse)
+def delete_request_route(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+):
+    # JWT sub is authoritative owner — ownership + BID - OPEN enforced in CRUD
+    return delete_request(
+        db, r_id=RID, background_tasks=background_tasks, user_id=user_id
+    )
 
-def delete_request_route(db:Session=Depends(get_db), 
-                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                         RID: str=Query(...)):
-    return delete_request(db,r_id=RID)
 
-@router.put("/updaterequest",response_model=ErrorResponse)
-
-def update_request_endpoint(requestdata: RequestUpdate, 
-                            user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                            db:Session=Depends(get_db)):
-    return update_request(db,requestdata)
+@router.put("/updaterequest", response_model=ErrorResponse)
+def update_request_endpoint(
+    requestdata: RequestUpdate,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    # JWT sub is authoritative owner — ownership + BID - OPEN enforced in CRUD
+    return update_request(db, requestdata, user_id=user_id)
 
 @router.put("/acceptrequestbyvendor",response_model=ErrorResponse)
 

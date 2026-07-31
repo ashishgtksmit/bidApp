@@ -400,41 +400,109 @@ def get_request_type(db:Session):
         db.close()
     
 
-def delete_request(db: Session, r_id : int, background_tasks : BackgroundTasks):
+def delete_request(
+    db: Session,
+    r_id: int,
+    background_tasks: BackgroundTasks,
+    user_id: Optional[str] = None,
+):
+    """
+    Soft-cancel a customer request (requestStatus → REQUEST - CANCELLED BY USER).
+
+    When ``user_id`` is provided (JWT ``sub`` from DELETE /deleterequest):
+    ownership and BID - OPEN status are enforced before mutation.
+    """
     try:
+        existing = db.query(Request).filter(Request.RID == r_id).first()
+
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and existing.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to delete this request",
+            )
+
+        if existing.requestStatus != "BID - OPEN":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
         updated = db.query(Request).filter(Request.RID == r_id).update(
             {Request.requestStatus: "REQUEST - CANCELLED BY USER"}
         )
         db.commit()
 
-        if updated==0:
-            return ErrorResponse(message="NO ROWS DELETED")
-        
+        if updated == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        # Background task opens its own SessionLocal — do not pass request db.
         background_tasks.add_task(
             notify_vendors_request_cancelled,
-            db,
-            r_id
+            r_id,
         )
-        
+
         return ErrorResponse(message="DELETED")
-    except SQLAlchemyError:
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
         db.rollback()
+        print(f"[delete_request] ERROR: {e}")
         return ErrorResponse(message="DELETED ERROR IN FUNCTION")
     finally:
         db.close()
-    
-def update_request(db : Session, request_data : RequestUpdate):
+
+
+def update_request(
+    db: Session,
+    request_data: RequestUpdate,
+    user_id: Optional[str] = None,
+):
+    """
+    Update editable fields on a customer request.
+
+    When ``user_id`` is provided (JWT ``sub`` from PUT /updaterequest):
+    ownership and BID - OPEN status are enforced before mutation.
+    Validation order: exists → ownership → BID - OPEN → noOfBids → update.
+    """
     try:
-        request = db.query(Request.noOfBids).filter(Request.RID == request_data.RID).first()
+        existing = db.query(Request).filter(Request.RID == request_data.RID).first()
 
-        if not request: 
-            return ErrorResponse(message="ERROR")
-        
-        no_of_bids = request.noOfBids
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
 
-        if no_of_bids > 0:
+        if user_id is not None and existing.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to update this request",
+            )
+
+        if existing.requestStatus != "BID - OPEN":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        if (existing.noOfBids or 0) > 0:
             return ErrorResponse(message="NO OF BIDS MORE THAN 0")
-        
+
+        special = (
+            request_data.specialRequest.strip()
+            if request_data.specialRequest and request_data.specialRequest.strip()
+            else None
+        )
+
         updated = db.query(Request).filter(Request.RID == request_data.RID).update({
             Request.fromLocation: request_data.fromLocation,
             Request.fromLandmark: request_data.fromLandmark,
@@ -446,25 +514,30 @@ def update_request(db : Session, request_data : RequestUpdate):
             Request.noOfKids: request_data.noOfKids,
             Request.carType: request_data.carType,
             Request.acRequest: 1 if request_data.acRequest else 0,
-            Request.carrierRequest : 1 if request_data.carrierRequest else 0,
-            Request.specialRequest : request_data.specialRequest,
-            Request.bidEndTime : request_data.bidEndTime,
-            Request.tableTimestamp : func.current_timestamp()
+            Request.carrierRequest: 1 if request_data.carrierRequest else 0,
+            Request.specialRequest: special,
+            Request.bidEndTime: request_data.bidEndTime,
+            Request.tableTimestamp: datetime.now(
+                ZoneInfo("Asia/Kolkata")
+            ).replace(tzinfo=None),
         })
         db.commit()
 
-        if updated==0:
+        if updated == 0:
             return ErrorResponse(message="FAILED")
-        
+
         return ErrorResponse(message="SUCCESS")
-        
+
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
         db.rollback()
-        print(str(e))
-        return EmailErrorResponse(message="ERROR", error=str(e))    
+        print(f"[update_request] ERROR: {e}")
+        return ErrorResponse(message="ERROR")
     except Exception as e:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_EXCEPTION", error=str(e))    
+        print(f"[update_request] ERROR_EXCEPTION: {e}")
+        return ErrorResponse(message="ERROR")
     finally:
         db.close()
     

@@ -654,33 +654,45 @@ def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
         db.close()
 
 
-def notify_vendors_request_cancelled(db: Session, rid : int):
+def notify_vendors_request_cancelled(rid: int) -> None:
     """
-    Notify all vendors who placed bids on this request
+    Notify all vendors who placed bids on this request.
+
+    Intended for background task use. Creates and closes its own DB session so
+    it does not depend on the request-scoped SQLAlchemy session lifetime.
+    Notification failures are logged and must not undo the committed soft delete.
+    Zero-bid requests yield an empty vendor token list — that is valid.
     """
-    # Get vendor tokens
-    rows = (
-        db.query(User.fcmToken)
-        .join(BidDetail, BidDetail.bidderID == User.userAppId)
-        .filter(BidDetail.rID == rid)
-        .all()
-    )
+    from ..database import SessionLocal
 
-    tokens = [
-        t[0].strip()
-        for t in rows
-        if t[0] and t[0].strip().lower() not in ["", "null"]
-    ]
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(User.fcmToken)
+            .join(BidDetail, BidDetail.bidderID == User.userAppId)
+            .filter(BidDetail.rID == rid)
+            .all()
+        )
 
-    for token in tokens:
-        try:
-            send_notification(
-                title="Bid Update: Request Cancelled",
-                body="The request you had bid on has been cancelled by the user. 🚀",
-                fcm_token=token,
-                url="Bid Update: Request Cancelled",
-                type="default",
-                sound_file="normal_notification"
-            )
-        except Exception as e:
-            print(f"[FCM ERROR] token={token} err={e}")
+        tokens = [
+            t[0].strip()
+            for t in rows
+            if t[0] and t[0].strip().lower() not in ["", "null"]
+        ]
+
+        for token in tokens:
+            try:
+                send_notification(
+                    title="Bid Update: Request Cancelled",
+                    body="The request you had bid on has been cancelled by the user. 🚀",
+                    fcm_token=token,
+                    url="Bid Update: Request Cancelled",
+                    type="default",
+                    sound_file="normal_notification",
+                )
+            except Exception as e:
+                print(f"[FCM ERROR] token={token} err={e}")
+    except Exception as e:
+        print(f"[FCM ERROR] notify_vendors_request_cancelled err={e}")
+    finally:
+        db.close()

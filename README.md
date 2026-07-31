@@ -69,3 +69,22 @@ FCM: `POST /login` persists `fcmToken`; authenticated `PUT /fcmtokenupdate` also
 ```bash
 python -m pytest tests/test_pr8_insertrequest.py -q
 ```
+
+## PR9 — PUT /updaterequest + DELETE /deleterequest
+
+| Rule | Behaviour |
+|------|-----------|
+| Auth | Bearer JWT + `X-Client-Id` |
+| Ownership | JWT `sub` must own the request row; wrong owner → **HTTP 403**; missing RID → **HTTP 404**; no mutation |
+| Status gate | Both endpoints require `requestStatus == "BID - OPEN"`; else **HTTP 409** `INVALID_REQUEST_STATUS` |
+| Update bids | If `noOfBids > 0` → HTTP **200** `{ "message": "NO OF BIDS MORE THAN 0" }` (no field mutation) |
+| Update success | HTTP **200** `{ "message": "SUCCESS" }` — editable fields + `specialRequest`; protected lifecycle fields unchanged |
+| `tableTimestamp` | Update uses `Asia/Kolkata` (aligned with PR8 create); not updated on validation failures |
+| Delete | Soft cancel only: `requestStatus = "REQUEST - CANCELLED BY USER"`; row + bid rows retained |
+| Delete success | HTTP **200** `{ "message": "DELETED" }` |
+| Notify | `BackgroundTasks` injected; `notify_vendors_request_cancelled(rid)` opens its own `SessionLocal()`; failures logged, do not undo delete |
+| Errors | Internal SQL exception strings are not returned to clients |
+
+```bash
+python -m pytest tests/test_pr9_update_delete_request.py -q
+```
