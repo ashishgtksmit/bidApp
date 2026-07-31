@@ -104,3 +104,21 @@ Vendor Flutter call sites for GET bids / insert/update/delete bid / accept/rejec
 ```bash
 python -m pytest tests/test_pr10_customer_bids.py -q
 ```
+
+## PR11 — Vendor bidding / handshake
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getallbidsforrequestforvendor?RID=` | Active approved vendor; request `BID - OPEN`; open-feed eligibility **or** existing bid; returns `BID - OPEN` bids sorted by amount; **no FCMTOKEN**; empty → `[]`; does **not** weaken customer GET ownership |
+| `GET /viewcarsforvendor` | JWT `sub` authoritative; optional `userAppId` must match JWT; admin-approved cars only; lean fields; empty → `[]`; fleet UI remains PHP |
+| `POST /insertbid` | Body `RID`/`CARID`/`bidAmount` only; `bidderID`/`bidStatus` from JWT/server; duplicate RID+vendor+CARID → `BID ALREADY PRESENT`; `noOfBids` recomputed; notify after commit (own SessionLocal); **no** `bidEndTime` enforcement |
+| `PUT /updatebid?BIDID=` | Body `{bidAmount}`; owner + `BID - OPEN` gates; no FCM; no vehicle change |
+| `DELETE /deletebid?BIDID=` | Owner + `BID - OPEN`; hard delete; recompute `noOfBids`; missing → 404; no FCM |
+| `PUT /acceptrequestbyvendor?RID=&BIDID=` | JWT vendor + selected confirmed bid; derives `finalAmount`/`requestWonBy`; request → `REQUEST - CONFIRMED`; selected bid → `REQUEST - CONFIRMED`; competitors unchanged; same vendor/BIDID replay idempotent |
+| `PUT /rejectrequestbyvendor?RID=&BIDID=` | Body `{rejectionReason}`; reopen request `BID - OPEN`; hard-delete selected bid; recompute `noOfBids`; already open → 409 |
+
+Worker: `vendor_requests` rows include `BIDID` (backward-compatible additive field).
+
+```bash
+python -m pytest tests/test_pr11_vendor_bidding.py -q
+```

@@ -693,6 +693,197 @@ def notify_vendor_bid_accepted(
         db.close()
 
 
+def notify_customer_new_bid(
+    customer_user_app_id: str,
+    notification_type: str = "default",
+) -> None:
+    """Notify customer after vendor insert bid commits. Owns SessionLocal()."""
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not customer_user_app_id or not str(customer_user_app_id).strip():
+            return
+        send_notification_to_user(
+            db,
+            FCMSend(
+                userAppId=str(customer_user_app_id).strip(),
+                title="New Bid on your Request",
+                body="A Vendor has made a New Bid on your Request. Check it.",
+                url="New Bid on Your Request",
+                type=notification_type,
+                soundFile="normal_notification",
+                source=None,
+                destination=None,
+                travelDate=None,
+                pickupTime=None,
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_customer_new_bid err={e}")
+    finally:
+        db.close()
+
+
+def notify_other_vendors_new_bid(
+    rid: int,
+    excluded_vendor_id: str,
+    notification_type: str = "default",
+) -> None:
+    """Notify other vendors who already bid (existing FastAPI behaviour). Owns SessionLocal()."""
+    from ..database import SessionLocal
+    from .vendor_filtering import get_vendors_who_bid_on_request
+
+    db = SessionLocal()
+    try:
+        vendor_ids = get_vendors_who_bid_on_request(db, rid)
+        other_vendor_ids = [
+            vid
+            for vid in vendor_ids
+            if str(vid).strip().lower() != str(excluded_vendor_id).strip().lower()
+        ]
+        if not other_vendor_ids:
+            return
+        send_notification_to_selected_users(
+            db,
+            FCMSendDrivers(
+                title="Someone Else Bid on Your Same Request!",
+                body="Check your bid now. Another driver also gave a price.",
+                url="Someone Else Bid on Your Same Request!",
+                type=notification_type,
+                soundFile="normal_notification",
+                driverIds=other_vendor_ids,
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_other_vendors_new_bid err={e}")
+    finally:
+        db.close()
+
+
+def notify_customer_vendor_accepted(
+    customer_user_app_id: str,
+    notification_type: str = "passengernotification",
+) -> None:
+    """Notify customer after vendor accept handshake. Owns SessionLocal()."""
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not customer_user_app_id or not str(customer_user_app_id).strip():
+            return
+        send_notification_to_user(
+            db,
+            FCMSend(
+                userAppId=str(customer_user_app_id).strip(),
+                title="Booking Confirmed!",
+                body="Vendor has accepted your request!",
+                url="Booking Confirmed!",
+                type=notification_type,
+                soundFile="normal_notification",
+                source="",
+                destination="",
+                travelDate="",
+                pickupTime="",
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_customer_vendor_accepted err={e}")
+    finally:
+        db.close()
+
+
+def notify_losing_vendors_trip_won(losing_vendor_ids: list) -> None:
+    """Notify losing vendors after vendor accept. Owns SessionLocal()."""
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not losing_vendor_ids:
+            return
+        send_notification_to_selected_users(
+            db,
+            FCMSendDrivers(
+                title="The request was won by another vendor!",
+                body="The request was won by another vendor!",
+                url="The request was won by another vendor!",
+                soundFile="normal_notification",
+                driverIds=list(losing_vendor_ids),
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_losing_vendors_trip_won err={e}")
+    finally:
+        db.close()
+
+
+def notify_customer_vendor_rejected(
+    customer_user_app_id: str,
+    rejection_reason: str,
+    notification_type: str = "default",
+) -> None:
+    """Notify customer after vendor reject handshake. Owns SessionLocal()."""
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not customer_user_app_id or not str(customer_user_app_id).strip():
+            return
+        send_notification_to_user(
+            db,
+            FCMSend(
+                userAppId=str(customer_user_app_id).strip(),
+                title="Vendor Rejected your Request!",
+                body=rejection_reason or "Vendor rejected the handshake.",
+                url="Vendor Rejected your Request!",
+                type=notification_type,
+                soundFile="normal_notification",
+                source="",
+                destination="",
+                travelDate="",
+                pickupTime="",
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_customer_vendor_rejected err={e}")
+    finally:
+        db.close()
+
+
+def notify_vendors_bidding_reopened(
+    rid: int,
+    excluded_vendor_id: str,
+) -> None:
+    """Notify remaining vendors after vendor reject (exclude rejector). Owns SessionLocal()."""
+    from ..database import SessionLocal
+    from .vendor_filtering import get_vendors_who_bid_on_request
+
+    db = SessionLocal()
+    try:
+        remaining = get_vendors_who_bid_on_request(db, rid)
+        remaining = [
+            vid
+            for vid in remaining
+            if str(vid).strip().lower() != str(excluded_vendor_id).strip().lower()
+        ]
+        if not remaining:
+            return
+        send_notification_to_selected_users(
+            db,
+            FCMSendDrivers(
+                title="Bidding Reopened!",
+                body="⏳ The request has been opened again! 📂",
+                url="Bidding Reopened!",
+                soundFile="alarm_notification",
+                driverIds=remaining,
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_vendors_bidding_reopened err={e}")
+    finally:
+        db.close()
+
+
 def notify_vendors_request_cancelled(rid: int) -> None:
     """
     Notify all vendors who placed bids on this request.

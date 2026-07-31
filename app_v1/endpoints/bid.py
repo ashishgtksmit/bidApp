@@ -1,13 +1,33 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
-from ..crud.bid import get_bids_for_request,delete_bid_with_bid,update_bid,accept_bid,insert_bid,update_car_id_bid
-from ..schemas.bid_details import CustomerBidDetail,NoBidResponse,BidInsert,UpdateCarIdForBidRequest
-from ..utils.common import ErrorResponse
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Query
+from typing import Optional, Union, List
+
 from sqlalchemy.orm import Session
-from typing import Union,List
-from ..database import get_db
+
 from ..auth.deps import get_current_user_id
+from ..crud.bid import (
+    get_bids_for_request,
+    accept_bid,
+    update_car_id_bid,
+)
+from ..crud.vendor_bid import (
+    get_bids_for_request_for_vendor,
+    insert_vendor_bid,
+    update_vendor_bid,
+    delete_vendor_bid,
+)
+from ..database import get_db
+from ..schemas.bid_details import (
+    CustomerBidDetail,
+    VendorBidDetail,
+    VendorBidInsert,
+    BidAmountUpdate,
+    NoBidResponse,
+    UpdateCarIdForBidRequest,
+)
+from ..utils.common import ErrorResponse
 
 router = APIRouter()
+
 
 @router.get(
     "/getallbidsforrequest",
@@ -18,22 +38,94 @@ def get_all_bids(
     user_id: str = Depends(get_current_user_id),
     RID: int = Query(...),
 ):
-    """Customer-owned bid list. Empty → ``[]``. No FCMTOKEN. Vendor callers remain on PHP."""
+    """Customer-owned bid list (PR10). Empty → ``[]``. No FCMTOKEN."""
     return get_bids_for_request(db, rid=RID, user_id=user_id)
 
-@router.delete("/deletebidwithbid",response_model=ErrorResponse)
 
-def delete_bids(db:Session=Depends(get_db), 
-                user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                RID : int = Query(...), BID :int = Query(...)):
-    return delete_bid_with_bid(db,rid=RID,bid=BID)
-    
-@router.put("/updatebidwithbid",response_model=ErrorResponse)
+@router.get(
+    "/getallbidsforrequestforvendor",
+    response_model=Union[List[VendorBidDetail], NoBidResponse, ErrorResponse],
+)
+def get_all_bids_for_vendor(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+):
+    """
+    Vendor-visible bid list (PR11).
 
-def update_bid_endpoint(db:Session=Depends(get_db), 
-                        user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                        BIDID : int = Query(...), bidAmount : float = Query(...)):
-    return update_bid(db, bid=BIDID,bidamount=bidAmount)
+    Active vendor + BID - OPEN + open-feed eligibility (or existing bid).
+    Does not weaken customer GET ownership. Empty → []. No FCMTOKEN.
+    Intentionally does not enforce bidEndTime.
+    """
+    return get_bids_for_request_for_vendor(db, rid=RID, user_id=user_id)
+
+
+@router.delete("/deletebid", response_model=ErrorResponse)
+def delete_bid_endpoint(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    BIDID: int = Query(...),
+):
+    """Hard-delete own BID - OPEN bid. RID derived from bid row. No FCM."""
+    return delete_vendor_bid(db, bid_id=BIDID, user_id=user_id)
+
+
+@router.delete("/deletebidwithbid", response_model=ErrorResponse, deprecated=True)
+def delete_bids_legacy(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(None),
+    BID: int = Query(None),
+    BIDID: int = Query(None),
+):
+    """Legacy alias — BIDID preferred. RID ignored; ownership from JWT."""
+    bid_id = BIDID if BIDID is not None else BID
+    if bid_id is None:
+        from fastapi import HTTPException, status as http_status
+
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="BIDID is required",
+        )
+    return delete_vendor_bid(db, bid_id=bid_id, user_id=user_id)
+
+
+@router.put("/updatebid", response_model=ErrorResponse)
+def update_bid_endpoint(
+    body: BidAmountUpdate,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    BIDID: int = Query(...),
+):
+    """Update own BID - OPEN bid amount. No FCM. No vehicle change."""
+    return update_vendor_bid(db, bid_id=BIDID, body=body, user_id=user_id)
+
+
+@router.put("/updatebidwithbid", response_model=ErrorResponse, deprecated=True)
+def update_bid_legacy(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    BIDID: int = Query(...),
+    bidAmount: Optional[float] = Query(None),
+    body: Optional[BidAmountUpdate] = Body(None),
+):
+    """Legacy alias — prefer PUT /updatebid with JSON body."""
+    amount = body.bidAmount if body is not None else bidAmount
+    if amount is None:
+        from fastapi import HTTPException, status as http_status
+
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="bidAmount is required",
+        )
+    return update_vendor_bid(
+        db,
+        bid_id=BIDID,
+        body=BidAmountUpdate(bidAmount=amount),
+        user_id=user_id,
+    )
+
 
 @router.put("/acceptbid", response_model=ErrorResponse)
 def accept_bid_by_customer(
@@ -53,18 +145,29 @@ def accept_bid_by_customer(
     )
 
 
-@router.post("/insertbid",response_model=ErrorResponse)
+@router.post("/insertbid", response_model=ErrorResponse)
+def bid_insert(
+    bidData: VendorBidInsert,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Place bid (PR11). Body: RID, CARID, bidAmount only.
+    bidderID/bidStatus derived server-side. Intentionally does not enforce bidEndTime.
+    """
+    return insert_vendor_bid(
+        db,
+        bid_data=bidData,
+        user_id=user_id,
+        background_tasks=background_tasks,
+    )
 
-def bid_insert(bidData : BidInsert, 
-               user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-               db:Session = Depends(get_db)):
-    return insert_bid(db, bidData)
 
-@router.put("/updatecaridforbid",response_model=ErrorResponse)
-
+@router.put("/updatecaridforbid", response_model=ErrorResponse)
 def update_car_id_for_bid(
-                        data : UpdateCarIdForBidRequest,
-                          db:Session=Depends(get_db),
-                          user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                          ):
+    data: UpdateCarIdForBidRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     return update_car_id_bid(db, data)

@@ -5,16 +5,18 @@ from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRid
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
                                      RequestConfirmedCommonResponse,GetBookingReportResponse)
 from ..schemas.request_type_details import RequestTypeBase
+from ..schemas.bid_details import VendorRejectBody
 from ..utils.common import ErrorResponse,EmailErrorResponse
 from typing import List, Union
 from ..database import get_db
 from ..crud.request import (get_all_open_requests,get_all_requests_for_user,get_rid_by_details,
                             get_booking_report,get_all_open_requests_for_vendor,get_request_type,
-                            delete_request,update_request,accept_by_vendor,cancel_handshake,
+                            delete_request,update_request,cancel_handshake,
                             booking_cancelled_by_user,get_all_confirmed_requests_for_customer,
                             get_all_confirmed_requests_for_vendor,reopen_request,
                             create_request,assign_driver_to_request,get_all_cancelled_requests_for_vendor,
-                            reject_request_by_vendor,get_all_requests_by_request_status)
+                            get_all_requests_by_request_status)
+from ..crud.vendor_bid import accept_request_by_vendor, reject_request_by_vendor_pr11
 from ..auth.deps import get_current_user_id
 
 
@@ -97,21 +99,48 @@ def update_request_endpoint(
     # JWT sub is authoritative owner — ownership + BID - OPEN enforced in CRUD
     return update_request(db, requestdata, user_id=user_id)
 
-@router.put("/acceptrequestbyvendor",response_model=ErrorResponse)
+@router.put("/acceptrequestbyvendor", response_model=ErrorResponse)
+def update_accept_request_by_vendor(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+    BIDID: int = Query(...),
+):
+    """
+    Vendor accept handshake (PR11). RID + BIDID only.
+    Vendor/finalAmount derived from JWT + selected bid. No winner self-notify.
+    """
+    return accept_request_by_vendor(
+        db,
+        rid=RID,
+        bid_id=BIDID,
+        user_id=user_id,
+        background_tasks=background_tasks,
+    )
 
-def update_accept_request_by_vendor(db:Session=Depends(get_db), 
-                                    user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                    VENDORID : int = Query(...), RID : int = Query(...), 
-                                    FINALAMOUNT : float = Query(...)):
-    return accept_by_vendor(db, rid=RID, vendor_id=VENDORID, final_amount=FINALAMOUNT)
 
-@router.put("/rejectrequestbyvendor",response_model=ErrorResponse)
-def reject_by_vendor(db:Session=Depends(get_db),
-                     user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                     RID : int = Query(...), 
-                     BID :int = Query(...), 
-                     rejectionReason : str = Query(...)):
-    return reject_request_by_vendor(db,rid=RID,bid_id=BID,rejection_reason=rejectionReason)
+@router.put("/rejectrequestbyvendor", response_model=ErrorResponse)
+def reject_by_vendor(
+    background_tasks: BackgroundTasks,
+    body: VendorRejectBody,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+    BIDID: int = Query(...),
+):
+    """
+    Vendor reject handshake (PR11). RID + BIDID + rejectionReason body.
+    Reopens to BID - OPEN; hard-deletes selected bid; recompute noOfBids.
+    """
+    return reject_request_by_vendor_pr11(
+        db,
+        rid=RID,
+        bid_id=BIDID,
+        body=body,
+        user_id=user_id,
+        background_tasks=background_tasks,
+    )
 
 @router.put("/cancelhandshakerequest", response_model=ErrorResponse)
 def cancel_handshake_of_request(

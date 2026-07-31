@@ -4,12 +4,14 @@ from ..schemas.vendor_car_types import VendorCarTypeDetail
 from ..schemas.car_details import (CarDetailsResponse,NoCarDetailsResponse,CarDetailsDelete,CarDetailsCreate,
                                    GetAllCarsResponse,UpdateCarApprovalStatusRequest,
                                    UploadCarDocumentRequest,UploadCarDocumentResponse)
+from ..schemas.bid_details import VendorCarSummaryResponse
 from ..utils.common import ErrorResponse,EmailErrorResponse
-from typing import List, Union
+from typing import List, Optional, Union
 from sqlalchemy.orm import Session
 from ..database import get_db
 from ..crud.car import (get_all_car_types,get_vendor_car_types,get_approved_car_for_vendor,delete_car_by_id,insert_car_details,get_all_cars,update_car_approval_status,
                         upload_car_document_backend)
+from ..crud.vendor_bid import get_vendor_cars_for_bidding
 from ..auth.deps import get_current_user_id
 
 router = APIRouter()
@@ -28,11 +30,22 @@ def read_vendor_car_types(db:Session = Depends(get_db),
     return get_vendor_car_types(db)
 
 
-@router.get("/viewcarsforvendor", response_model=Union[List[CarDetailsResponse],NoCarDetailsResponse])
-def read_all_cars_for_vendor(db:Session = Depends(get_db), 
-                             user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                             userAppId : str = Query(...)):
-    return get_approved_car_for_vendor(db, userapp_id=userAppId)
+@router.get(
+    "/viewcarsforvendor",
+    response_model=Union[List[VendorCarSummaryResponse], NoCarDetailsResponse, ErrorResponse],
+)
+def read_all_cars_for_vendor(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    userAppId: Optional[str] = Query(None),
+):
+    """
+    Approved cars for JWT vendor (PR11 bidding).
+
+    JWT sub is authoritative. Optional userAppId must match JWT or 403.
+    Empty → []. Fleet View_All_Cars remains on PHP.
+    """
+    return get_vendor_cars_for_bidding(db, user_id=user_id, user_app_id=userAppId)
 
 @router.delete("/deletecarfromprofile",response_model=Union[EmailErrorResponse,ErrorResponse])
 def delete_car(delete_data : CarDetailsDelete, 
