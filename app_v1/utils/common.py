@@ -4,18 +4,80 @@ from typing import Any,Optional,List
 
 
 def _to_id_array(value) -> List[int]:
-    """Convert string or list to deduped, sorted list of ints"""
+    """Convert string or list to deduped, sorted list of ints.
+
+    Accepts JSON integers and digit-only strings. Silently skips malformed
+    tokens for legacy callers. Prefer ``_parse_id_list_strict`` for the
+    PR18 mobile preference contract (rejects malformed values).
+    """
     if value is None:
         return []
     raw = value if isinstance(value, list) else [x.strip() for x in str(value).split(',') if x.strip()]
-    ints = []
+    ints: List[int] = []
     seen = set()
     for v in raw:
-        if v.isdigit() and int(v) not in seen:
-            seen.add(int(v))
-            ints.append(int(v))
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            parsed = v
+        elif isinstance(v, float):
+            if not v.is_integer():
+                continue
+            parsed = int(v)
+        else:
+            token = str(v).strip()
+            if not token.isdigit():
+                continue
+            parsed = int(token)
+        if parsed <= 0 or parsed in seen:
+            continue
+        seen.add(parsed)
+        ints.append(parsed)
     ints.sort()
     return ints
+
+
+def _parse_id_list_strict(value, *, field_name: str = "ids") -> List[int]:
+    """Strict ID list parser for PR18 preference updates.
+
+    Accepts:
+    - JSON integers (> 0)
+    - digit-only strings (backward compatibility)
+    - empty lists
+
+    Rejects:
+    - booleans, floats, negatives, zero
+    - arbitrary strings, nested arrays/objects
+    - missing / non-list values
+    """
+    if value is None:
+        raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+    if not isinstance(value, list):
+        raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+
+    ints: List[int] = []
+    seen = set()
+    for v in value:
+        if isinstance(v, bool) or isinstance(v, float) or isinstance(v, (dict, list)):
+            raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+        if isinstance(v, int):
+            parsed = v
+        elif isinstance(v, str):
+            token = v.strip()
+            if not token.isdigit():
+                raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+            parsed = int(token)
+        else:
+            raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+        if parsed <= 0:
+            raise ValueError(f"ERROR_INVALID_{field_name.upper()}")
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        ints.append(parsed)
+    ints.sort()
+    return ints
+
 
 def _ids_to_csv(ids: List[int]) -> str:
     return ','.join(map(str, ids))

@@ -185,3 +185,57 @@ python migrations/pr15_car_soft_delete_normalized_reg/preflight_normalized_reg_c
 python -m pytest tests/test_pr15_vendor_manage_cars.py -q
 python -m pytest tests/test_pr11_vendor_bidding.py -q
 ```
+
+## PR16 — Vendor Registration / KYC onboarding
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `PUT /registernewvendor` | JWT `sub` authoritative; optional legacy `userAppId` must match or **403**; missing user → **404** `USER_NOT_FOUND`; `lockApp` → **403** `ACCOUNT_LOCKED`; `vendorApproved` → **409** `ALREADY_VENDOR`; customer-only + pending vendor allowed; server forces `alsoVendor=true`; never sets `vendorApproved`; never changes `lockApp`; DOB `yyyy-MM-dd` only; `addressLine2` required; IFSC uppercase; embedded bank fields + private Aadhaar/PAN/bank blobs; `joiningDate` set only if absent; `requestTypePreferences` initialized to `1,2,3,4` only when empty; success `{message: UPDATED}`; KYC email after commit via `KYC_EMAIL_FROM` (fallback `customersupport@wizzride.com`); email failure does not undo commit |
+
+Flutter: `OpenBidVendorOnboardingService` — registration FastAPI-only; no PHP fallback; does **not** call `/alsovendorupdate`. Session refresh via `GET /getuserdetails` + `AppSessionMapper`. WSS remains authoritative for approval/access locks. Post-onboarding bank view/edit migrated in PR17. No worker change.
+
+```bash
+python -m pytest tests/test_pr16_vendor_onboarding.py -q
+python -m pytest tests/test_pr6_getuserdetails.py tests/test_pr11_vendor_bidding.py \
+  tests/test_pr13_vendor_confirmed_trip.py tests/test_pr14_vendor_manage_drivers.py \
+  tests/test_pr15_vendor_manage_cars.py -q
+```
+
+## PR17 — Vendor Bank Account view / update
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getregisteredbankaccount` | JWT `sub` authoritative; optional legacy `userAppId` must match or **403**; missing user → **404** `USER_NOT_FOUND`; `lockApp` → **403** `ACCOUNT_LOCKED`; customer / pending vendor → **403** `VENDOR_NOT_ELIGIBLE`; approved unlocked vendor → `VendorBankAccountSummaryResponse` (`hasBankAccount`, `maskedAccountNumber`, holder, IFSC, bank name). Never returns full account number, `imageBankAccount`, KYC URLs, or approval flags. Empty bank → typed `hasBankAccount: false` with null fields. |
+| `PUT /updatevendorbankdetails` | JWT `sub` authoritative; optional legacy `userAppId` must match or **403**; same eligibility/lock gates; all four bank text fields required; PR16 account/IFSC validation (`ERROR_INVALID_ACCOUNTNO` / `ERROR_INVALID_IFSC`); `SELECT FOR UPDATE` + re-check eligibility; updates only four bank columns + Asia/Kolkata `tableTimestamp` on changed values; preserves `imageBankAccount` and all unrelated fields; same-value replay → `{message: UPDATED}`; no email; no passbook/media; no soft-200 authz errors. |
+
+Flutter: `OpenBidVendorBankService` — FastAPI-only; no PHP fallback; no `userAppId` / `page` / media; 401 refresh-once retry; PUT network/timeout → `unknownCommit` (no auto-retry). PR16 onboarding bank/passbook path unchanged. PHP handlers retained unused. No worker change.
+
+```bash
+python -m pytest tests/test_pr17_vendor_bank.py -q
+python -m pytest tests/test_pr6_getuserdetails.py tests/test_pr11_vendor_bidding.py \
+  tests/test_pr13_vendor_confirmed_trip.py tests/test_pr14_vendor_manage_drivers.py \
+  tests/test_pr15_vendor_manage_cars.py tests/test_pr16_vendor_onboarding.py -q
+```
+
+## PR18 — Vendor Trip Preferences
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getuserregionpreferences` | JWT `sub` authoritative; optional legacy `userAppId` must match or **403**; missing user → **404** `USER_NOT_FOUND`; `lockApp` → **403** `ACCOUNT_LOCKED`; customer / pending vendor → **403** `VENDOR_NOT_ELIGIBLE`; returns full region/location catalog with `SELECTED` flags (nested city ids are `location_details.LID`). Empty prefs → catalog with all `SELECTED=false` (not `NOT_FOUND`). |
+| `GET /getuserrequesttypepreferences` | Same ownership/eligibility; full request-type catalog + `SELECTED`; empty prefs → all false. |
+| `PUT /updateregioncityselections` | Body `{regionIds, cityIds}` required int arrays (may be empty); dedupe + ascending CSV; forced master validation (**422** `ERROR_INVALID_REGIONIDS` / `ERROR_INVALID_CITYIDS`); `SELECT FOR UPDATE` + re-check eligibility; atomic replace of both CSV columns; same-value → `{message: UPDATED}` without publish; changed commit then `POST {WORKER_BASE_URL}/build_snapshot` `flag=Vendor`. Does **not** bump `tableTimestamp` (WSS does not use it for prefs). |
+| `PUT /updaterequesttypeselections` | Body `{requestTypeIds}` required int array (may be empty); same eligibility/lock/validation (**422** `ERROR_INVALID_REQUESTTYPEIDS`); same-value `{message: UPDATED}`; changed commit then Vendor snapshot refresh. No `NOTHING_TO_UDPATE`. |
+
+Empty city and/or request-type selections mean the vendor receives no matching open requests (not “all”). `regionPreferences` remain stored/UI-only; worker/PR11 continue filtering by city LID + request type only. Notification matching parity gap is unchanged/out of scope.
+
+Flutter: `OpenBidVendorPreferenceService` — FastAPI-only; no PHP fallback; no `userAppId` / `page` / CSV; 401 refresh-once retry; PUT network/timeout → `unknownCommit` (no auto-retry). PHP handlers retained unused.
+
+Env: `WORKER_BASE_URL`, `BUILD_SNAPSHOT_FUNCTION_KEY` (same as openbid-ws). Propagation failure is logged and does not roll back the preference update.
+
+```bash
+python -m pytest tests/test_pr18_vendor_preferences.py -q
+python -m pytest tests/test_pr6_getuserdetails.py tests/test_pr7_catalogs.py \
+  tests/test_pr11_vendor_bidding.py tests/test_pr14_vendor_manage_drivers.py \
+  tests/test_pr15_vendor_manage_cars.py tests/test_pr16_vendor_onboarding.py \
+  tests/test_pr17_vendor_bank.py -q
+```

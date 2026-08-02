@@ -119,19 +119,73 @@ class BidderDetail(TrimmedBaseModel):
                     
 
 class UserBankDetailsUpdate(TrimmedBaseModel):
-    userAppId : str
-    bankAccountHolderName : Optional[str] = None
-    bankAccountNo : Optional[str] = None
-    bankIFSC : Optional[str] = None
-    bankName : Optional[str] = None
+    """PR17 mobile bank text update.
+
+    All four bank fields are required (no partial update on this route).
+    Optional legacy ``userAppId`` is ignored for ownership; mismatch → 403.
+    """
+
+    bankAccountHolderName: str = Field(..., min_length=1)
+    bankAccountNo: str = Field(..., min_length=1)
+    bankIFSC: str = Field(..., min_length=1)
+    bankName: str = Field(..., min_length=1)
+    # Transitional only — JWT sub is authoritative.
+    userAppId: Optional[str] = None
+
+    @field_validator("bankAccountHolderName", "bankName")
+    @classmethod
+    def validate_required_text(cls, v):
+        text = str(v or "").strip()
+        if not text:
+            raise ValueError("ERROR_REQUIRED_FIELD")
+        return text
+
+    @field_validator("bankIFSC")
+    @classmethod
+    def validate_ifsc(cls, v):
+        if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", str(v).upper()):
+            raise ValueError("ERROR_INVALID_IFSC")
+        return str(v).upper()
+
+    @field_validator("bankAccountNo")
+    @classmethod
+    def validate_bank_account_no(cls, v):
+        cleaned = str(v).replace(" ", "").strip()
+        if not re.match(r"^[0-9A-Za-z\-]{6,22}$", cleaned):
+            raise ValueError("ERROR_INVALID_ACCOUNTNO")
+        return cleaned
+
+    @field_validator("userAppId")
+    @classmethod
+    def validate_user_app_id(cls, v):
+        if v is None:
+            return None
+        if not str(v).strip():
+            return None
+        return str(v).replace(" ", "").strip()
+
 
 class UserBankDetailsResponse(TrimmedBaseModel):
-    BANK_AC_HOLDER : Optional[str] = None
-    BANK_AC_NO : Optional[str] = None
-    BANK_IFSC : Optional[str] = None
-    BANK_NAME : Optional[str] = None
-   
-    model_config={"from_attributes":True}
+    """Legacy uppercase bank payload (non-mobile / admin consumers)."""
+
+    BANK_AC_HOLDER: Optional[str] = None
+    BANK_AC_NO: Optional[str] = None
+    BANK_IFSC: Optional[str] = None
+    BANK_NAME: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class VendorBankAccountSummaryResponse(TrimmedBaseModel):
+    """PR17 mobile GET bank summary — masked account only."""
+
+    hasBankAccount: bool
+    maskedAccountNumber: Optional[str] = None
+    accountHolderName: Optional[str] = None
+    bankIFSC: Optional[str] = None
+    bankName: Optional[str] = None
+
+    model_config = {"from_attributes": True}
 
 class UserLogin(TrimmedBaseModel):
     userAppId : str
@@ -178,126 +232,161 @@ class VendorResponse(TrimmedBaseModel):
 
 
 class VendorKycCreate(TrimmedBaseModel):
-    userAppId : str = Field(...,min_length=1)
-    alsoVendor : bool
-    firstName : str = Field(...,min_length=1)
-    lastName : str=Field(...,min_length=1)
-    dob : str=Field(...,min_length=1)
-    gender : str=Field(...,min_length=1)
-    addressLine1 : str=Field(...,min_length=1)
-    addressLine2 : Optional[str] = None
-    city : str=Field(...,min_length=1)
-    state:str=Field(...,min_length=1)
-    bankAccountHolderName: str=Field(...,min_length=1)
-    bankAccountNo : str=Field(...,min_length=1)
-    bankIFSC : str=Field(...,min_length=1)
-    bankName : str=Field(...,min_length=1)
-    imageAadhar : str=Field(...,min_length=1)
-    imagePAN : str=Field(...,min_length=1)
-    imageBankAccount : str=Field(...,min_length=1)
+    """Vendor KYC / registration body (PR16).
 
-    @field_validator('userAppId')
-    @classmethod
-    def validate_user_app_id(cls,v):
-        if not v or v.isspace():
-            raise ValueError("ERROR_INVALID_USERAPPID")
-        return v.replace(' ','')
-    
-    @field_validator('dob')
-    @classmethod
-    def validate_dob(cls,v):
-        try:
-            #Try parsing common date formats
-            datetime.strptime(v,"%Y-%m-%d")
-            return v
-        except ValueError:
-            try : 
-                datetime.strptime(v,"%d-%m-%Y")
-                return v
-            except ValueError:
-                try : 
-                    datetime.strptime(v,"%d/%m/%Y")
-                    return v
-                except ValueError:
-                    raise ValueError('ERROR_INVALID_DOB')
-                
-    @field_validator('gender')
-    @classmethod
-    def validate_gender(cls,v):
-        vali_genders = ['M','F','O','MALE','FEMALE','OTHER']
-        if v.upper() not in vali_genders:
-            raise ValueError('ERROR_INVALID_GENDER')
-        return v.upper()
-    
-    @field_validator('bankIFSC')
-    @classmethod
-    def validate_ifsc(cls,v):
-        if not re.match(r'^[A-Z]{4}0[A-Z0-9]{6}$', v.upper()):
-            raise ValueError('ERROR_INVALID_IFSC')
-        return v.upper()
-    
-    @field_validator('bankAccountNo')
-    @classmethod
-    def validate_bank_account_no(cls,v):
-        if not re.match(r'^[0-9A-Za-z\-]{6,22}$', v):
-            raise ValueError('ERROR_INVALID_ACCOUNTNO')
-        return v.replace(' ', '')
+    Applicant identity and lifecycle flags are server-derived from JWT.
+    Legacy clients may still send optional userAppId / alsoVendor; ownership
+    and alsoVendor are not client-authoritative.
+    """
 
-    @field_validator('imageAadhar', 'imagePAN', 'imageBankAccount')
-    def validate_images(cls, v):
-        if not v or v.strip() == '':
-            raise ValueError('ERROR_MISSING_IMAGES')
-        return v
-    
-    model_config={"from_attributes":True}
+    dob: str = Field(..., min_length=1)
+    gender: str = Field(..., min_length=1)
+    addressLine1: str = Field(..., min_length=1)
+    addressLine2: str = Field(..., min_length=1)
+    city: str = Field(..., min_length=1)
+    state: str = Field(..., min_length=1)
+    bankAccountHolderName: str = Field(..., min_length=1)
+    bankAccountNo: str = Field(..., min_length=1)
+    bankIFSC: str = Field(..., min_length=1)
+    bankName: str = Field(..., min_length=1)
+    imageAadhar: str = Field(..., min_length=1)
+    imagePAN: str = Field(..., min_length=1)
+    imageBankAccount: str = Field(..., min_length=1)
+    # Legacy / ignored — JWT sub is authoritative; alsoVendor forced server-side.
+    userAppId: Optional[str] = None
+    alsoVendor: Optional[bool] = None
 
-class UpdateRequestTypeSelectionsRequest(TrimmedBaseModel):
-    userAppId: str
-    requestTypeIds: Optional[Union[str, List[Union[str, int]]]] = None
-    validate: Optional[bool] = False
-
-    @field_validator('userAppId')
+    @field_validator("userAppId")
+    @classmethod
     def validate_user_app_id(cls, v):
-        if not v:
-            raise ValueError('ERROR_MISSING_USERAPPID')
-        return v
-
-    @field_validator('requestTypeIds', mode='before')
-    def parse_request_type_ids(cls, v):
         if v is None:
             return None
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            if v.strip() == "":
-                return []
-            return [x.strip() for x in v.split(',') if x.strip()]
-        return []
+        if not str(v).strip():
+            raise ValueError("ERROR_INVALID_USERAPPID")
+        return str(v).replace(" ", "").strip()
+
+    @field_validator("dob")
+    @classmethod
+    def validate_dob(cls, v):
+        # Canonical wire format for PR16: yyyy-MM-dd only.
+        try:
+            datetime.strptime(str(v).strip(), "%Y-%m-%d")
+            return str(v).strip()
+        except ValueError:
+            raise ValueError("ERROR_INVALID_DOB")
+
+    @field_validator("gender")
+    @classmethod
+    def validate_gender(cls, v):
+        mapping = {
+            "M": "Male",
+            "MALE": "Male",
+            "F": "Female",
+            "FEMALE": "Female",
+            "O": "Other",
+            "OTHER": "Other",
+        }
+        key = str(v or "").strip().upper()
+        if key not in mapping:
+            raise ValueError("ERROR_INVALID_GENDER")
+        return mapping[key]
+
+    @field_validator("bankIFSC")
+    @classmethod
+    def validate_ifsc(cls, v):
+        if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", str(v).upper()):
+            raise ValueError("ERROR_INVALID_IFSC")
+        return str(v).upper()
+
+    @field_validator("bankAccountNo")
+    @classmethod
+    def validate_bank_account_no(cls, v):
+        cleaned = str(v).replace(" ", "")
+        if not re.match(r"^[0-9A-Za-z\-]{6,22}$", cleaned):
+            raise ValueError("ERROR_INVALID_ACCOUNTNO")
+        return cleaned
+
+    @field_validator("imageAadhar", "imagePAN", "imageBankAccount")
+    @classmethod
+    def validate_images(cls, v):
+        if not v or str(v).strip() == "":
+            raise ValueError("ERROR_MISSING_IMAGES")
+        return v
 
     model_config = {"from_attributes": True}
 
-class UpdateRegionCitySelectionsRequest(TrimmedBaseModel):
-    userAppId : str
-    regionIds: Optional[Union[str, List[Union[str, int]]]] = None
-    cityIds: Optional[Union[str, List[Union[str, int]]]] = None
-    validate: Optional[bool] = False
-    @field_validator('userAppId')
-    def validate_user_app_id(cls, v):
-        if not v:
-            raise ValueError('ERROR_MISSING_USERAPPID')
-        return v
+class UpdateRequestTypeSelectionsRequest(TrimmedBaseModel):
+    """PR18 PUT /updaterequesttypeselections body.
 
-    @field_validator('regionIds', 'cityIds', mode='before')
-    def parse_ids(cls, v):
+    JWT ``sub`` is authoritative. Optional transitional ``userAppId`` must match
+    JWT when provided; it never selects the target row.
+    """
+
+    userAppId: Optional[str] = None
+    requestTypeIds: List[Union[str, int]]
+
+    @field_validator("userAppId", mode="before")
+    @classmethod
+    def normalize_optional_user_app_id(cls, v):
         if v is None:
             return None
+        text = str(v).strip()
+        return text or None
+
+    @field_validator("requestTypeIds", mode="before")
+    @classmethod
+    def parse_request_type_ids(cls, v):
+        if v is None:
+            raise ValueError("ERROR_INVALID_REQUESTTYPEIDS")
         if isinstance(v, list):
+            for item in v:
+                if isinstance(item, bool) or isinstance(item, float):
+                    raise ValueError("ERROR_INVALID_REQUESTTYPEIDS")
             return v
         if isinstance(v, str):
             if v.strip() == "":
                 return []
-            return [x.strip() for x in v.split(',') if x.strip()]
-        return []
+            return [x.strip() for x in v.split(",") if x.strip()]
+        raise ValueError("ERROR_INVALID_REQUESTTYPEIDS")
+
+    model_config = {"from_attributes": True}
+
+
+class UpdateRegionCitySelectionsRequest(TrimmedBaseModel):
+    """PR18 PUT /updateregioncityselections body.
+
+    Both ``regionIds`` and ``cityIds`` are required (may be empty arrays).
+    JWT ``sub`` is authoritative. Optional transitional ``userAppId`` must match
+    JWT when provided; it never selects the target row.
+    """
+
+    userAppId: Optional[str] = None
+    regionIds: List[Union[str, int]]
+    cityIds: List[Union[str, int]]
+
+    @field_validator("userAppId", mode="before")
+    @classmethod
+    def normalize_optional_user_app_id(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        return text or None
+
+    @field_validator("regionIds", "cityIds", mode="before")
+    @classmethod
+    def parse_ids(cls, v):
+        if v is None:
+            raise ValueError("ERROR_MISSING_ID_ARRAY")
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, bool) or isinstance(item, float):
+                    raise ValueError("ERROR_INVALID_ID_VALUE")
+            return v
+        if isinstance(v, str):
+            if v.strip() == "":
+                return []
+            return [x.strip() for x in v.split(",") if x.strip()]
+        raise ValueError("ERROR_MISSING_ID_ARRAY")
 
     model_config = {"from_attributes": True}
 

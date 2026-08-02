@@ -21,8 +21,17 @@ from ..schemas.user_table import (NoUserResponse,BidderDetail, RejectUserRequest
                                   UpdateRequestTypeSelectionsRequest,UpdateRegionCitySelectionsRequest,
                                   RequestTypeResponse,GetUserDetailsResponse,CustomerListItem,AdminNumberResponse,
                                   UpdateVendorApprovalRequest,UpdateVendorLockAppStatusRequest,UploadVendorDocumentRequest,
-                                  UploadVendorDocumentResponse)
-from ..utils.common import ErrorResponse,ImageResponse,EmailErrorResponse,_ids_to_csv,_to_id_array,_csv_to_set
+                                  UploadVendorDocumentResponse,VendorBankAccountSummaryResponse)
+from ..utils.common import (
+    ErrorResponse,
+    ImageResponse,
+    EmailErrorResponse,
+    _ids_to_csv,
+    _to_id_array,
+    _csv_to_set,
+    _parse_id_list_strict,
+)
+from ..utils.vendor_snapshot_refresh import request_vendor_snapshot_refresh
 from ..utils.image import upload_image,upload_vendor_profile_picture_azure,azure_blob_upload,azure_blob_delete_by_url
 from ..utils.email import send_email
 from ..utils.fcm import subscribe_token_to_topics, TOPIC_ALL_USERS, TOPIC_ALL_VENDORS, unsubscribe_token_from_topics
@@ -435,31 +444,110 @@ def get_vendor_by_rid(
         ) from None
 
 
-def get_user_bank_details(db:Session, userappid : int):
+def _reject_user_app_id_mismatch(jwt_sub: str, user_app_id: Optional[str]) -> None:
+    """Transitional compatibility: optional client userAppId must match JWT sub."""
+    if user_app_id is None:
+        return
+    provided = str(user_app_id).strip()
+    if not provided:
+        return
+    if provided != str(jwt_sub).strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized",
+        )
+
+
+def _enforce_bank_vendor_eligibility(user: User) -> None:
+    """PR17 bank GET/PUT eligibility — ACCOUNT_LOCKED before VENDOR_NOT_ELIGIBLE."""
+    _enforce_approved_vendor_eligibility(user)
+
+
+def _enforce_approved_vendor_eligibility(user: User) -> None:
+    """Approved unlocked vendor gate — ACCOUNT_LOCKED before VENDOR_NOT_ELIGIBLE."""
+    if bool(getattr(user, "lockApp", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ACCOUNT_LOCKED",
+        )
+    if (
+        not bool(getattr(user, "alsoVendor", False))
+        or not bool(getattr(user, "vendorApproved", False))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="VENDOR_NOT_ELIGIBLE",
+        )
+
+
+def _mask_bank_account_mobile(account_no: Optional[str]) -> Optional[str]:
+    """Masked mobile account display — never returns the full value.
+
+    Uses the same last-four suffix rule as PR16 ``_mask_bank_account``,
+    with a stable ``X`` mask character for the Flutter contract.
+    """
+    cleaned = _kyc_clean(account_no)
+    if not cleaned:
+        return None
+    if len(cleaned) <= 4:
+        return "XXXX"
+    return f"{'X' * (len(cleaned) - 4)}{cleaned[-4:]}"
+
+
+def _has_bank_account(account_no: Optional[str]) -> bool:
+    return bool(_kyc_clean(account_no))
+
+
+def _ist_now_naive() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+
+def get_user_bank_details(
+    db: Session,
+    user_id: str,
+    user_app_id: Optional[str] = None,
+) -> VendorBankAccountSummaryResponse:
+    """PR17 GET /getregisteredbankaccount — JWT-owned masked bank summary."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, user_app_id)
+
     try:
-        bankdetails = db.query(
-            User.bankAccountHolderName,
-            User.bankAccountNo,
-            User.bankIFSC,
-            User.bankName
-            ).filter(User.userAppId == userappid).limit(1).all()
-        db.commit()
-        if not bankdetails:
-            return ErrorResponse(message="NO_BANK_DETAILS")
-        
-        bank_acc_holder_name,bank_acc_no,bank_ifsc,bank_name = bankdetails[0]
-        return UserBankDetailsResponse(
-                BANK_AC_HOLDER= bank_acc_holder_name,
-                BANK_AC_NO = bank_acc_no,
-                BANK_IFSC = bank_ifsc,
-                BANK_NAME=bank_name
+        user = db.query(User).filter(User.userAppId == jwt_sub).first()
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
             )
+
+        _enforce_bank_vendor_eligibility(user)
+
+        account_no = getattr(user, "bankAccountNo", None)
+        has_account = _has_bank_account(account_no)
+        if not has_account:
+            return VendorBankAccountSummaryResponse(
+                hasBankAccount=False,
+                maskedAccountNumber=None,
+                accountHolderName=None,
+                bankIFSC=None,
+                bankName=None,
+            )
+
+        return VendorBankAccountSummaryResponse(
+            hasBankAccount=True,
+            maskedAccountNumber=_mask_bank_account_mobile(account_no),
+            accountHolderName=getattr(user, "bankAccountHolderName", None),
+            bankIFSC=getattr(user, "bankIFSC", None),
+            bankName=getattr(user, "bankName", None),
+        )
+    except HTTPException:
+        raise
     except SQLAlchemyError:
         db.rollback()
-        return ErrorResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
-    
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load bank details",
+        ) from None
+
     
 # def fcm_token_update(db:Session, user_app_id : int, fcm_token : int):
 #     try:
@@ -747,49 +835,62 @@ def delete_user(db: Session, user_data: UserDelete):
     finally:
         db.close()
     
-def update_vendor_bank_details(db : Session, user_data : UserBankDetailsUpdate):
-    try : 
-        with db.begin():
-            existing_user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
-            if not existing_user:
-                return ErrorResponse(message="NOT FOUND")            
-            #Collect Updata Data 
-            update_data = {}
-            if user_data.bankAccountHolderName and user_data.bankAccountHolderName.strip():
-                update_data["bankAccountHolderName"] = user_data.bankAccountHolderName.strip()
-            if user_data.bankAccountNo and user_data.bankAccountNo.strip():
-                #Remove non-alphanumeric characters
-                account_no = re.sub(r'[^A-Za-z0-9]', '', user_data.bankAccountNo.strip())
-                if len(account_no) > 50: # Basic length validation
-                    return ErrorResponse(message="ERROR_INVALID_BANKACCOUNTNO")
-                update_data["bankAccountNo"] = account_no
-            if user_data.bankIFSC and user_data.bankIFSC.strip():
-                # Uppercase and validate IFSC (11 characters, e.g., SBIN0001234)
-                ifsc = user_data.bankIFSC.strip().upper()
-                if not re.match(r'^[A-Z]{4}0[A-Z0-9]{6}$', ifsc):
-                    return NoUserResponse(message="ERROR_INVALID_BANKIFSC")
-                update_data["bankIFSC"] = ifsc
-            if user_data.bankName and user_data.bankName.strip():
-                update_data["bankName"] = user_data.bankName
+def update_vendor_bank_details(
+    db: Session,
+    user_data: UserBankDetailsUpdate,
+    user_id: str,
+) -> ErrorResponse:
+    """PR17 PUT /updatevendorbankdetails — JWT-owned four-field bank text update."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, getattr(user_data, "userAppId", None))
 
-            if not update_data:
-                return ErrorResponse(message="ERROR_NOTHING_TO_UPDATE")
+    holder = str(user_data.bankAccountHolderName).strip()
+    account_no = str(user_data.bankAccountNo).strip()
+    ifsc = str(user_data.bankIFSC).strip().upper()
+    bank_name = str(user_data.bankName).strip()
 
-            #UPDATE USER
-            update = db.query(User).filter(User.userAppId == user_data.userAppId).update(update_data)
+    try:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
+
+        _enforce_bank_vendor_eligibility(user)
+
+        unchanged = (
+            _kyc_clean(getattr(user, "bankAccountHolderName", None)) == holder
+            and _kyc_clean(getattr(user, "bankAccountNo", None)) == account_no
+            and _kyc_clean(getattr(user, "bankIFSC", None)).upper() == ifsc
+            and _kyc_clean(getattr(user, "bankName", None)) == bank_name
+        )
+        if unchanged:
             db.commit()
+            return ErrorResponse(message="UPDATED")
 
-            if update > 0:
-                return ErrorResponse(message="UPDATED")
-            
-            return ErrorResponse(message="NO_CHANGES")
-
+        user.bankAccountHolderName = holder
+        user.bankAccountNo = account_no
+        user.bankIFSC = ifsc
+        user.bankName = bank_name
+        user.tableTimestamp = _ist_now_naive()
+        db.commit()
+        return ErrorResponse(message="UPDATED")
+    except HTTPException:
+        db.rollback()
+        raise
     except SQLAlchemyError:
         db.rollback()
-        return ErrorResponse(message="ERROR_UPDATE")
-    finally:
-        db.close()
-    
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to update bank details",
+        ) from None
+
 # def profile_image_upload(db: Session, user_data : UserImageUpload):
 #     try : 
 #         with db.begin():
@@ -1203,27 +1304,80 @@ def get_all_active_vendors(db: Session):
 #         db.close()
 
 
-def vendor_update_with_kyc(db: Session, vendor_update_data: VendorKycCreate):
+_MAX_KYC_MEDIA_BYTES = 2 * 1024 * 1024
+_DEFAULT_KYC_EMAIL_FROM = "customersupport@wizzride.com"
+
+
+def _kyc_clean(v) -> str:
+    return str(v or "").strip()
+
+
+def _mask_bank_account(account_no: str) -> str:
+    digits = _kyc_clean(account_no)
+    if len(digits) <= 4:
+        return "****"
+    return f"{'*' * (len(digits) - 4)}{digits[-4:]}"
+
+
+def _map_kyc_media_error(upload_message: Optional[str], label: str) -> str:
+    msg = str(upload_message or "").upper()
+    if "FILE_TOO_LARGE" in msg:
+        return "ERROR_MEDIA_TOO_LARGE"
+    if "INVALID_BASE64" in msg:
+        return "ERROR_INVALID_MEDIA"
+    if "INVALID_IMAGE" in msg or "UNSUPPORTED_IMAGE" in msg:
+        return "ERROR_INVALID_MEDIA"
+    return f"ERROR_SAVE_{label}"
+
+
+def _cleanup_kyc_blobs(urls: list[str]) -> None:
+    for url in urls:
+        if not url:
+            continue
+        try:
+            azure_blob_delete_by_url(url)
+        except Exception:
+            pass
+
+
+def vendor_update_with_kyc(
+    db: Session,
+    vendor_update_data: VendorKycCreate,
+    user_id: str,
+):
+    """PUT /registernewvendor — JWT-owned KYC upsert (PR16).
+
+    Forces alsoVendor=true. Never sets vendorApproved. Never changes lockApp.
+    Approved vendors are blocked with ALREADY_VENDOR. Pending vendors may resubmit.
+    """
     EMAIL_TO = "openbidresourceteam@wizzride.com"
     EMAIL_TO_NAME = "Wizzride"
-    EMAIL_FROM = "ticketdetails@wizzride.com"
-    EMAIL_FROM_NAME = "WizzRide"
+    EMAIL_FROM = os.getenv("KYC_EMAIL_FROM", _DEFAULT_KYC_EMAIL_FROM).strip() or _DEFAULT_KYC_EMAIL_FROM
+    EMAIL_FROM_NAME = os.getenv("KYC_EMAIL_FROM_NAME", "WizzRide").strip() or "WizzRide"
     EMAIL_SUBJECT = "New/Updated Vendor Registration - Approval Pending"
 
-    def clean(v) -> str:
-        return str(v or "").strip()
-
     tz = ZoneInfo("Asia/Kolkata")
+    jwt_sub = _kyc_clean(user_id).replace(" ", "")
+    if not jwt_sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
 
-    # ----------------------------------
-    # REQUIRED FIELDS (same as PHP)
-    # ----------------------------------
+    # Legacy body identity must match JWT when supplied.
+    legacy_id = getattr(vendor_update_data, "userAppId", None)
+    if legacy_id is not None and _kyc_clean(legacy_id).replace(" ", ""):
+        if _kyc_clean(legacy_id).replace(" ", "") != jwt_sub:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized",
+            )
+
     required_fields = {
-        "userAppId": getattr(vendor_update_data, "userAppId", None),
-        "alsoVendor": getattr(vendor_update_data, "alsoVendor", None),
         "dob": getattr(vendor_update_data, "dob", None),
         "gender": getattr(vendor_update_data, "gender", None),
         "addressLine1": getattr(vendor_update_data, "addressLine1", None),
+        "addressLine2": getattr(vendor_update_data, "addressLine2", None),
         "city": getattr(vendor_update_data, "city", None),
         "state": getattr(vendor_update_data, "state", None),
         "bankAccountHolderName": getattr(vendor_update_data, "bankAccountHolderName", None),
@@ -1234,134 +1388,193 @@ def vendor_update_with_kyc(db: Session, vendor_update_data: VendorKycCreate):
         "imagePAN": getattr(vendor_update_data, "imagePAN", None),
         "imageBankAccount": getattr(vendor_update_data, "imageBankAccount", None),
     }
-
     for field_name, field_value in required_fields.items():
-        if field_value is None or clean(field_value) == "":
-            return EmailErrorResponse(message=f"ERROR_MISSING_{field_name.upper()}")
-        
-    # ----------------------------------
-    # CLEAN INPUT (same as PHP)
-    # ----------------------------------
-    user_app_id = clean(vendor_update_data.userAppId).replace(" ", "")
-    also_vendor = 1 if (
-        vendor_update_data.alsoVendor == 1
-        or vendor_update_data.alsoVendor == "1"
-        or vendor_update_data.alsoVendor is True
-    ) else 0
+        if field_value is None or _kyc_clean(field_value) == "":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"ERROR_MISSING_{field_name.upper()}",
+            )
 
-    # DOB validation like PHP
-    dob_raw = vendor_update_data.dob
-    dob_sql = None
+    dob_raw = _kyc_clean(vendor_update_data.dob)
     try:
-        if hasattr(dob_raw, "strftime"):
-            dob_sql = dob_raw.strftime("%Y-%m-%d")
-        else:
-            # accept ISO-like string first
-            dob_sql = datetime.fromisoformat(str(dob_raw)).strftime("%Y-%m-%d")
-    except Exception:
-        try:
-            dob_sql = datetime.strptime(str(dob_raw), "%d-%m-%Y").strftime("%Y-%m-%d")
-        except Exception:
-            return EmailErrorResponse(message="ERROR_INVALID_DOB")
+        dob_sql = datetime.strptime(dob_raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_INVALID_DOB",
+        )
 
-    gender = clean(vendor_update_data.gender).upper()
-    if gender not in {"M", "F", "O", "MALE", "FEMALE", "OTHER"}:
-        return EmailErrorResponse(message="ERROR_INVALID_GENDER")
+    gender = _kyc_clean(vendor_update_data.gender)
+    if gender not in {"Male", "Female", "Other"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_INVALID_GENDER",
+        )
 
-    address1 = clean(vendor_update_data.addressLine1)
-    address2 = clean(getattr(vendor_update_data, "addressLine2", ""))
+    address1 = _kyc_clean(vendor_update_data.addressLine1)
+    address2 = _kyc_clean(vendor_update_data.addressLine2)
     address = f"{address1} {address2}".strip()
+    city = _kyc_clean(vendor_update_data.city)
+    state = _kyc_clean(vendor_update_data.state)
+    acc_holder = _kyc_clean(vendor_update_data.bankAccountHolderName)
+    acc_no = _kyc_clean(vendor_update_data.bankAccountNo)
+    ifsc = _kyc_clean(vendor_update_data.bankIFSC).upper()
+    bank_name = _kyc_clean(vendor_update_data.bankName)
 
-    city = clean(vendor_update_data.city)
-    state = clean(vendor_update_data.state)
+    if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", ifsc):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_INVALID_IFSC",
+        )
+    if not re.match(r"^[0-9A-Za-z\-]{6,22}$", acc_no):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_INVALID_ACCOUNTNO",
+        )
 
-    acc_holder = clean(vendor_update_data.bankAccountHolderName)
-    acc_no = clean(vendor_update_data.bankAccountNo)
-    ifsc = clean(vendor_update_data.bankIFSC).upper()
-    bank_name = clean(vendor_update_data.bankName)
-
-    joining_date = datetime.now(tz).strftime("%Y-%m-%d")
-    request_type_preferences = "1,2,3,4"
-
+    joining_date_today = datetime.now(tz).date()
     new_blob_urls: list[str] = []
     old_aadhaar_url = None
     old_pan_url = None
     old_bank_url = None
+    aadhaar_url = None
+    pan_url = None
+    bank_url = None
 
     try:
-        with db.begin():
-            # Same PHP behavior: user must exist
-            user = db.query(User).filter(User.userAppId == user_app_id).first()
-            if not user:
-                return EmailErrorResponse(message="USER_NOT_FOUND")
-
-            old_aadhaar_url = user.imageAadhar
-            old_pan_url = user.imagePAN
-            old_bank_url = user.imageBankAccount
-
-            ts = datetime.now(tz).strftime("%Y%m%d_%H%M%S")
-            blob_base = f"{user_app_id}/"
-
-            ok_a, aadhaar_url = azure_blob_upload(
-                blob_name=f"{blob_base}Aadhaar_{ts}",
-                base64_data=vendor_update_data.imageAadhar,
-                make_public=False,
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
             )
-            if not ok_a:
-                raise ValueError("ERROR_SAVE_AADHAAR")
-            new_blob_urls.append(aadhaar_url)
 
-            ok_p, pan_url = azure_blob_upload(
-                blob_name=f"{blob_base}PAN_{ts}",
-                base64_data=vendor_update_data.imagePAN,
-                make_public=False,
+        if bool(getattr(user, "lockApp", False)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ACCOUNT_LOCKED",
             )
-            if not ok_p:
-                raise ValueError("ERROR_SAVE_PAN")
-            new_blob_urls.append(pan_url)
 
-            ok_b, bank_url = azure_blob_upload(
-                blob_name=f"{blob_base}Bank_{ts}",
-                base64_data=vendor_update_data.imageBankAccount,
-                make_public=False,
+        if bool(getattr(user, "vendorApproved", False)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="ALREADY_VENDOR",
             )
-            if not ok_b:
-                raise ValueError("ERROR_SAVE_BANK")
-            new_blob_urls.append(bank_url)
 
-            # update base details
-            user.joiningDate = joining_date
-            user.alsoVendor = also_vendor
-            user.dob = dob_sql
-            user.address = address
-            user.city = city
-            user.gender = gender
-            user.state = state
-            user.bankAccountHolderName = acc_holder
-            user.bankAccountNo = acc_no
-            user.bankIFSC = ifsc
-            user.bankName = bank_name
-            user.requestTypePreferences = request_type_preferences
+        old_aadhaar_url = user.imageAadhar
+        old_pan_url = user.imagePAN
+        old_bank_url = user.imageBankAccount
 
-            # update doc urls
-            user.imageAadhar = aadhaar_url
-            user.imagePAN = pan_url
-            user.imageBankAccount = bank_url
+        ts = datetime.now(tz).strftime("%Y%m%d_%H%M%S")
+        blob_base = f"{jwt_sub}/"
 
-        # ----------------------------------
-        # DELETE OLD BLOBS AFTER COMMIT
-        # ----------------------------------
+        ok_a, aadhaar_url = azure_blob_upload(
+            blob_name=f"{blob_base}Aadhaar_{ts}",
+            base64_data=vendor_update_data.imageAadhar,
+            make_public=False,
+            max_upload_bytes=_MAX_KYC_MEDIA_BYTES,
+        )
+        if not ok_a:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_map_kyc_media_error(aadhaar_url, "AADHAAR"),
+            )
+        new_blob_urls.append(aadhaar_url)
+
+        ok_p, pan_url = azure_blob_upload(
+            blob_name=f"{blob_base}PAN_{ts}",
+            base64_data=vendor_update_data.imagePAN,
+            make_public=False,
+            max_upload_bytes=_MAX_KYC_MEDIA_BYTES,
+        )
+        if not ok_p:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_map_kyc_media_error(pan_url, "PAN"),
+            )
+        new_blob_urls.append(pan_url)
+
+        ok_b, bank_url = azure_blob_upload(
+            blob_name=f"{blob_base}Bank_{ts}",
+            base64_data=vendor_update_data.imageBankAccount,
+            make_public=False,
+            max_upload_bytes=_MAX_KYC_MEDIA_BYTES,
+        )
+        if not ok_b:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=_map_kyc_media_error(bank_url, "BANK"),
+            )
+        new_blob_urls.append(bank_url)
+
+        # Re-check approval / lock under a fresh locked read before mutation apply
+        # so an admin approval racing with upload is observed.
+        db.refresh(user)
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
+        if bool(getattr(user, "vendorApproved", False)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="ALREADY_VENDOR",
+            )
+        if bool(getattr(user, "lockApp", False)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ACCOUNT_LOCKED",
+            )
+        preserved_vendor_approved = bool(getattr(user, "vendorApproved", False))
+        preserved_lock_app = bool(getattr(user, "lockApp", False))
+
+        if not getattr(user, "joiningDate", None):
+            user.joiningDate = joining_date_today
+
+        existing_prefs = _kyc_clean(getattr(user, "requestTypePreferences", None))
+        if not existing_prefs:
+            user.requestTypePreferences = "1,2,3,4"
+
+        user.alsoVendor = True
+        user.vendorApproved = preserved_vendor_approved
+        user.lockApp = preserved_lock_app
+        user.dob = dob_sql
+        user.address = address
+        user.city = city
+        user.gender = gender
+        user.state = state
+        user.bankAccountHolderName = acc_holder
+        user.bankAccountNo = acc_no
+        user.bankIFSC = ifsc
+        user.bankName = bank_name
+        user.imageAadhar = aadhaar_url
+        user.imagePAN = pan_url
+        user.imageBankAccount = bank_url
+
+        db.commit()
+
         for old_url in [old_aadhaar_url, old_pan_url, old_bank_url]:
-            if old_url:
+            if old_url and old_url not in new_blob_urls:
                 try:
                     azure_blob_delete_by_url(old_url)
                 except Exception:
+                    # Cleanup failure must not undo committed registration.
                     pass
 
-        # ----------------------------------
-        # EXACT PHP EMAIL HTML
-        # ----------------------------------
-        html = f'''
+        masked_account = _mask_bank_account(acc_no)
+        esc = html.escape
+        email_html = f'''
         <html>
         <head>
             <title>New/Updated Vendor Registration</title>
@@ -1377,25 +1590,26 @@ def vendor_update_with_kyc(db: Session, vendor_update_data: VendorKycCreate):
             <div class="box">
                 <h2>Vendor KYC — New/Updated Submission</h2>
 
-                <div class="row"><span class="k">User App ID:</span> {user_app_id}</div>
-                <div class="row"><span class="k">Also Vendor:</span> {"Yes" if also_vendor else "No"}</div>
+                <div class="row"><span class="k">User App ID:</span> {esc(jwt_sub)}</div>
+                <div class="row"><span class="k">Also Vendor:</span> Yes</div>
+                <div class="row"><span class="k">Vendor Approved:</span> No (pending review)</div>
 
                 <hr>
-                <div class="row"><span class="k">DOB:</span> {dob_sql}</div>
-                <div class="row"><span class="k">Gender:</span> {gender}</div>
-                <div class="row"><span class="k">Address:</span> {address}</div>
-                <div class="row"><span class="k">City / State:</span> {city} / {state}</div>
+                <div class="row"><span class="k">DOB:</span> {esc(dob_sql)}</div>
+                <div class="row"><span class="k">Gender:</span> {esc(gender)}</div>
+                <div class="row"><span class="k">Address:</span> {esc(address)}</div>
+                <div class="row"><span class="k">City / State:</span> {esc(city)} / {esc(state)}</div>
 
                 <hr>
-                <div class="row"><span class="k">Bank A/C Holder:</span> {acc_holder}</div>
-                <div class="row"><span class="k">Account No:</span> {acc_no}</div>
-                <div class="row"><span class="k">IFSC:</span> {ifsc}</div>
-                <div class="row"><span class="k">Bank Name:</span> {bank_name}</div>
+                <div class="row"><span class="k">Bank A/C Holder:</span> {esc(acc_holder)}</div>
+                <div class="row"><span class="k">Account No:</span> {esc(masked_account)}</div>
+                <div class="row"><span class="k">IFSC:</span> {esc(ifsc)}</div>
+                <div class="row"><span class="k">Bank Name:</span> {esc(bank_name)}</div>
 
                 <hr>
-                <div class="row"><span class="k">Aadhaar:</span> <a href="{aadhaar_url}" target="_blank">{aadhaar_url}</a></div>
-                <div class="row"><span class="k">PAN:</span> <a href="{pan_url}" target="_blank">{pan_url}</a></div>
-                <div class="row"><span class="k">Bank Doc:</span> <a href="{bank_url}" target="_blank">{bank_url}</a></div>
+                <div class="row"><span class="k">Aadhaar:</span> <a href="{esc(aadhaar_url or '', quote=True)}" target="_blank">Private document</a></div>
+                <div class="row"><span class="k">PAN:</span> <a href="{esc(pan_url or '', quote=True)}" target="_blank">Private document</a></div>
+                <div class="row"><span class="k">Bank Doc:</span> <a href="{esc(bank_url or '', quote=True)}" target="_blank">Private document</a></div>
 
                 <hr>
                 <div class="row">Submitted at: {datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")}</div>
@@ -1406,7 +1620,7 @@ def vendor_update_with_kyc(db: Session, vendor_update_data: VendorKycCreate):
 
         try:
             send_email(
-                message=html,
+                message=email_html,
                 subject=EMAIL_SUBJECT,
                 from_address=EMAIL_FROM,
                 from_name=EMAIL_FROM_NAME,
@@ -1414,275 +1628,248 @@ def vendor_update_with_kyc(db: Session, vendor_update_data: VendorKycCreate):
                 to_name=EMAIL_TO_NAME,
             )
         except Exception:
-            # same PHP behavior: do not fail API for email
+            # Email failure must not undo successful registration.
             pass
 
         return EmailErrorResponse(message="UPDATED")
 
-    except ValueError as e:
+    except HTTPException:
         db.rollback()
-        for url in new_blob_urls:
-            try:
-                azure_blob_delete_by_url(url)
-            except Exception:
-                pass
-        return EmailErrorResponse(message=str(e))
-
-    except SQLAlchemyError as e:
+        _cleanup_kyc_blobs(new_blob_urls)
+        raise
+    except SQLAlchemyError:
         db.rollback()
-        for url in new_blob_urls:
-            try:
-                azure_blob_delete_by_url(url)
-            except Exception:
-                pass
-        return EmailErrorResponse(message="ERROR", error=str(e))
-
-    except Exception as e:
+        _cleanup_kyc_blobs(new_blob_urls)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ERROR",
+        )
+    except Exception:
         db.rollback()
-        for url in new_blob_urls:
-            try:
-                azure_blob_delete_by_url(url)
-            except Exception:
-                pass
-        return EmailErrorResponse(message="ERROR", error=str(e))
-            
+        _cleanup_kyc_blobs(new_blob_urls)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ERROR",
+        )
 
-
-            
     
 
-def update_request_type_selections(db : Session, data : UpdateRequestTypeSelectionsRequest):
-    """
-    Update user's requestTypePreferences (CSV of RTDIDs).
-    Matches PHP updateRequestTypeSelections() 1:1.
-    """
+def update_request_type_selections(
+    db: Session,
+    data: UpdateRequestTypeSelectionsRequest,
+    user_id: str,
+):
+    """PR18 PUT /updaterequesttypeselections — JWT-owned request-type prefs."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, getattr(data, "userAppId", None))
 
     try:
-        # (1) Fetch current value
-        user = db.query(User).filter(User.userAppId== data.userAppId).first()
-        if not user:
-            return EmailErrorResponse(message="NOT_FOUND")
-        
-        curr_csv = user.requestTypePreferences or ""
-        curr_ids = _ids_to_csv(curr_csv)
+        new_ids = _parse_id_list_strict(
+            data.requestTypeIds, field_name="REQUESTTYPEIDS"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_INVALID_REQUESTTYPEIDS",
+        ) from None
 
-        # (2) If not provided → nothing to do
-        if data.requestTypeIds is None : 
-            return EmailErrorResponse(message="NOTHING_TO_UDPATE")        
-        new_ids = _to_id_array(data.requestTypeIds)
+    try:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
 
-        # (3) Optional validation
-        if data.validate and new_ids:
-            valid_ids = db.query(RequestType.RTDID).filter(
-                RequestType.RTDID.in_(new_ids)
-            ).all()
+        _enforce_approved_vendor_eligibility(user)
+
+        if new_ids:
+            valid_ids = (
+                db.query(RequestType.RTDID)
+                .filter(RequestType.RTDID.in_(new_ids))
+                .all()
+            )
             valid_set = {row[0] for row in valid_ids}
             if len(valid_set) != len(new_ids):
-                return EmailErrorResponse(message="ERROR_INVALID_REQUESTTYPE")
-        
-        # (4) Build new CSV        
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="ERROR_INVALID_REQUESTTYPEIDS",
+                )
+
+        curr_csv = user.requestTypePreferences or ""
         next_csv = _ids_to_csv(new_ids)
 
-        # (5) Short-circuit if unchanged
         if next_csv == curr_csv:
-            return EmailErrorResponse(message="NOTHING_TO_UPDATE")
-        
-        # (6) Update DB
+            db.commit()
+            return ErrorResponse(message="UPDATED")
+
         user.requestTypePreferences = next_csv
+        # tableTimestamp: preference CSVs are feed filters, not profile text.
+        # Worker/WSS propagation does not use tableTimestamp — skip churn.
         db.commit()
-
-        return EmailErrorResponse(message="UPDATED")
-
-    except SQLAlchemyError as e: 
+    except HTTPException:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_UPDATE",error=str(e))
-    except Exception as e:
+        raise
+    except SQLAlchemyError:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
-    
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to update request type preferences",
+        ) from None
 
-# def update_region_city_selections(db: Session, data : UpdateRegionCitySelectionsRequest):
-#     """
-#     Update user's regionPreferences and cityPreferences (CSV of IDs).
-#     Matches PHP updateRegionCitySelections() 1:1.
-#     """
-#     try:
-#         # (1) Fetch current values
-#         user = db.query(User).filter(User.userAppId == data.userAppId).first()
-#         if not user:
-#             return EmailErrorResponse(message="NOT_FOUND")
-        
-#         curr_region_csv = user.regionPreferences or ""
-#         curr_city_csv = user.cityPreferences or ""
-#         curr_region_ids = _to_id_array(curr_region_csv)
-#         curr_city_ids = _to_id_array(curr_city_csv)
-
-#         # (2) Determine if fields were provided
-#         regions_provided = data.regionIds is not None
-#         city_provided = data.cityIds is not None
-
-#         if not regions_provided and not city_provided:
-#             return EmailErrorResponse(message="NOTHING_TO_UPDATE")
-        
-#         #(3) Parse New Values
-#         new_region_ids = _to_id_array(data.regionIds) if regions_provided else curr_region_ids
-#         new_city_ids = _to_id_array(data.cityIds) if city_provided else curr_city_ids
-
-#         # (4) Optional validation
-#         if data.validate:
-#             if regions_provided and new_region_ids:
-#                 if not new_region_ids:
-#                     return None
-#             valid = db.query(Region.RDID).filter(Region.RDID.in_(new_region_ids)).all()
-#             valid_set = {row[0] for row in valid}
-#             if len(valid_set) != len(new_region_ids):
-#                 return EmailErrorResponse(message="ERROR_INVALID_REGIONIDS")            
-        
-#             if city_provided and new_city_ids:
-#                 if not new_city_ids:
-#                     return None
-#             valid = db.query(LocationDetail.LID).filter(LocationDetail.LID.in_(new_city_ids)).all()
-#             valid_set = {row[0] for row in valid}
-#             if len(valid_set) != len(new_city_ids):
-#                 return EmailErrorResponse(message="ERROR_INVALID_CITYIDS")
-#             return None
-        
-#         # (5) Build new CSVs
-#         next_region_csv = _ids_to_csv(new_region_ids)
-#         next_city_csv = _ids_to_csv(new_city_ids)
-
-#         # (6) Short-circuit if unchanged
-#         if next_region_csv == curr_region_csv and next_city_csv == curr_city_csv:
-#             return EmailErrorResponse(message="NOTHING_TO_UDPATE")
-        
-#         # (7) Update DB
-#         user.regionPreferences = next_region_csv
-#         user.cityPreferences = next_city_csv
-#         db.commit()
-
-#         return EmailErrorResponse(message="UPDATED")
-    
-#     except SQLAlchemyError as e:
-#         db.rollback()
-#         return EmailErrorResponse(message="ERROR_UPDATE")
-#     except Exception as e:
-#         db.rollback()
-#         return EmailErrorResponse(message="ERROR_PREPARE")
-#     finally:
-#         db.close()
+    # After commit only — failure must not roll back business mutation.
+    request_vendor_snapshot_refresh(jwt_sub)
+    return ErrorResponse(message="UPDATED")
 
 
-def update_region_city_selections(db: Session, data: UpdateRegionCitySelectionsRequest):
-    """
-    Update user's regionPreferences and cityPreferences.
-    PHP-equivalent behavior.
-    """
+def update_region_city_selections(
+    db: Session,
+    data: UpdateRegionCitySelectionsRequest,
+    user_id: str,
+):
+    """PR18 PUT /updateregioncityselections — JWT-owned atomic region/city prefs."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, getattr(data, "userAppId", None))
+
     try:
-        if not data.userAppId or str(data.userAppId).strip() == "":
-            return EmailErrorResponse(message="ERROR_MISSING_USERAPPID")
+        new_region_ids = _parse_id_list_strict(
+            data.regionIds, field_name="REGIONIDS"
+        )
+        new_city_ids = _parse_id_list_strict(
+            data.cityIds, field_name="CITYIDS"
+        )
+    except ValueError as exc:
+        detail = str(exc) if str(exc).startswith("ERROR_INVALID_") else "ERROR_INVALID_REGIONIDS"
+        if "CITYIDS" in str(exc):
+            detail = "ERROR_INVALID_CITYIDS"
+        elif "REGIONIDS" in str(exc):
+            detail = "ERROR_INVALID_REGIONIDS"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=detail,
+        ) from None
 
-        user_app_id = str(data.userAppId).strip()
+    try:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
 
-        user = db.query(User).filter(User.userAppId == user_app_id).first()
-        if not user:
-            return EmailErrorResponse(message="NOT_FOUND")
+        _enforce_approved_vendor_eligibility(user)
+
+        if new_region_ids:
+            valid_regions = (
+                db.query(Region.RDID)
+                .filter(Region.RDID.in_(new_region_ids))
+                .all()
+            )
+            found_region_ids = {row[0] for row in valid_regions}
+            if len(found_region_ids) != len(new_region_ids):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="ERROR_INVALID_REGIONIDS",
+                )
+
+        if new_city_ids:
+            valid_cities = (
+                db.query(LocationDetail.LID)
+                .filter(LocationDetail.LID.in_(new_city_ids))
+                .all()
+            )
+            found_city_ids = {row[0] for row in valid_cities}
+            if len(found_city_ids) != len(new_city_ids):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="ERROR_INVALID_CITYIDS",
+                )
 
         cur_region_csv = user.regionPreferences or ""
         cur_city_csv = user.cityPreferences or ""
-
-        region_ids_provided = data.regionIds is not None
-        city_ids_provided = data.cityIds is not None
-
-        if not region_ids_provided and not city_ids_provided:
-            return EmailErrorResponse(message="NOTHING_TO_UPDATE")
-
-        new_region_ids = _to_id_array(data.regionIds) if region_ids_provided else []
-        new_city_ids = _to_id_array(data.cityIds) if city_ids_provided else []
-
-        if data.validate:
-            if region_ids_provided and new_region_ids:
-                valid_regions = db.query(Region.RDID).filter(Region.RDID.in_(new_region_ids)).all()
-                found_region_ids = {row[0] for row in valid_regions}
-                for region_id in new_region_ids:
-                    if region_id not in found_region_ids:
-                        return EmailErrorResponse(message="ERROR_INVALID_REGIONIDS")
-
-            if city_ids_provided and new_city_ids:
-                valid_cities = db.query(LocationDetail.LID).filter(LocationDetail.LID.in_(new_city_ids)).all()
-                found_city_ids = {row[0] for row in valid_cities}
-                for city_id in new_city_ids:
-                    if city_id not in found_city_ids:
-                        return EmailErrorResponse(message="ERROR_INVALID_CITYIDS")
-
-        next_region_csv = _ids_to_csv(new_region_ids) if region_ids_provided else cur_region_csv
-        next_city_csv = _ids_to_csv(new_city_ids) if city_ids_provided else cur_city_csv
+        next_region_csv = _ids_to_csv(new_region_ids)
+        next_city_csv = _ids_to_csv(new_city_ids)
 
         if next_region_csv == cur_region_csv and next_city_csv == cur_city_csv:
-            return EmailErrorResponse(message="NOTHING_TO_UPDATE")
+            db.commit()
+            return ErrorResponse(message="UPDATED")
 
         user.regionPreferences = next_region_csv
         user.cityPreferences = next_city_csv
+        # tableTimestamp unused for WSS preference propagation — skip churn.
         db.commit()
-
-        return EmailErrorResponse(message="UPDATED")
-
+    except HTTPException:
+        db.rollback()
+        raise
     except SQLAlchemyError:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_UPDATE")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to update region/city preferences",
+        ) from None
 
-    except Exception:
-        db.rollback()
-        return EmailErrorResponse(message="ERROR_PREPARE")
-    
+    request_vendor_snapshot_refresh(jwt_sub)
+    return ErrorResponse(message="UPDATED")
 
-def get_request_type_selections(db:Session, user_app_id : str):
-    """
-    Get user's request type selections.
-    Matches PHP getRequestTypeSelections() 1:1.
-    """
+
+def get_request_type_selections(
+    db: Session,
+    user_id: str,
+    user_app_id: Optional[str] = None,
+):
+    """PR18 GET /getuserrequesttypepreferences — JWT-owned catalog + SELECTED."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, user_app_id)
 
     try:
-        # (1) Get user preferences
-        user = db.query(User).filter(User.userAppId == user_app_id).first()
-        if not user:
-            return EmailErrorResponse(message="NOT_FOUND")
+        user = db.query(User).filter(User.userAppId == jwt_sub).first()
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
+
+        _enforce_approved_vendor_eligibility(user)
+
         req_type_csv = user.requestTypePreferences or ""
         selected_ids = _csv_to_set(req_type_csv)
 
-        # (2) Load all request types
-        types_raw = db.query(
-            RequestType.RTDID,
-            RequestType.requestType
-        ).order_by(
-            RequestType.requestType.asc()
-        ).all()
+        types_raw = (
+            db.query(RequestType.RTDID, RequestType.requestType)
+            .order_by(RequestType.requestType.asc())
+            .all()
+        )
 
-        # (3) Build response
         types = []
-        for rtdid,rtype in types_raw:
-            types.append({
-                "REQUEST_TYPE_ID": rtdid,
-                "REQUEST_TYPE_NAME": rtype or "",
-                "SELECTED": rtdid in selected_ids
-            })
+        for rtdid, rtype in types_raw:
+            types.append(
+                {
+                    "REQUEST_TYPE_ID": rtdid,
+                    "REQUEST_TYPE_NAME": rtype or "",
+                    "SELECTED": rtdid in selected_ids,
+                }
+            )
 
-        # (4) Sort by name (case-insensitive) — already ordered, but ensure stable
         types.sort(key=lambda x: x["REQUEST_TYPE_NAME"].lower())
-
-        # (5) Convert to Pydantic models
-        # response_data = []
-
         return [RequestTypeResponse(**t) for t in types]
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load request type preferences",
+        ) from None
 
-    except SQLAlchemyError as e:
-        print(str(e))
-        return EmailErrorResponse(message="ERROR_PREPARE")
-    except Exception as e:
-        print(str(e))
-        return EmailErrorResponse(message="ERROR_PREPARE")
-    
 def get_all_customers(db: Session) :
     """
     Returns all users who are NOT vendors (alsoVendor = 0)

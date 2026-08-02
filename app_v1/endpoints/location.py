@@ -7,7 +7,7 @@ from ..schemas.region_details import RegionDetailBase
 from ..utils.common import ErrorResponse
 from ..auth.deps import get_current_user_id
 from ..database import get_db
-from typing import List,Union
+from typing import List, Optional, Union
 
 router = APIRouter()
 
@@ -34,8 +34,12 @@ def read_regions(db:Session = Depends(get_db)
                  ):
     return get_all_regions(db)
 
-@router.get("/getuserregionpreferences",response_model=Union[List[RegionDetail],ErrorResponse])
-def read_user_region_preferences(db:Session=Depends(get_db)
-                                 ,user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                 userAppId:str = Query(...)):
-    return get_region_city_selections(db,user_app_id=userAppId)
+@router.get("/getuserregionpreferences", response_model=List[RegionDetail])
+def read_user_region_preferences(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    userAppId: Optional[str] = Query(None),
+):
+    return get_region_city_selections(
+        db, user_id=user_id, user_app_id=userAppId
+    )

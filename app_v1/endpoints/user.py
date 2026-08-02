@@ -6,10 +6,11 @@ from ..schemas.user_table import (NoUserResponse,BidderDetail,UserBankDetailsRes
                                   RequestTypeResponse,CustomerListItem,GetAllVendorsWithUnapprovedResponse,
                                   AdminNumberResponse,UpdateVendorApprovalRequest,
                                   UpdateVendorLockAppStatusRequest,RejectUserRequest,
-                                  UploadVendorDocumentRequest,UploadVendorDocumentResponse)
+                                  UploadVendorDocumentRequest,UploadVendorDocumentResponse,
+                                  VendorBankAccountSummaryResponse)
 from ..schemas.request_table import CustomerBookingVendorDetail
 from ..utils.common import ErrorResponse,EmailErrorResponse,SMSErrorResponse,ImageResponse
-from typing import Union, List
+from typing import Union, List, Optional
 from ..database import get_db
 from sqlalchemy.orm import Session
 from ..crud.user import (get_user_details,check_user,get_all_vendors,get_vendor_by_rid,
@@ -89,11 +90,17 @@ def get_vendor_rid(
     return get_vendor_by_rid(db, rid=RID, user_id=user_id)
 
 
-@router.get("/getregisteredbankaccount", response_model=Union[UserBankDetailsResponse,ErrorResponse])
-def read_user_bank_account(db:Session = Depends(get_db), 
-                           user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                           userAppId : str = Query(...)):
-    return get_user_bank_details(db,userappid=userAppId)
+@router.get(
+    "/getregisteredbankaccount",
+    response_model=VendorBankAccountSummaryResponse,
+)
+def read_user_bank_account(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    userAppId: Optional[str] = Query(None),
+):
+    """PR17 — JWT-owned masked bank summary for active approved vendors."""
+    return get_user_bank_details(db, user_id=user_id, user_app_id=userAppId)
 
 
 @router.put("/fcmtokenupdate",response_model=ErrorResponse)
@@ -143,11 +150,14 @@ def delete_existing_user(user_delete_data : UserDelete,
                          db:Session = Depends(get_db)):
     return delete_user(db,user_delete_data)
 
-@router.put("/updatevendorbankdetails",response_model=ErrorResponse)
-def vendor_bank_details_update(user_data : UserBankDetailsUpdate, 
-                               user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                               db:Session = Depends(get_db)):
-    return update_vendor_bank_details(db,user_data)
+@router.put("/updatevendorbankdetails", response_model=ErrorResponse)
+def vendor_bank_details_update(
+    user_data: UserBankDetailsUpdate,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """PR17 — JWT-owned bank text update for active approved vendors."""
+    return update_vendor_bank_details(db, user_data, user_id=user_id)
 
 @router.post("/profilepageupload",response_model=Union[EmailErrorResponse,ImageResponse,ErrorResponse])
 def upload_profile_image(image_data : UserImageUpload, 
@@ -165,25 +175,36 @@ def also_vendor_update(vendor_data : VendorUpdate,
 def register_new_vendor(vendor_data :VendorKycCreate, 
                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
                         db:Session = Depends(get_db)):
-    return vendor_update_with_kyc(db,vendor_data)
+    return vendor_update_with_kyc(db, vendor_data, user_id)
 
-@router.put("/updaterequesttypeselections",response_model=EmailErrorResponse)
-def update_request_type_selections_endpoint(data :UpdateRequestTypeSelectionsRequest, 
-                                            user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                            db: Session = Depends(get_db) ):
-    return update_request_type_selections(db,data)
+@router.put("/updaterequesttypeselections", response_model=ErrorResponse)
+def update_request_type_selections_endpoint(
+    data: UpdateRequestTypeSelectionsRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    return update_request_type_selections(db, data, user_id)
 
-@router.put("/updateregioncityselections",response_model=EmailErrorResponse)
-def update_region_city_selections_endpoint(data :UpdateRegionCitySelectionsRequest, 
-                                           user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                           db: Session = Depends(get_db) ):
-    return update_region_city_selections(db,data)
 
-@router.get("/getuserrequesttypepreferences",response_model=Union[List[RequestTypeResponse],EmailErrorResponse])
-def get_user_request_type_preferences(db: Session = Depends(get_db),
-                                      user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                      userAppId:str=Query(...)):
-    return get_request_type_selections(db,user_app_id=userAppId)
+@router.put("/updateregioncityselections", response_model=ErrorResponse)
+def update_region_city_selections_endpoint(
+    data: UpdateRegionCitySelectionsRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    return update_region_city_selections(db, data, user_id)
+
+
+@router.get(
+    "/getuserrequesttypepreferences",
+    response_model=List[RequestTypeResponse],
+)
+def get_user_request_type_preferences(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    userAppId: Optional[str] = Query(None),
+):
+    return get_request_type_selections(db, user_id=user_id, user_app_id=userAppId)
 
 
 @router.get("/getallcustomers",response_model=Union[List[CustomerListItem],NoUserResponse])

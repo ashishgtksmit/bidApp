@@ -1,3 +1,6 @@
+from typing import Optional
+
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from ..models.location_details import LocationDetail
@@ -9,6 +12,35 @@ from ..models.region_details import Region
 from ..schemas.region_details import RegionDetailBase
 from ..utils.common import ErrorResponse
 from ..models.user_table import User
+
+
+def _reject_user_app_id_mismatch(jwt_sub: str, user_app_id: Optional[str]) -> None:
+    if user_app_id is None:
+        return
+    provided = str(user_app_id).strip()
+    if not provided:
+        return
+    if provided != str(jwt_sub).strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized",
+        )
+
+
+def _enforce_approved_vendor_eligibility(user: User) -> None:
+    if bool(getattr(user, "lockApp", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ACCOUNT_LOCKED",
+        )
+    if (
+        not bool(getattr(user, "alsoVendor", False))
+        or not bool(getattr(user, "vendorApproved", False))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="VENDOR_NOT_ELIGIBLE",
+        )
 
 
 def get_all_locations(db:Session):
@@ -64,31 +96,45 @@ def get_all_regions(db:Session):
     except SQLAlchemyError:
         return NoUserResponse(message="ERROR_UPDATE")
     
-def get_region_city_selections(db: Session, user_app_id: str):
-    if not user_app_id or user_app_id.strip() == "":
-        return ErrorResponse(message="ERROR_MISSING_USERAPPID")
+def get_region_city_selections(
+    db: Session,
+    user_id: str,
+    user_app_id: Optional[str] = None,
+):
+    """PR18 GET /getuserregionpreferences — JWT-owned catalog + SELECTED flags."""
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, user_app_id)
 
     try:
-        # Step 1: Get user preferences
-        user = db.query(User.regionPreferences, User.cityPreferences).filter(
-            User.userAppId == user_app_id
-        ).first()
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
 
-        if not user:
-            region_pref_csv, city_pref_csv = "", ""
-        else:
-            region_pref_csv, city_pref_csv = user.regionPreferences or "", user.cityPreferences or ""
+        _enforce_approved_vendor_eligibility(user)
 
-        # Convert CSV to sets
+        region_pref_csv = user.regionPreferences or ""
+        city_pref_csv = user.cityPreferences or ""
+
         def to_id_set(csv: str) -> set:
             if not csv:
                 return set()
-            return {int(tok) for tok in csv.split(",") if tok.strip().isdigit()}
+            out = set()
+            for tok in csv.split(","):
+                token = tok.strip()
+                if token.isdigit():
+                    out.add(int(token))
+            return out
 
         region_sel = to_id_set(region_pref_csv)
         city_sel = to_id_set(city_pref_csv)
 
-        # Step 2: Load all regions
         regions = {}
         region_results = db.query(Region.RDID, Region.regionName).order_by(
             Region.regionName.asc()
@@ -97,51 +143,43 @@ def get_region_city_selections(db: Session, user_app_id: str):
         for rdid, region_name in region_results:
             regions[rdid] = {
                 "REGION_ID": rdid,
-                "REGION_NAME": region_name,
+                "REGION_NAME": region_name or "",
                 "SELECTED": False,
-                "CITIES": []
+                "CITIES": [],
             }
 
-        # Step 3: Load all locations (cities)
         locations = db.query(
             LocationDetail.LID,
             LocationDetail.location,
             LocationDetail.location_shortCode,
-            LocationDetail.regionId
+            LocationDetail.regionId,
         ).order_by(
             LocationDetail.regionId.asc(),
-            LocationDetail.location.asc()
+            LocationDetail.location.asc(),
         ).all()
 
         for lid, location, short_code, region_id in locations:
             if region_id not in regions:
-                regions[region_id] = {
-                    "REGION_ID": region_id,
-                    "REGION_NAME": "",
-                    "SELECTED": False,
-                    "CITIES": []
-                }
+                # Orphan location regionId — skip inventing catalog rows.
+                continue
             regions[region_id]["CITIES"].append({
                 "LID": lid,
                 "CITY": location,
                 "SHORT": short_code,
-                "SELECTED": lid in city_sel
+                "SELECTED": lid in city_sel,
             })
 
-        # Step 4: Compute region SELECTED flags
         for region in regions.values():
             region["SELECTED"] = (
-                region["REGION_ID"] in region_sel or
-                any(city["SELECTED"] for city in region["CITIES"])
+                region["REGION_ID"] in region_sel
+                or any(city["SELECTED"] for city in region["CITIES"])
             )
 
-        # Step 5: Sort regions by name (case-insensitive)
         sorted_regions = sorted(
             regions.values(),
-            key=lambda x: x["REGION_NAME"].lower()
+            key=lambda x: x["REGION_NAME"].lower(),
         )
 
-        # Step 6: Convert to schema
         return [
             RegionDetail(
                 REGION_ID=r["REGION_ID"],
@@ -152,13 +190,17 @@ def get_region_city_selections(db: Session, user_app_id: str):
                         LID=c["LID"],
                         CITY=c["CITY"],
                         SHORT=c["SHORT"],
-                        SELECTED=c["SELECTED"]
-                    ) for c in r["CITIES"]
-                ]
-            ) for r in sorted_regions
+                        SELECTED=c["SELECTED"],
+                    )
+                    for c in r["CITIES"]
+                ],
+            )
+            for r in sorted_regions
         ]
-
+    except HTTPException:
+        raise
     except SQLAlchemyError:
-        return ErrorResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load region preferences",
+        ) from None
