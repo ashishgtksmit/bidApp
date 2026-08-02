@@ -592,6 +592,11 @@ def notify_driver_assigned_to_customer(
     """
     Reusable helper for request flow:
     notify customer that a driver has been assigned.
+
+    Canonical PR13 copy:
+    - title: 🚖 Driver Assigned (Flutter routes on DRIVER ASSIGNED)
+    - body: existing product style (name + number + request id)
+    - url: ///My Trips
     """
     user = db.query(User).filter(User.userAppId == customer_user_app_id).first()
     if not user:
@@ -609,15 +614,55 @@ def notify_driver_assigned_to_customer(
         body = f"A driver has been assigned to your request #{request_id}."
 
     result = send_notification_to_token(
-        title="Driver Assigned",
+        title="🚖 Driver Assigned",
         body=body,
         fcm_token=fcm_token,
-        url="/mytrips",
+        url="///My Trips",
         notification_type="passengernotification",
         sound_file="alarm_notification",
     )
 
     return result
+
+
+def notify_driver_assigned_to_customer_background(
+    customer_user_app_id: str,
+    request_id: int,
+    driver_id: int,
+) -> None:
+    """
+    Background task after driver assignment commit (PR13).
+
+    Owns SessionLocal(); loads customer + driver details independently.
+    Failures are logged and must not undo the committed assignment.
+    """
+    from ..database import SessionLocal
+    from ..models.driver_details import DriverDetail
+
+    db = SessionLocal()
+    try:
+        if not customer_user_app_id or not str(customer_user_app_id).strip():
+            return
+
+        driver = (
+            db.query(DriverDetail)
+            .filter(DriverDetail.DDID == driver_id)
+            .first()
+        )
+        driver_name = driver.driverName if driver else None
+        driver_number = driver.driverNumber if driver else None
+
+        notify_driver_assigned_to_customer(
+            db,
+            customer_user_app_id=str(customer_user_app_id).strip(),
+            request_id=request_id,
+            driver_name=driver_name,
+            driver_number=driver_number,
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_driver_assigned_to_customer_background err={e}")
+    finally:
+        db.close()
 
 
 def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
@@ -880,6 +925,44 @@ def notify_vendors_bidding_reopened(
         )
     except Exception as e:
         print(f"[FCM ERROR] notify_vendors_bidding_reopened err={e}")
+    finally:
+        db.close()
+
+
+def notify_vendor_booking_cancelled_by_customer(
+    vendor_user_app_id: str,
+    notification_type: str = "default",
+) -> None:
+    """
+    Notify the selected vendor after customer confirmed-booking cancellation (PR12).
+
+    Intended for background task use. Creates and closes its own DB session.
+    Notification failures are logged and must not undo the committed cancellation.
+    """
+    from ..database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if not vendor_user_app_id or not str(vendor_user_app_id).strip():
+            return
+
+        send_notification_to_user(
+            db,
+            FCMSend(
+                userAppId=str(vendor_user_app_id).strip(),
+                title="Booking Cancelled",
+                body="The customer has cancelled the confirmed booking.",
+                url="///Cancelled Trips",
+                type=notification_type,
+                soundFile="alarm_notification",
+                source=None,
+                destination=None,
+                travelDate=None,
+                pickupTime=None,
+            ),
+        )
+    except Exception as e:
+        print(f"[FCM ERROR] notify_vendor_booking_cancelled_by_customer err={e}")
     finally:
         db.close()
 

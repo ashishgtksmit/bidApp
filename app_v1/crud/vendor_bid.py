@@ -305,6 +305,7 @@ def get_vendor_cars_for_bidding(
             .filter(
                 CarDetail.userAppId == vendor.userAppId,
                 CarDetail.adminApproved == True,  # noqa: E712
+                CarDetail.isDeleted == False,  # noqa: E712
             )
             .order_by(CarDetail.registeredOn)
             .all()
@@ -373,11 +374,22 @@ def insert_vendor_bid(
                 detail="INVALID_REQUEST_STATUS",
             )
 
-        car = db.query(CarDetail).filter(CarDetail.CARID == bid_data.CARID).first()
+        car = (
+            db.query(CarDetail)
+            .filter(CarDetail.CARID == bid_data.CARID)
+            .with_for_update()
+            .first()
+        )
         if not car:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Car not found",
+            )
+
+        if bool(getattr(car, "isDeleted", False)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Car is not eligible",
             )
 
         if str(car.userAppId).strip() != vendor_id:

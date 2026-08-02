@@ -7,6 +7,7 @@ from ..schemas.user_table import (NoUserResponse,BidderDetail,UserBankDetailsRes
                                   AdminNumberResponse,UpdateVendorApprovalRequest,
                                   UpdateVendorLockAppStatusRequest,RejectUserRequest,
                                   UploadVendorDocumentRequest,UploadVendorDocumentResponse)
+from ..schemas.request_table import CustomerBookingVendorDetail
 from ..utils.common import ErrorResponse,EmailErrorResponse,SMSErrorResponse,ImageResponse
 from typing import Union, List
 from ..database import get_db
@@ -72,11 +73,20 @@ def get_vendors(db:Session = Depends(get_db),
                 ):
     return get_all_vendors(db)
 
-@router.get("/getvendordetailsbyrid",response_model=Union[List[BidderDetail],NoUserResponse])
-def get_vendor_rid(db:Session = Depends(get_db), 
-                   user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                   RID : str = Query(...)):
-    return get_vendor_by_rid(db,rid=RID)
+@router.get(
+    "/getvendordetailsbyrid",
+    response_model=List[CustomerBookingVendorDetail],
+)
+def get_vendor_rid(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+):
+    """
+    Customer-owned confirmed booking vendor details (PR12).
+    JWT ownership enforced; returns [] when no selected vendor relation.
+    """
+    return get_vendor_by_rid(db, rid=RID, user_id=user_id)
 
 
 @router.get("/getregisteredbankaccount", response_model=Union[UserBankDetailsResponse,ErrorResponse])

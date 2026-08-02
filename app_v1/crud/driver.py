@@ -1,5 +1,6 @@
 from zoneinfo import ZoneInfo
 
+from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import func
@@ -7,8 +8,11 @@ import urllib
 from ..utils.common import EmailErrorResponse,ErrorResponse
 from ..models.driver_details import DriverDetail
 from ..models.user_table import User
+from fastapi import HTTPException, status
 from ..schemas.driver_details import (UpdateDriverDetail,DeleteDriverDetail,CreateDriverDetail,DriverDetailResponse,
-                                      UploadDriverDocumentRequest,UploadDriverDocumentResponse)
+                                      UploadDriverDocumentRequest,UploadDriverDocumentResponse,
+                                      VendorDriverAssignmentSummary)
+from ..crud.vendor_bid import require_active_vendor
 from ..utils.image import upload_image,azure_blob_upload,azure_blob_delete_by_url
 from ..utils.email import send_email
 import os
@@ -981,15 +985,34 @@ def insert_driver(db: Session, driver_data: CreateDriverDetail):
 
 def get_all_driver_for_vendor(
     db: Session,
-    userappid: str,
+    user_id: str,
+    userappid: Optional[str] = None,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
 ):
-    try:
-        if not userappid or str(userappid).strip() == "":
-            return ErrorResponse(message="ERROR_MISSING_USERAPPID")
+    """
+    Lean drivers owned by JWT vendor (PR13 assignment list).
 
-        userappid = str(userappid).strip()
+    Authorization:
+    1. Resolve JWT sub (caller).
+    2. Require active approved vendor.
+    3. Optional userAppId must equal JWT sub (compat); mismatch → 403.
+    4. Query drivers by JWT vendor only (never by client-supplied id).
+
+    Filtering is ownership-only — no adminApproved / availability / KYC gates.
+    Empty → []. Safe generic error on DB failure (no SQL leak).
+    """
+    try:
+        require_active_vendor(db, user_id)
+
+        if userappid is not None and str(userappid).strip() != "":
+            if str(userappid).strip() != str(user_id).strip():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized to view these drivers",
+                )
+
+        vendor_id = str(user_id).strip()
 
         try:
             limit = int(limit)
@@ -1009,18 +1032,11 @@ def get_all_driver_for_vendor(
         drivers = (
             db.query(
                 DriverDetail.DDID,
-                DriverDetail.userAppId,
                 DriverDetail.driverName,
-                DriverDetail.driverNumber,
-                DriverDetail.driverDOB,
-                DriverDetail.driverGender,
-                DriverDetail.driverCity,
-                DriverDetail.driverLicense,
-                DriverDetail.driverDocument,
                 DriverDetail.driverPhoto,
-                DriverDetail.tableTimestamp
+                DriverDetail.driverNumber,
             )
-            .filter(DriverDetail.userAppId == userappid)
+            .filter(DriverDetail.userAppId == vendor_id)
             .order_by(DriverDetail.tableTimestamp.desc())
             .limit(limit)
             .offset(offset)
@@ -1028,39 +1044,26 @@ def get_all_driver_for_vendor(
         )
 
         if not drivers:
-            return ErrorResponse(message="NO_DRIVERS_FOUND")
+            return []
 
         return [
-            DriverDetailResponse(
-                DRIVERID=ddid,
-                USERAPPID=user_app_id,
-                DRIVERNAME=driver_name,
-                DRIVERNUMBER=driver_number,
-                DRIVERDOB=driver_dob.strftime("%Y-%m-%d") if driver_dob else None,
-                GENDER=driver_gender,
-                DRIVERCITY=driver_city,
-                LICENSE_URL=driver_license,
-                DOCUMENT_URL=driver_document,
+            VendorDriverAssignmentSummary(
+                DRIVERID=int(ddid),
+                DRIVERNAME=driver_name or "",
                 PHOTO_URL=driver_photo,
-                ADDEDON=table_timestamp.strftime("%Y-%m-%d %H:%M:%S") if table_timestamp else None,
+                DRIVERNUMBER=driver_number,
             )
-            for (
-                ddid,
-                user_app_id,
-                driver_name,
-                driver_number,
-                driver_dob,
-                driver_gender,
-                driver_city,
-                driver_license,
-                driver_document,
-                driver_photo,
-                table_timestamp,
-            ) in drivers
+            for (ddid, driver_name, driver_photo, driver_number) in drivers
         ]
 
-    except SQLAlchemyError:
-        return ErrorResponse(message="ERROR_PREPARE")
+    except HTTPException:
+        raise
+    except SQLAlchemyError as e:
+        print(f"[get_all_driver_for_vendor] ERROR: {e}")
+        return ErrorResponse(message="ERROR")
+    except Exception as e:
+        print(f"[get_all_driver_for_vendor] ERROR_EXCEPTION: {e}")
+        return ErrorResponse(message="ERROR")
 
 
 def get_all_drivers(db: Session, limit: int = 50, offset: int = 0):

@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List
 from datetime import date,time,datetime
 
 
@@ -34,6 +34,50 @@ class RequestCreate(RequestBase):
     wizzpnr : Optional[str] = None
     customerAppId : str
     requestStatus : Optional[str] = None
+
+
+# ---------------------------------- #
+# 🔹 PR12 Cancel / Reopen Schemas     #
+# --------------------------------- #
+
+class CancelBookingBody(BaseModel):
+    """Body for PUT /bookingcancelledbyuser. RID is query-only."""
+    rejectionReason: str = Field(..., min_length=1)
+
+
+class ReopenBookingResponse(BaseModel):
+    """Success/error wrapper for PUT /reopenbooking."""
+    message: str
+    newRequestId: Optional[int] = None
+    error: Optional[str] = None
+
+
+class CustomerBookingVendorDetail(BaseModel):
+    """
+    Customer-safe vendor + selected-car summary for GET /getvendordetailsbyrid.
+
+    Excludes FCM tokens, KYC/registration/POA docs, bank data, and approval internals.
+    """
+    FULLNAME: Optional[str] = None
+    PRIMARYNUMBER: Optional[str] = None
+    DOB: Optional[date] = None
+    CITY: Optional[str] = None
+    GENDER: Optional[str] = None
+    RATING: Optional[float] = None
+    TOTALNOOFREVIEWS: Optional[int] = None
+    JOININGDATE: Optional[date] = None
+    PROFILEPIC: Optional[str] = None
+    TAGS: List[str] = []
+    NOOFTRIPSCOMPLETED: Optional[int] = None
+    CARID: Optional[int] = None
+    CARREGNO: Optional[str] = None
+    CARMODEL: Optional[str] = None
+    MODELYEAR: Optional[str] = None
+    IMAGEVEHICLEFRONT: Optional[str] = None
+    IMAGEVEHICLESIDE: Optional[str] = None
+    CAR_TYPE: Optional[str] = None
+
+    model_config = {"from_attributes": True}
 
 
 # ---------------------------------- #
@@ -173,9 +217,25 @@ class RequestConfirmedForVendorResponse(RequestConfirmedCommonResponse):
 
 
 class AssignDriverRequest(BaseModel):
-    RID : str
-    DRIVERID : str
-    
+    """Body for PUT /updatedrivertorequest (PR13). RID + DRIVERID only."""
+
+    RID: int
+    DRIVERID: int
+
+    @field_validator("RID", "DRIVERID", mode="before")
+    @classmethod
+    def coerce_positive_int(cls, v):
+        if v is None:
+            raise ValueError("Required")
+        if isinstance(v, bool):
+            raise ValueError("Invalid")
+        if isinstance(v, int):
+            return v
+        text = str(v).strip()
+        if not text or not text.lstrip("-").isdigit():
+            raise ValueError("Invalid")
+        return int(text)
+
 
 
 class RequestForUserResponse(RequestConfirmedCommonResponse):

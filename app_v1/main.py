@@ -17,6 +17,8 @@ from .database import Base, engine
 from .auth.deps import get_current_user_id
 # Ensure PR5 OTP / reset-token / rate-limit tables are registered before create_all.
 from .models import otp_challenge as _otp_challenge_models  # noqa: F401
+# Ensure PR14 driver OTP challenge / token tables are registered before create_all.
+from .models import driver_otp as _driver_otp_models  # noqa: F401
 import traceback
 
 

@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRidResponse,UpdateResponse,RequestUpdate,
                                      RequestConfirmedForUserResponse,RequestConfirmedForVendorResponse,
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
-                                     RequestConfirmedCommonResponse,GetBookingReportResponse)
+                                     RequestConfirmedCommonResponse,GetBookingReportResponse,
+                                     CancelBookingBody, ReopenBookingResponse)
 from ..schemas.request_type_details import RequestTypeBase
 from ..schemas.bid_details import VendorRejectBody
 from ..utils.common import ErrorResponse,EmailErrorResponse
@@ -151,14 +152,27 @@ def cancel_handshake_of_request(
     """Customer cancel handshake. Ownership + status gate. No FCM in PR10."""
     return cancel_handshake(db, rid=RID, user_id=user_id)
 
-@router.put("/bookingcancelledbyuser",response_model=ErrorResponse)
+@router.put("/bookingcancelledbyuser", response_model=ErrorResponse)
+def cancel_by_user(
+    body: CancelBookingBody,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    RID: int = Query(...),
+):
+    """
+    Customer confirmed-booking cancellation (PR12).
 
-def cancel_by_user(db:Session=Depends(get_db),
-                   user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                   RID : int = Query(...), 
-                   bidder_id : int = Query(...),
-                   rejectionReason : str = Query(...)):
-    return booking_cancelled_by_user(db,rid=RID,rejection_reason=rejectionReason)
+    Query: RID. Body: rejectionReason only.
+    JWT sub is authoritative; vendor notify from request.requestWonBy.
+    """
+    return booking_cancelled_by_user(
+        db,
+        rid=RID,
+        rejection_reason=body.rejectionReason,
+        user_id=user_id,
+        background_tasks=background_tasks,
+    )
 
 @router.get("/getallconfirmedrequestsforuser",response_model=Union[List[RequestConfirmedForUserResponse],EmailErrorResponse])
 def get_all_confirmed_customer_requests(db: Session = Depends(get_db),
@@ -172,12 +186,22 @@ def get_all_confirmed_vendor_requests(db: Session = Depends(get_db),
                                       vendorId:str = Query(...)):
     return get_all_confirmed_requests_for_vendor(db,vendor_id=vendorId)
 
-@router.put("/reopenbooking",response_model=EmailErrorResponse)
-def reopen_booking(backgroundTasks : BackgroundTasks, RID : str = Query(...), 
-                   db:Session=Depends(get_db),
-                   user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                   ):
-    return reopen_request(db,r_id=RID, background_tasks=backgroundTasks)
+@router.put("/reopenbooking", response_model=ReopenBookingResponse)
+def reopen_booking(
+    backgroundTasks: BackgroundTasks,
+    RID: int = Query(...),
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Reopen cancelled booking (PR12): clone new BID - OPEN request; mark original reopened.
+    """
+    return reopen_request(
+        db,
+        r_id=RID,
+        background_tasks=backgroundTasks,
+        user_id=user_id,
+    )
 
 @router.post("/insertrequest",response_model=EmailErrorResponse)
 def create_new_request(create_data : RequestCreate, background_taks : BackgroundTasks, 
@@ -187,11 +211,25 @@ def create_new_request(create_data : RequestCreate, background_taks : Background
     # JWT sub is authoritative customerAppId — ownership enforced inside create_request
     return create_request(db, create_data, background_taks, user_id=user_id)
 
-@router.put("/updatedrivertorequest",response_model=EmailErrorResponse)
-def driver_assign_to_request(request_data : AssignDriverRequest, db:Session=Depends(get_db),
-                             user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                             ):
-    return assign_driver_to_request(db,request_data)
+@router.put("/updatedrivertorequest", response_model=EmailErrorResponse)
+def driver_assign_to_request(
+    request_data: AssignDriverRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Vendor driver assignment (PR13).
+
+    Body: RID + DRIVERID only. JWT sub must own the request (requestWonBy)
+    and the driver. Status gate: REQUEST - CONFIRMED.
+    """
+    return assign_driver_to_request(
+        db,
+        request_data,
+        user_id=user_id,
+        background_tasks=background_tasks,
+    )
 
 @router.get("/getallcancelledrequestsforvendor",response_model=Union[List[RequestConfirmedForVendorResponse],EmailErrorResponse])
 def get_all_vendor_cancelled_requests(db: Session = Depends(get_db),

@@ -21,12 +21,27 @@ from ..models.bid_details import BidDetail
 from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRidResponse,RequestUpdate,
                                      RequestConfirmedForUserResponse,RequestConfirmedForVendorResponse,
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
-                                     RequestConfirmedCommonResponse,GetBookingReportResponse)
+                                     RequestConfirmedCommonResponse,GetBookingReportResponse,
+                                     ReopenBookingResponse)
 from ..schemas.request_type_details import RequestTypeBase
 from ..utils.common import ErrorResponse,EmailErrorResponse, FCMSend
-from ..services.notifications import (FCMSendDrivers, notify_driver_assigned_to_customer,
-                                      notify_vendors_for_request,notify_vendors_request_cancelled, send_notification_to_selected_users, send_notification_to_user)
+from ..services.notifications import (
+    FCMSendDrivers,
+    notify_driver_assigned_to_customer_background,
+    notify_vendors_for_request,
+    notify_vendors_request_cancelled,
+    notify_vendor_booking_cancelled_by_customer,
+    send_notification_to_selected_users,
+    send_notification_to_user,
+)
 from ..services.vendor_filtering import get_other_vendors_who_bid_on_request, get_vendors_for_request,get_vendors_who_bid_on_request
+
+# MySQL TEXT max for rejectionReason — do not expose column name in errors.
+_REJECTION_REASON_MAX_LEN = 65535
+
+STATUS_REQUEST_CONFIRMED = "REQUEST - CONFIRMED"
+STATUS_BOOKING_CANCELLED_BY_USER = "BOOKING - CANCELLED BY USER"
+STATUS_BID_OPEN = "BID - OPEN"
 
 def get_all_open_requests(db : Session):
     try:
@@ -1021,71 +1036,139 @@ def cancel_handshake(
 #         db.close()
 
 
+def _now_ist_naive() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+
+def _request_pickup_datetime(request_row: Request) -> datetime:
+    return datetime.combine(request_row.pickUpDate, request_row.pickUpTime)
+
+
+def _validate_cancellation_reason(rejection_reason: Optional[str]) -> str:
+    """Trim and validate cancellation reason. Raises HTTP 422 on invalid input."""
+    if rejection_reason is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid cancellation reason",
+        )
+    trimmed = rejection_reason.strip()
+    if not trimmed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid cancellation reason",
+        )
+    if len(trimmed) > _REJECTION_REASON_MAX_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid cancellation reason",
+        )
+    return trimmed
+
+
 def booking_cancelled_by_user(
     db: Session,
     rid: int,
-    bidder_id: str,
     rejection_reason: str,
-    notification_type: str = "default",
+    user_id: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
 ):
     """
-    PHP-equivalent behavior of bookingCancelledByUser():
-    - update request status to BOOKING - CANCELLED BY USER
-    - set rejectionReason
-    - notify the winning vendor (BIDDERID)
-    - do not delete bid history
-    """
+    Customer confirmed-booking cancellation (PR12).
 
+    REQUEST - CONFIRMED → BOOKING - CANCELLED BY USER.
+    JWT sub is authoritative owner. Vendor notify recipient = request.requestWonBy.
+    Preserves requestWonBy, finalAmount, bids, driver, and payment fields.
+    """
     try:
-        # 1) Update request
+        request_row = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .with_for_update()
+            .first()
+        )
+
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and request_row.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to cancel this booking",
+            )
+
+        # Idempotent replay: already cancelled by user → 200 UPDATED, no re-notify.
+        if request_row.requestStatus == STATUS_BOOKING_CANCELLED_BY_USER:
+            db.commit()
+            return ErrorResponse(message="UPDATED")
+
+        if request_row.requestStatus != STATUS_REQUEST_CONFIRMED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        now = _now_ist_naive()
+        pickup_dt = _request_pickup_datetime(request_row)
+        if pickup_dt <= now:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="CANCELLATION_NOT_ALLOWED",
+            )
+
+        trimmed_reason = _validate_cancellation_reason(rejection_reason)
+
+        vendor_to_notify = (
+            str(request_row.requestWonBy).strip()
+            if request_row.requestWonBy
+            else None
+        )
+
         updated = (
             db.query(Request)
             .filter(Request.RID == rid)
             .update(
                 {
-                    Request.requestStatus: "BOOKING - CANCELLED BY USER",
-                    Request.rejectionReason: rejection_reason,
+                    Request.requestStatus: STATUS_BOOKING_CANCELLED_BY_USER,
+                    Request.rejectionReason: trimmed_reason,
+                    Request.tableTimestamp: now,
                 },
                 synchronize_session=False,
             )
         )
-
         if updated == 0:
-            db.rollback()
-            return ErrorResponse(message="REQUEST TABLE UPDATE FAILED")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
 
         db.commit()
 
-        # 2) Notify winning vendor (best effort, same spirit as PHP)
-        try:
-            if bidder_id and str(bidder_id).strip() != "":
-                send_notification_to_user(
-                    db,
-                    FCMSend(
-                        userAppId=str(bidder_id).strip(),
-                        title="Trip Cancelled!",
-                        body="Your trip has been cancelled by the passenger. 🚀",
-                        url="Trip Cancelled!",
-                        type=notification_type,
-                        soundFile="alarm_notification",
-                        source=None,
-                        destination=None,
-                        travelDate=None,
-                        pickupTime=None,
-                    ),
-                )
-        except Exception:
-            pass
+        if background_tasks is not None and vendor_to_notify:
+            background_tasks.add_task(
+                notify_vendor_booking_cancelled_by_customer,
+                vendor_to_notify,
+            )
 
         return ErrorResponse(message="UPDATED")
 
-    except SQLAlchemyError:
+    except HTTPException:
         db.rollback()
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        print(f"[booking_cancelled_by_user] ERROR: {e}")
         return ErrorResponse(message="ERROR")
-
-    except Exception:
+    except Exception as e:
         db.rollback()
-        return ErrorResponse(message="INSER ERROR IN FUNCTION")
+        print(f"[booking_cancelled_by_user] ERROR_EXCEPTION: {e}")
+        return ErrorResponse(message="ERROR")
+    finally:
+        db.close()
+
+
 def get_all_confirmed_requests_for_customer(db: Session, user_app_id : str):
     try:
         with db.begin():
@@ -1212,110 +1295,162 @@ def get_all_confirmed_requests_for_vendor(db: Session, vendor_id: str):
         return EmailErrorResponse(message="ERROR", error=str(e))
     
 
-def reopen_request(db : Session, r_id : int, background_tasks : BackgroundTasks):
-    """
-    Reopen a booking by setting requestReopened=1 and creating a new request.
-    """
-    try:
-        with db.begin():
-            update = db.query(Request).filter(Request.RID == r_id).update({
-                Request.requestReopened : True,
-                Request.tableTimestamp : datetime.now()
-            })
-            db.flush()
-            if update ==0 : 
-                return EmailErrorResponse(message="REQUEST_NOT_FOUND")
-            
-            request = db.query(Request.fromLocation,
-                               Request.fromLandmark,
-                               Request.toLocation,
-                               Request.toLandmark,
-                               Request.pickUpDate,
-                               Request.pickUpTime,
-                               Request.noOfAdults,
-                               Request.noOfKids,
-                               Request.carType,
-                               Request.acRequest,
-                               Request.carrierRequest,
-                               Request.bidEndTime,
-                               Request.customerAppId).filter(Request.RID == r_id).first()
-            if not request:
-                db.rollback()
-                return EmailErrorResponse(message="REQUEST_NOT_FOUND")
-
-            (
-                from_location,
-                from_landmark,
-                to_location,
-                to_landmark,
-                pick_up_date,
-                pick_up_time,
-                no_of_adults,
-                no_of_kids,
-                car_type,
-                ac_request,
-                carrier_request,
-                bid_end_time,
-                customer_app_id
-            ) = request
-
-            #Modify request 
-
-            pickup_datetime = datetime.combine(pick_up_date,pick_up_time)
-            modified_pick_up_time = (pickup_datetime + timedelta(minutes=5)).time()
-            print(modified_pick_up_time)
-
-            create_data = RequestCreate(
-                fromLocation=from_location,
-                fromLandmark=from_landmark,
-                toLocation=to_location,
-                toLandmark=to_landmark,
-                pickUpDate=pick_up_date,
-                pickUpTime=modified_pick_up_time,
-                noOfAdults=no_of_adults,
-                noOfKids=no_of_kids,
-                carType=car_type,
-                acRequest=ac_request,
-                carrierRequest=carrier_request,
-                bidEndTime=bid_end_time,
-                customerAppId=customer_app_id
-            )
-
-            create_result = create_request(db,create_data,background_tasks=background_tasks,
-                                           emit=True,notify=True)
-            if create_result.message != "INSERTED":
-                db.rollback()
-                return EmailErrorResponse(message=create_result.message, error=create_result.error)
-            db.commit()
-            return EmailErrorResponse(message="UPDATED")                        
-    except SQLAlchemyError as e :
-        db.rollback()
-        return EmailErrorResponse(message="ERROR",error=str(e))
-    
-    except ValueError as e : 
-        db.rollback()
-        return EmailErrorResponse(message="ERROR_INVALID_FORMAT",error=str(e))
-    finally:
-        db.close()
-    
-
-
-def create_request(
+def reopen_request(
     db: Session,
-    create_data: RequestCreate,
+    r_id: int,
     background_tasks: BackgroundTasks,
     user_id: Optional[str] = None,
+):
+    """
+    Reopen a cancelled booking (PR12).
+
+    Marks original requestReopened=1 and clones a new BID - OPEN request
+    with the same pickup datetime and bidEndTime (must both still be future).
+    Does not mutate the original status away from BOOKING - CANCELLED BY USER.
+    """
+    try:
+        original = (
+            db.query(Request)
+            .filter(Request.RID == r_id)
+            .with_for_update()
+            .first()
+        )
+
+        if not original:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and original.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to reopen this booking",
+            )
+
+        if bool(original.requestReopened):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="REQUEST_ALREADY_REOPENED",
+            )
+
+        if original.requestStatus != STATUS_BOOKING_CANCELLED_BY_USER:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        now = _now_ist_naive()
+        pickup_dt = _request_pickup_datetime(original)
+        if pickup_dt <= now:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="REOPEN_NOT_ALLOWED",
+            )
+
+        if original.bidEndTime is None or original.bidEndTime <= now:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="REOPEN_NOT_ALLOWED",
+            )
+
+        create_data = RequestCreate(
+            fromLocation=original.fromLocation,
+            fromLandmark=original.fromLandmark,
+            toLocation=original.toLocation,
+            toLandmark=original.toLandmark,
+            pickUpDate=original.pickUpDate,
+            pickUpTime=original.pickUpTime,
+            noOfAdults=original.noOfAdults,
+            noOfKids=original.noOfKids,
+            carType=original.carType,
+            acRequest=bool(original.acRequest),
+            carrierRequest=bool(original.carrierRequest),
+            specialRequest=original.specialRequest,
+            bidEndTime=original.bidEndTime,
+            customerAppId=original.customerAppId,
+            requestType=original.requestType,
+            wizzpnr=original.WIZZPNR,
+        )
+
+        insert_result = insert_request_row(
+            db,
+            create_data,
+            user_id=user_id if user_id is not None else original.customerAppId,
+            commit=False,
+            close_session=False,
+            notify=False,
+        )
+
+        if isinstance(insert_result, EmailErrorResponse):
+            db.rollback()
+            return ReopenBookingResponse(
+                message=insert_result.message,
+                error=getattr(insert_result, "error", None),
+            )
+
+        new_request = insert_result
+
+        original.requestReopened = True
+        original.tableTimestamp = now
+
+        db.commit()
+
+        # Notify eligible vendors after commit (same as normal create).
+        try:
+            vendor_ids = get_vendors_for_request(
+                db,
+                create_data.fromLocation,
+                create_data.toLocation,
+            )
+            if vendor_ids:
+                background_tasks.add_task(
+                    notify_vendors_for_request,
+                    vendor_ids,
+                    create_data,
+                )
+        except Exception as e:
+            print(f"[reopen_request] notify schedule error: {e}")
+
+        return ReopenBookingResponse(
+            message="UPDATED",
+            newRequestId=int(new_request.RID),
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as e:
+        db.rollback()
+        print(f"[reopen_request] ERROR: {e}")
+        return ReopenBookingResponse(message="ERROR")
+    except Exception as e:
+        db.rollback()
+        print(f"[reopen_request] ERROR_EXCEPTION: {e}")
+        return ReopenBookingResponse(message="ERROR")
+    finally:
+        db.close()
+
+
+def insert_request_row(
+    db: Session,
+    create_data: RequestCreate,
+    *,
+    user_id: Optional[str] = None,
+    commit: bool = True,
+    close_session: bool = True,
     notify: bool = True,
+    background_tasks: Optional[BackgroundTasks] = None,
     emit: bool = True,
 ):
     """
-    Create a new request in requestTable.
+    Validate and insert a new request row.
 
-    When ``user_id`` is provided (JWT ``sub`` from POST /insertrequest),
-    body ``customerAppId`` must match; persisted identity is always the JWT sub.
+    When ``commit=False``, the row is flushed onto the shared session without
+    committing or closing — safe for reopen's outer transaction.
+    When ``commit=True`` (default), behaves like the public create_request path.
     """
     try:
-        # 0) Ownership: JWT sub is authoritative when provided by the endpoint
         if user_id is not None:
             body_customer = (create_data.customerAppId or "").strip()
             if not body_customer or body_customer != user_id:
@@ -1327,20 +1462,18 @@ def create_request(
         else:
             persisted_customer_id = create_data.customerAppId
 
-        request_status = "BID - OPEN"
+        request_status = STATUS_BID_OPEN
         ac_request = bool(create_data.acRequest)
         carrier_request = bool(create_data.carrierRequest)
         request_type = create_data.requestType if create_data.requestType else 1
         wizzpnr = create_data.wizzpnr if create_data.wizzpnr else None
 
-        # 1) Validate customer exists
         existing_customer = db.query(User).filter(
             User.userAppId == persisted_customer_id
         ).first()
         if not existing_customer:
             return EmailErrorResponse(message="CUSTOMER_NOT_FOUND")
 
-        # 2) Check duplicate (open requests only — do not block reopen flows)
         existing_request = db.query(Request).filter(
             Request.fromLocation == create_data.fromLocation.strip(),
             Request.toLocation == create_data.toLocation.strip(),
@@ -1349,13 +1482,12 @@ def create_request(
             Request.noOfAdults == create_data.noOfAdults,
             Request.noOfKids == create_data.noOfKids,
             Request.carType == (create_data.carType.strip() if create_data.carType else None),
-            Request.requestStatus == "BID - OPEN",
+            Request.requestStatus == STATUS_BID_OPEN,
         ).first()
 
         if existing_request:
             return EmailErrorResponse(message="REQUEST_ALREADY_PRESENT")
 
-        # 3) Build new request row
         new_request = Request(
             WIZZPNR=wizzpnr,
             fromLocation=create_data.fromLocation.strip(),
@@ -1374,21 +1506,24 @@ def create_request(
             requestStatus=request_status,
             customerAppId=persisted_customer_id,
             requestType=request_type,
-            tableTimestamp=datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None),
+            tableTimestamp=_now_ist_naive(),
         )
 
         db.add(new_request)
+        db.flush()
+
+        if not commit:
+            return new_request
+
         db.commit()
         db.refresh(new_request)
 
-        # 4) Background notification (optional). Task opens its own DB session.
-        if notify:
+        if notify and background_tasks is not None:
             vendor_ids = get_vendors_for_request(
                 db,
                 create_data.fromLocation,
                 create_data.toLocation,
             )
-
             if vendor_ids:
                 background_tasks.add_task(
                     notify_vendors_for_request,
@@ -1396,17 +1531,46 @@ def create_request(
                     create_data,
                 )
 
-        # RID is not part of EmailErrorResponse schema — message only for clients
         return EmailErrorResponse(message="INSERTED")
 
     except HTTPException:
+        if commit:
+            raise
         raise
     except SQLAlchemyError as e:
-        db.rollback()
-        print(f"[create_request] ERROR_INSERT: {e}")
+        if commit:
+            db.rollback()
+        print(f"[insert_request_row] ERROR_INSERT: {e}")
         return EmailErrorResponse(message="ERROR_INSERT")
     finally:
-        db.close()
+        if close_session:
+            db.close()
+
+
+def create_request(
+    db: Session,
+    create_data: RequestCreate,
+    background_tasks: BackgroundTasks,
+    user_id: Optional[str] = None,
+    notify: bool = True,
+    emit: bool = True,
+):
+    """
+    Create a new request in requestTable.
+
+    When ``user_id`` is provided (JWT ``sub`` from POST /insertrequest),
+    body ``customerAppId`` must match; persisted identity is always the JWT sub.
+    """
+    return insert_request_row(
+        db,
+        create_data,
+        user_id=user_id,
+        commit=True,
+        close_session=True,
+        notify=notify,
+        background_tasks=background_tasks,
+        emit=emit,
+    )
 
 # def assign_driver_to_request(db:Session, request_data : AssignDriverRequest):
 #     try : 
@@ -1464,43 +1628,123 @@ def create_request(
 #     finally:
 #         db.close()
 
-def assign_driver_to_request(db: Session, request_data: AssignDriverRequest):
+def assign_driver_to_request(
+    db: Session,
+    request_data: AssignDriverRequest,
+    user_id: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
+):
+    """
+    Vendor assigns (or replaces) a driver on a confirmed request (PR13).
+
+    Body: RID + DRIVERID only. JWT sub must equal requestWonBy and own the driver.
+    Status gate: REQUEST - CONFIRMED only. No pickup-time gate.
+    Same-driver replay → UPDATED without timestamp/notify churn.
+    Different-driver replacement updates assignment + notifies customer once.
+    Notification after commit via BackgroundTasks (own SessionLocal).
+    """
     try:
-        with db.begin():
-            request = db.query(Request).filter(Request.RID == request_data.RID).first()
-            if not request:
-                return EmailErrorResponse(message="NOT FOUND")
-
-            driver_details = db.query(DriverDetail).filter(
-                DriverDetail.DDID == request_data.DRIVERID
-            ).first()
-
-            driver_name = driver_details.driverName if driver_details else None
-            driver_number = driver_details.driverNumber if driver_details else None
-
-            request.driverAssignedID = request_data.DRIVERID
-            request.tableTimestamp = datetime.now()
-
-        # send after DB transaction succeeds
-        try:
-            notify_driver_assigned_to_customer(
-                db,
-                customer_user_app_id=request.customerAppId,
-                request_id=request_data.RID,
-                driver_name=driver_name,
-                driver_number=driver_number,
+        if user_id is None or not str(user_id).strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to assign a driver",
             )
-        except Exception:
-            pass
+
+        vendor_id = str(user_id).strip()
+        rid = int(request_data.RID)
+        driver_id = int(request_data.DRIVERID)
+
+        if rid <= 0 or driver_id <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid assignment payload",
+            )
+
+        request_row = (
+            db.query(Request)
+            .filter(Request.RID == rid)
+            .with_for_update()
+            .first()
+        )
+
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        won_by = (
+            str(request_row.requestWonBy).strip()
+            if request_row.requestWonBy is not None
+            else ""
+        )
+        if won_by != vendor_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to assign a driver for this request",
+            )
+
+        if request_row.requestStatus != STATUS_REQUEST_CONFIRMED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="INVALID_REQUEST_STATUS",
+            )
+
+        driver_row = (
+            db.query(DriverDetail)
+            .filter(DriverDetail.DDID == driver_id)
+            .first()
+        )
+        if not driver_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Driver not found",
+            )
+
+        driver_owner = (
+            str(driver_row.userAppId).strip() if driver_row.userAppId else ""
+        )
+        if driver_owner != vendor_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to assign this driver",
+            )
+
+        existing_assigned = request_row.driverAssignedID
+        if existing_assigned is not None and int(existing_assigned) == driver_id:
+            # Same-driver idempotent replay: success, no timestamp churn, no notify.
+            db.commit()
+            return EmailErrorResponse(message="UPDATED")
+
+        customer_app_id = request_row.customerAppId
+        now = _now_ist_naive()
+        request_row.driverAssignedID = driver_id
+        request_row.tableTimestamp = now
+        db.commit()
+
+        if background_tasks is not None and customer_app_id:
+            background_tasks.add_task(
+                notify_driver_assigned_to_customer_background,
+                str(customer_app_id).strip(),
+                rid,
+                driver_id,
+            )
 
         return EmailErrorResponse(message="UPDATED")
 
-    except SQLAlchemyError:
+    except HTTPException:
         db.rollback()
-        return EmailErrorResponse(message="DB ERROR")
-    except Exception:
+        raise
+    except SQLAlchemyError as e:
         db.rollback()
-        return EmailErrorResponse(message="INSER ERROR IN FUNCTION")    
+        print(f"[assign_driver_to_request] ERROR: {e}")
+        return EmailErrorResponse(message="ERROR")
+    except Exception as e:
+        db.rollback()
+        print(f"[assign_driver_to_request] ERROR_EXCEPTION: {e}")
+        return EmailErrorResponse(message="ERROR")
+    finally:
+        db.close()
 
 # def get_all_cancelled_requests_for_vendor(db: Session, vendor_id : str):
 #     try:

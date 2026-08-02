@@ -28,9 +28,12 @@ from ..utils.email import send_email
 from ..utils.fcm import subscribe_token_to_topics, TOPIC_ALL_USERS, TOPIC_ALL_VENDORS, unsubscribe_token_from_topics
 from ..services.vendor_filtering import get_all_vendors_enriched
 from datetime import date, datetime
+from typing import Optional
+from fastapi import HTTPException, status
 import re
 import os
 import html
+from ..models.request_table import Request
 
 def _vendor_rating_float(rating) -> float | None:
     if rating is None:
@@ -286,99 +289,105 @@ def get_all_vendors(db: Session):
 #         db.close()
 
 
-def get_vendor_by_rid(db: Session, rid: int):
+def get_vendor_by_rid(
+    db: Session,
+    rid: int,
+    user_id: Optional[str] = None,
+):
+    """
+    Customer-safe selected vendor details for a request (PR12).
+
+    Ownership: JWT sub must own the request.
+    Relation: request.requestWonBy + selected bid with REQUEST - CONFIRMED.
+    Empty relation → []. Does not expose FCM, KYC, registration, or POA docs.
+    """
+    from ..schemas.request_table import CustomerBookingVendorDetail
+    from ..models.tags_table import Tag
+
     try:
+        request_row = db.query(Request).filter(Request.RID == rid).first()
+
+        if not request_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Request not found",
+            )
+
+        if user_id is not None and request_row.customerAppId != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to view vendor details for this request",
+            )
+
+        won_by = (
+            str(request_row.requestWonBy).strip()
+            if request_row.requestWonBy
+            else None
+        )
+        if not won_by:
+            return []
+
+        try:
+            won_by_key = int(won_by)
+        except (TypeError, ValueError):
+            won_by_key = won_by
+
         vendors = (
             db.query(
                 User.fullName,
                 User.userAppId,
-                User.alternateNumber,
-                User.emailId,
                 User.dob,
                 User.city,
                 User.gender,
                 User.rating,
                 User.totalNoOfReviews,
                 User.joiningDate,
-                BidDetail.bidderID,
-                BidDetail.bidAmount,
                 User.profilePicture,
                 User.tags,
                 User.noOfTripsCompleted,
                 BidDetail.CARID,
-
-                CarDetail.userAppId,
                 CarDetail.carRegNo,
                 CarDetail.carModel,
                 CarDetail.modelYear,
-                CarDetail.carColor,
-                CarDetail.ownerName,
-                CarDetail.registrationDoc,
-                CarDetail.powerOfAttorneyDoc,
-                CarDetail.registeredOn,
-                CarDetail.adminApproved,
-                CarDetail.carOwnedBySameVendor,
-                CarDetail.CTD,
                 CarDetail.imageVehicleFront,
                 CarDetail.imageVehicleSide,
-
                 CarTypeDetail.car_type,
-                CarTypeDetail.car_sub_type,
-                CarTypeDetail.capacity,
-                CarTypeDetail.image_url,
             )
             .join(User, User.userAppId == BidDetail.bidderID)
             .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
             .outerjoin(CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD)
             .filter(
                 BidDetail.rID == rid,
+                BidDetail.bidderID == won_by_key,
                 BidDetail.bidStatus == "REQUEST - CONFIRMED",
             )
             .all()
         )
 
         if not vendors:
-            return NoUserResponse(message="NO VENDOR DATA FOUND")
+            return []
 
         result = []
-
         for (
             full_name,
             primary_number,
-            alternate_number,
-            email_id,
             dob,
             city,
             gender,
             rating,
             total_no_of_reviews,
             joining_date,
-            bidder_id,
-            bid_amount,
             profile_pic,
             tags_str,
             no_of_trips_completed,
             car_id,
-            car_user_app_id,
             car_reg_no,
             car_model,
             model_year,
-            car_color,
-            owner_name,
-            registration_doc,
-            power_of_attorney_doc,
-            registered_on,
-            admin_approved,
-            car_owned_by_same_vendor,
-            ctd,
             image_vehicle_front,
             image_vehicle_side,
             car_type,
-            car_sub_type,
-            capacity,
-            image_url,
         ) in vendors:
-
             tag_ids = []
             if tags_str:
                 for t in str(tags_str).split(","):
@@ -392,19 +401,15 @@ def get_vendor_by_rid(db: Session, rid: int):
                 tag_names = [row[0] for row in tag_rows]
 
             result.append(
-                BidderDetail(
+                CustomerBookingVendorDetail(
                     FULLNAME=full_name,
-                    PRIMARYNUMBER=primary_number,
-                    ALTERNATENUMBER=alternate_number,
-                    EMAILID=email_id,
+                    PRIMARYNUMBER=str(primary_number) if primary_number is not None else None,
                     DOB=dob,
                     CITY=city,
                     GENDER=gender,
                     RATING=rating,
                     TOTALNOOFREVIEWS=total_no_of_reviews,
                     JOININGDATE=joining_date,
-                    BIDDERID=bidder_id,
-                    BIDDERAMOUT=bid_amount,
                     PROFILEPIC=profile_pic,
                     TAGS=tag_names,
                     NOOFTRIPSCOMPLETED=no_of_trips_completed,
@@ -412,29 +417,23 @@ def get_vendor_by_rid(db: Session, rid: int):
                     CARREGNO=car_reg_no,
                     CARMODEL=car_model,
                     MODELYEAR=model_year,
-                    CARCOLOR=car_color,
-                    OWNERNAME=owner_name,
-                    REGISTRATIONDOC=registration_doc,
-                    POWEROFATTORNEYDOC=power_of_attorney_doc,
-                    REGISTEREDON=registered_on,
-                    ADMINAPPROVED=admin_approved,
-                    CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
-                    CTD=ctd,
                     IMAGEVEHICLEFRONT=image_vehicle_front,
                     IMAGEVEHICLESIDE=image_vehicle_side,
-                    CAR_USERAPPID=car_user_app_id,
                     CAR_TYPE=car_type,
-                    CAR_SUB_TYPE=car_sub_type,
-                    CAPACITY=capacity,
-                    CAR_TYPE_IMAGE_URL=image_url,
                 )
             )
 
         return result
 
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
-        return NoUserResponse(message="ERROR_PREPARE", error=str(e))
-        
+        print(f"[get_vendor_by_rid] ERROR: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to load vendor details",
+        ) from None
+
 
 def get_user_bank_details(db:Session, userappid : int):
     try:

@@ -163,3 +163,79 @@ class UploadCarDocumentResponse(BaseModel):
     url: str
     userAppId: str
     carRegNo: str
+
+
+# ---------------------------------------------------------------------------
+# PR15 — Vendor Manage Cars (JWT-owned fleet CRUD)
+# ---------------------------------------------------------------------------
+
+
+class VendorManagedCar(TrimmedBaseModel):
+    """Management-safe car row. Omits USERAPPID, RC/POA, internal delete fields, FCM."""
+
+    CARID: int
+    CARREGNO: str
+    CARMODEL: str
+    MODELYEAR: Optional[str] = None
+    CARCOLOR: Optional[str] = None
+    OWNERNAME: Optional[str] = None
+    CAR_TYPE: Optional[str] = None
+    CAR_SUB_TYPE: Optional[str] = None
+    VEHICLE_FRONT: Optional[str] = None
+    VEHICLE_SIDE: Optional[str] = None
+    ADMINAPPROVED: bool = False
+    REGISTEREDON: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class CreateVendorCarRequest(TrimmedBaseModel):
+    """Create car body (PR15). Owner / CARID / approval derived server-side.
+
+    Legacy clients may still send userAppId / adminApproved / etc.; ignored by CRUD.
+    """
+
+    carRegNo: str
+    carModel: str
+    CTD: int
+    carColor: str
+    modelYear: int
+    ownerName: str
+    imageVehicleRC: str
+    imagePowerOfAttorney: Optional[str] = None
+    imageVehicleFront: str
+    imageVehicleSide: str
+    # Ignored / rejected by CRUD if used for ownership or lifecycle:
+    userAppId: Optional[str] = None
+    CARID: Optional[int] = None
+    adminApproved: Optional[bool] = None
+    registeredOn: Optional[datetime] = None
+    carOwnedBySameVendor: Optional[bool] = None
+
+    @field_validator("CTD", mode="before")
+    @classmethod
+    def coerce_ctd(cls, v):
+        return int(v)
+
+    @field_validator("modelYear", mode="before")
+    @classmethod
+    def coerce_model_year(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("modelYear must be a four-digit year")
+        if isinstance(v, int):
+            return v
+        text = str(v or "").strip()
+        if not text or not text.isdigit():
+            raise ValueError("modelYear must be a four-digit year")
+        return int(text)
+
+
+class DeleteVendorCarRequest(TrimmedBaseModel):
+    """PUT /deletecarfromprofile body — CARID only. JWT sub is authoritative."""
+
+    CARID: int
+
+    @field_validator("CARID", mode="before")
+    @classmethod
+    def coerce_car_id(cls, v):
+        return int(v)

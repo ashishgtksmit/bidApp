@@ -110,7 +110,7 @@ python -m pytest tests/test_pr10_customer_bids.py -q
 | Endpoint | Behaviour |
 |----------|-----------|
 | `GET /getallbidsforrequestforvendor?RID=` | Active approved vendor; request `BID - OPEN`; open-feed eligibility **or** existing bid; returns `BID - OPEN` bids sorted by amount; **no FCMTOKEN**; empty → `[]`; does **not** weaken customer GET ownership |
-| `GET /viewcarsforvendor` | JWT `sub` authoritative; optional `userAppId` must match JWT; admin-approved cars only; lean fields; empty → `[]`; fleet UI remains PHP |
+| `GET /viewcarsforvendor` | JWT `sub` authoritative; optional `userAppId` must match JWT; admin-approved + not soft-deleted; lean fields; empty → `[]`; Manage Cars uses dedicated PR15 route |
 | `POST /insertbid` | Body `RID`/`CARID`/`bidAmount` only; `bidderID`/`bidStatus` from JWT/server; duplicate RID+vendor+CARID → `BID ALREADY PRESENT`; `noOfBids` recomputed; notify after commit (own SessionLocal); **no** `bidEndTime` enforcement |
 | `PUT /updatebid?BIDID=` | Body `{bidAmount}`; owner + `BID - OPEN` gates; no FCM; no vehicle change |
 | `DELETE /deletebid?BIDID=` | Owner + `BID - OPEN`; hard delete; recompute `noOfBids`; missing → 404; no FCM |
@@ -120,5 +120,68 @@ python -m pytest tests/test_pr10_customer_bids.py -q
 Worker: `vendor_requests` rows include `BIDID` (backward-compatible additive field).
 
 ```bash
+python -m pytest tests/test_pr11_vendor_bidding.py -q
+```
+
+## PR12 — Customer confirmed booking cancel / reopen / vendor details
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `PUT /bookingcancelledbyuser?RID=` | Body `{rejectionReason}` only; JWT owner; `REQUEST - CONFIRMED` → `BOOKING - CANCELLED BY USER`; future pickup; trim/validate reason (422); preserve `requestWonBy`/`finalAmount`/bids/driver/payment; idempotent replay → `UPDATED` without re-notify; vendor notify from `requestWonBy` after commit (`Booking Cancelled` / `///Cancelled Trips`; own SessionLocal) |
+| `PUT /reopenbooking?RID=` | No body; JWT owner; source `BOOKING - CANCELLED BY USER` + not reopened; future pickup + future `bidEndTime`; atomic clone new `BID - OPEN` RID (same pickup/`bidEndTime`/`specialRequest`); original `requestReopened=1`; response `{message, newRequestId}`; already reopened → 409; notify eligible vendors after commit like create |
+| `GET /getvendordetailsbyrid?RID=` | JWT owner; `requestWonBy` + confirmed bid relation; customer-safe `CustomerBookingVendorDetail` (includes `GENDER`; no FCM/KYC/docs/bank); empty → `[]` |
+
+Flutter: `OpenBidCustomerBookingService` — no PHP fallback on migrated call sites. Lists remain WSS-primary. Worker unchanged (already emits `REQUESTSTATUS` / `REJECTIONREASON` / `REOPENBOOKING` / `REQUESTWONBY` / `FINALAMOUNT`). `RateTheVenor` remains PHP.
+
+```bash
+python -m pytest tests/test_pr12_customer_booking_cancellation.py -q
+```
+## PR13 — Vendor confirmed-trip driver list + assignment
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /viewdriversforvendor` | Active approved vendor; JWT `sub` authoritative; optional `userAppId` must match JWT; ownership-only driver list; lean `VendorDriverAssignmentSummary` (`DRIVERID`/`DRIVERNAME`/`PHOTO_URL`/optional `DRIVERNUMBER`); empty → `[]`; no KYC/licence/FCM |
+| `PUT /updatedrivertorequest` | Body `{RID, DRIVERID}` only; JWT must equal `requestWonBy` and own driver; status gate `REQUEST - CONFIRMED` (else 409); no pickup-time gate; sets `driverAssignedID` + Asia/Kolkata `tableTimestamp`; preserves status/`requestWonBy`/`finalAmount`/vehicle/payment; same-driver replay → `UPDATED` without re-notify; replacement allowed; customer notify after commit (`🚖 Driver Assigned` / `///My Trips`; own SessionLocal) |
+
+Flutter: `OpenBidVendorTripService` — no PHP fallback on migrated assign-dialog methods. Passenger details remain WSS-only. Vendor cancellation not introduced. Worker unchanged.
+
+```bash
+python -m pytest tests/test_pr13_vendor_confirmed_trip.py -q
+```
+
+## PR14 — Vendor Manage Drivers CRUD + dedicated driver OTP
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /viewmanageddriversforvendor` | Active vendor; JWT `sub` only (no `userAppId` query); own active drivers; soft-deleted excluded; newest first; `VendorManagedDriver` (`DRIVERID`/`DRIVERNAME`/`DRIVERNUMBER`/`DRIVERDOB`/`GENDER`/`DRIVERCITY`/`PHOTO_URL`/`ADDEDON`); empty → `[]`; **no** `USERAPPID`/licence/document/FCM |
+| `POST /driverotp/send` | Body `{driverPhone, purpose, driverId?}`; purposes `CREATE_DRIVER` / `CHANGE_DRIVER_PHONE`; hashed OTP at rest; never returns OTP; rate-limited; phone-change requires owned driver |
+| `POST /driverotp/verify` | Body `{driverPhone, purpose, otp, driverId?}`; success `{message: OTP_VERIFIED, driverOtpToken}` — **not** password-reset `reset_token`; single-use short-lived mutation token |
+| `POST /insertnewdriver` | JWT owner (client `userAppId` ignored); requires `CREATE_DRIVER` token; vendor-scoped phone uniqueness; JSON/base64 media; Asia/Kolkata timestamp; response `INSERTED`; token consumed only on commit |
+| `POST /updatedriverdetails` | Public `DRIVERID`; editable city/phone/optional photo; phone change requires `CHANGE_DRIVER_PHONE` token bound to vendor+phone+DRIVERID; response `UPDATED` |
+| `PUT /deletedriverfromprofile` | Body `{driverId}` only; soft-delete `userAppId=123456789`; active `REQUEST - CONFIRMED` assignment → **409** `DRIVER_ASSIGNED_TO_ACTIVE_TRIP`; replay → 404 |
+
+PR13 lean route stays unchanged. Tables: `driver_otp_challenges`, `driver_otp_tokens` (separate from PR5 reset tokens). Flutter: `OpenBidVendorDriverService` — Manage Drivers FastAPI-only; no PHP fallback.
+
+```bash
+OTP_TEST_BYPASS_SMS=1 OTP_TEST_FIXED_OTP=1234 \
+  python -m pytest tests/test_pr14_vendor_manage_drivers.py -q
+```
+
+## PR15 — Vendor Manage Cars CRUD
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /viewmanagedcarsforvendor` | Active vendor; JWT `sub` only; pending + approved; soft-deleted excluded; newest first; `VendorManagedCar` (no USERAPPID/RC/POA/delete internals/FCM); empty → `[]` |
+| `GET /getallvendorcartypes` | Active vendor; catalog CTD/manufacturer/model/variant; empty → `[]` |
+| `POST /addcartoprofile` | JWT owner; `CreateVendorCarRequest`; `adminApproved=false`; global `normalizedCarRegNo` unique (incl. soft-deleted); POA when owner ≠ vendor `fullName`; JSON/base64 media; Asia/Kolkata `registeredOn`; response `INSERTED`; conflict → 409 `CAR_ALREADY_EXISTS` |
+| `PUT /deletecarfromprofile` | Body `{CARID}` only; soft-delete (`isDeleted`/`deletedAt`/`deletedBy`); active bid/request use → **409** `CAR_IN_ACTIVE_USE`; replay → 404 |
+
+PR11 lean `GET /viewcarsforvendor` unchanged (approved + `isDeleted=false`). Bid insert rejects soft-deleted/unapproved/wrong-owner cars. Migration: `migrations/pr15_car_soft_delete_normalized_reg/` (preflight conflict scan required before unique index). Flutter: `OpenBidVendorCarService` — Manage Cars FastAPI-only; no PHP fallback. No edit-car route. No worker change.
+
+```bash
+# Preflight (stops on unresolved normalized-registration conflicts):
+python migrations/pr15_car_soft_delete_normalized_reg/preflight_normalized_reg_conflicts.py
+
+python -m pytest tests/test_pr15_vendor_manage_cars.py -q
 python -m pytest tests/test_pr11_vendor_bidding.py -q
 ```

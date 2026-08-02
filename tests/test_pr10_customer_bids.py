@@ -82,6 +82,7 @@ def _create_biddetails_sqlite(engine) -> None:
                     CARID INTEGER PRIMARY KEY,
                     userAppId VARCHAR(10) NOT NULL,
                     carRegNo VARCHAR(100) NOT NULL,
+                    normalizedCarRegNo VARCHAR(100) NOT NULL DEFAULT '',
                     carColor VARCHAR(200),
                     carModel VARCHAR(200) NOT NULL,
                     modelYear VARCHAR(10) NOT NULL,
@@ -93,7 +94,10 @@ def _create_biddetails_sqlite(engine) -> None:
                     carOwnedBySameVendor BOOLEAN NOT NULL,
                     CTD INTEGER NOT NULL,
                     imageVehicleFront TEXT,
-                    imageVehicleSide TEXT
+                    imageVehicleSide TEXT,
+                    isDeleted BOOLEAN NOT NULL DEFAULT 0,
+                    deletedAt TIMESTAMP,
+                    deletedBy VARCHAR(10)
                 )
                 """
             )

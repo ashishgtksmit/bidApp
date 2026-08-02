@@ -94,6 +94,7 @@ def _create_extra_sqlite(engine) -> None:
                     CARID INTEGER PRIMARY KEY,
                     userAppId VARCHAR(10) NOT NULL,
                     carRegNo VARCHAR(100) NOT NULL,
+                    normalizedCarRegNo VARCHAR(100) NOT NULL DEFAULT '',
                     carColor VARCHAR(200),
                     carModel VARCHAR(200) NOT NULL,
                     modelYear VARCHAR(10) NOT NULL,
@@ -105,7 +106,10 @@ def _create_extra_sqlite(engine) -> None:
                     carOwnedBySameVendor BOOLEAN NOT NULL,
                     CTD INTEGER NOT NULL,
                     imageVehicleFront TEXT,
-                    imageVehicleSide TEXT
+                    imageVehicleSide TEXT,
+                    isDeleted BOOLEAN NOT NULL DEFAULT 0,
+                    deletedAt TIMESTAMP,
+                    deletedBy VARCHAR(10)
                 )
                 """
             )
@@ -275,28 +279,36 @@ def _seed_car(
     approved: bool = True,
     reg: str = "SK01A1111",
     model: str = "Swift",
+    is_deleted: bool = False,
 ) -> int:
+    import re
+
     _car_id_seq["n"] += 1
     car_id = _car_id_seq["n"]
+    normalized = re.sub(r"[^A-Z0-9]", "", str(reg).strip().upper())
     db.execute(
         text(
             """
             INSERT INTO cardetails
-                (CARID, userAppId, carRegNo, carColor, carModel, modelYear, ownerName,
+                (CARID, userAppId, carRegNo, normalizedCarRegNo, carColor, carModel, modelYear, ownerName,
                  registrationDoc, powerOfAttorneyDoc, registeredOn, adminApproved,
-                 carOwnedBySameVendor, CTD, imageVehicleFront, imageVehicleSide)
+                 carOwnedBySameVendor, CTD, imageVehicleFront, imageVehicleSide,
+                 isDeleted, deletedAt, deletedBy)
             VALUES
-                (:car, :uid, :reg, 'White', :model, '2020', 'Owner',
-                 'doc', NULL, :ts, :approved, 1, 1, 'front.png', NULL)
+                (:car, :uid, :reg, :norm, 'White', :model, '2020', 'Owner',
+                 'doc', NULL, :ts, :approved, 1, 1, 'front.png', NULL,
+                 :deleted, NULL, NULL)
             """
         ),
         {
             "car": car_id,
             "uid": user_app_id,
             "reg": reg,
+            "norm": normalized,
             "model": model,
             "ts": "2026-01-01 12:00:00",
             "approved": 1 if approved else 0,
+            "deleted": 1 if is_deleted else 0,
         },
     )
     db.execute(
