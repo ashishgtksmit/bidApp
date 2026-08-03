@@ -1,75 +1,78 @@
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime,date,time
+"""PR19 public-safe vendor review schemas.
+
+Create body accepts only RID + category ratings + comments.
+Identity (reviewer + target vendor) is derived from JWT + request row.
+Half-step / text validation is enforced in CRUD with hard HTTPException details.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Optional, Union
+
+from pydantic import BaseModel, field_validator
+
+
+class ReviewCreate(BaseModel):
+    """Customer → vendor review insert (PR19). Client sends RID only for identity."""
+
+    RID: int
+    driverBehaviour: Any
+    punctuality: Any
+    carCondition: Any
+    cleanliness: Any
+    comments: Optional[Any] = ""
+
+    @field_validator("RID")
+    @classmethod
+    def rid_positive(cls, v: int) -> int:
+        if isinstance(v, bool) or v is None or int(v) <= 0:
+            raise ValueError("INVALID_RID")
+        return int(v)
+
+    model_config = {"from_attributes": True}
+
+
+class VendorReviewSummaryResponse(BaseModel):
+    """Public-safe vendor review list item (PR19)."""
+
+    reviewId: int
+    requestId: int
+    travelDate: Optional[date] = None
+    driverBehaviour: float
+    punctuality: float
+    carCondition: float
+    cleanliness: float
+    comments: str = ""
+    reviewerDisplayName: Optional[str] = None
+    reviewerProfileImageUrl: Optional[str] = None
+    fromLocation: Optional[str] = None
+    toLocation: Optional[str] = None
+    carRegNo: Optional[str] = None
+    carModel: Optional[str] = None
+    driverName: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class ReviewInsertResponse(BaseModel):
+    message: str = "INSERTED"
 
 
 class Review(BaseModel):
-    driverBehaviour : int
-    punctuality : int
-    carCondition : int
-    cleanliness : int
-    refreshments : int
-    comments : Optional[str] = None
+    driverBehaviour: Union[int, float]
+    punctuality: Union[int, float]
+    carCondition: Union[int, float]
+    cleanliness: Union[int, float]
+    refreshments: Optional[int] = 0
+    comments: Optional[str] = None
 
-    model_config={"from_attributes":True}
+    model_config = {"from_attributes": True}
 
-class ReviewCreate(Review):
-    customerAppId : str
-    RID : int
-    VENDORID : int
 
-class ReviewUpdate(BaseModel):
-    driverBehaviour : Optional[int] = None
-    punctuality : Optional[int] = None
-    carCondition : Optional[int] = None
-    cleanliness : Optional[int] = None
-    refreshments : Optional[int] = None
-    comments : Optional[int] = None   
-    
+class ReviewDetail(VendorReviewSummaryResponse):
+    pass
 
-class ReviewDetail(BaseModel):
-    CUSTOMERID : str
-    CUSTOMERNAME : str
-    REQUESTID : int
-    VENDORID : int
-    DRIVERBEHAVIOUR : int
-    PUNCTUALITY : int
-    CARCONDITION : int
-    CLEANLINESS : int
-    REFRESHMENTS : int
-    COMMENTS : str
-    CUSTOMER_PROFILEPIC : Optional[str] = None
-    REQ_FROMLOCATION : str
-    REQ_FROMLANKDMARK : str
-    REQ_TOLOCATION : Optional[str] = None
-    REQ_TOLANDMARK : Optional[str] = None
-    REQ_PICKUPDATE : Optional[date] = None
-    REQ_PICKUPTIME : Optional[time] = None
-    REQ_NOOFADULTS : Optional[int] = None
-    REQ_NOOFKIDS : Optional[int] = None
-    REQ_CARTYPE : Optional[str] = None
-    REQ_ACREQUEST : Optional[bool] = None
-    REQ_CARRIERREQUEST : Optional[bool] = None
-    REQ_SPECIALREQUEST : Optional[str] = None
-    BID_BIDAMOUNT : Optional[float] = None
-    BID_CARID : Optional[int] = None
-    CAR_REGNO : Optional[str] = None
-    CAR_MODEL : Optional[str] = None
-    CAR_MODELYEAR : Optional[str] = None
-    CAR_COLOR : Optional[str] = None
-    CAR_OWNERNAME : Optional[str] = None
-    CARTYPE : Optional[str] = None
-    DRIVER_NAME : Optional[str] = None
-                    
-                    
-
-    model_config={
-        "from_attributes":True,
-        "json_encoders": {
-            datetime: lambda v: v.strftime('%Y-%m-%d %H:%M:%S') if v else None
-        }
-    }
 
 class NoReviewResponse(BaseModel):
-    message : str
-
+    message: str

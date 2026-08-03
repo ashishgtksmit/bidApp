@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from ..schemas.user_table import (NoUserResponse,BidderDetail,UserBankDetailsResponse,UserCreate,
                                   LogoutResponse,UserDelete,UserBankDetailsUpdate,UserImageUpload,
                                   VendorUpdate,VendorKycCreate,UpdateRequestTypeSelectionsRequest,
@@ -39,7 +39,19 @@ def get_all_users(db:Session = Depends(get_db),
 def get_user(db:Session = Depends(get_db), 
              user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
              userAppId : str = Query(...)):
-    return get_user_details(db,userAppId=userAppId)
+    """PR6 session profile + PR23 ownership hardening.
+
+    JWT ``sub`` is authoritative. Transitional ``userAppId`` query must equal
+    JWT ``sub`` (mismatch → 403). Missing user keeps soft ``NO REGISTERED``.
+    """
+    jwt_sub = str(user_id).strip()
+    query_id = str(userAppId).strip()
+    if query_id != jwt_sub:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized",
+        )
+    return get_user_details(db, userAppId=jwt_sub)
 
 
 @router.get("/checkregistereduser", response_model=Union[NoUserResponse, ErrorResponse])
@@ -144,11 +156,38 @@ def send_otp(
         return limited
     return send_otp_to_user(db, user_app_id=userAppId)
 
-@router.post("/deleteappuser",response_model=ErrorResponse)
-def delete_existing_user(user_delete_data : UserDelete, 
-                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                         db:Session = Depends(get_db)):
-    return delete_user(db,user_delete_data)
+@router.post("/deleteappuser", response_model=ErrorResponse)
+def delete_existing_user(
+    request: Request,
+    user_delete_data: UserDelete,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """PR24 — JWT-owned soft tombstone account deletion (no PHP fallback)."""
+    jwt_sub = str(user_id).strip()
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"deleteappuser:ip:{client_ip_from_request(request)}",
+        max_hits=int(os.getenv("RATE_LIMIT_DELETE_USER_PER_IP", "5")),
+        window_seconds=int(os.getenv("RATE_LIMIT_DELETE_USER_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="DELETION_RATE_LIMITED",
+        )
+    limited = enforce_rate_limit(
+        db,
+        bucket_key=f"deleteappuser:user:{jwt_sub}",
+        max_hits=int(os.getenv("RATE_LIMIT_DELETE_USER_PER_APPID", "5")),
+        window_seconds=int(os.getenv("RATE_LIMIT_DELETE_USER_WINDOW_SECONDS", "900")),
+    )
+    if limited is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="DELETION_RATE_LIMITED",
+        )
+    return delete_user(db, user_delete_data, user_id=jwt_sub)
 
 @router.put("/updatevendorbankdetails", response_model=ErrorResponse)
 def vendor_bank_details_update(
@@ -159,11 +198,14 @@ def vendor_bank_details_update(
     """PR17 — JWT-owned bank text update for active approved vendors."""
     return update_vendor_bank_details(db, user_data, user_id=user_id)
 
-@router.post("/profilepageupload",response_model=Union[EmailErrorResponse,ImageResponse,ErrorResponse])
-def upload_profile_image(image_data : UserImageUpload, 
-                         user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                         db: Session = Depends(get_db) ):
-    return profile_image_upload(db,image_data)
+@router.post("/profilepageupload", response_model=ImageResponse)
+def upload_profile_image(
+    image_data: UserImageUpload,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """PR23 — JWT-owned JPEG/PNG profile-image upload (JSON/base64)."""
+    return profile_image_upload(db, image_data, user_id=user_id)
 
 @router.put("/alsovendorupdate",response_model=EmailErrorResponse)
 def also_vendor_update(vendor_data : VendorUpdate,

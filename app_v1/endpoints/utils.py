@@ -1,12 +1,19 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from ..utils.fcm import send_notification
-from ..utils.email import send_email
-from ..utils.common import ErrorResponse,EmailErrorResponse,FCMSend,EmailSend,FCMSendDrivers,SendNotificationResponse
+from ..utils.common import (
+    ErrorResponse,
+    EmailErrorResponse,
+    FCMSend,
+    FCMSendDrivers,
+    SendNotificationResponse,
+    InternalEmailSendRequest,
+)
 from ..utils.image import generate_azure_blob_sas,upload_support_docs_to_azure
 from ..services.notifications import (send_notification_to_user,send_notification_to_selected_users,
                                       send_notification_to_all_drivers,send_marketing_notification_to_numbers,
                                       send_marketing_notification_to_all_users)
+from ..services.internal_email import InternalEmailError, send_internal_email
 from ..schemas.common_schema import (GenerateBlobSasRequest, GenerateBlobSasResponse, UploadSupportDocsErrorResponse,
                                      UploadSupportDocsRequest,UploadSupportDocsResponse, 
                                      SendNotificationToAllDriversRequest, SendNotificationToAllDriversResponse,
@@ -16,56 +23,119 @@ from ..schemas.common_schema import (GenerateBlobSasRequest, GenerateBlobSasResp
 from ..database import get_db
 from typing import Union
 from ..auth.deps import get_current_user_id
+from ..auth.internal import (
+    require_internal_notification_access,
+    require_internal_email_access,
+)
 
 
 router = APIRouter()
 
-@router.post("/sendemail",response_model=Union[ErrorResponse,EmailErrorResponse])
-def send_mail_to_user(email_data:EmailSend, db : Session = Depends(get_db),
-                      user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                      ):
-    return send_email(
-        message=email_data.message,
-        subject=email_data.subject,
-        from_address=email_data.from_address,
-        from_name=email_data.from_name,
-        to_address=email_data.to_address,
-        to_name=email_data.to_name,
-        cc_address=email_data.cc_address,
-        cc_name=email_data.cc_name,
-        bcc_address=email_data.bcc_address,
-        bcc_name=email_data.bcc_name,
-        attachment_path=email_data.attachment_path
-        )
+_NOTIFICATION_DISPATCH_FAILED = "NOTIFICATION_DISPATCH_FAILED"
 
-@router.post("/sendfcmnotification",response_model=Union[ErrorResponse,EmailErrorResponse])
-def send_notification_to_fcm_token(fcm_data : FCMSend, user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                   ):
-    return send_notification(
-        title=fcm_data.title,
-        body=fcm_data.body,
-        fcm_token=fcm_data.fcmToken,
-        url=fcm_data.url,
-        source=fcm_data.source,
-        destination=fcm_data.destination,
-        travel_date=fcm_data.travelDate,
-        pickup_time=fcm_data.pickupTime,        
-        type=fcm_data.type,
-        sound_file=fcm_data.soundFile
+
+def _raise_notification_dispatch_failed() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=_NOTIFICATION_DISPATCH_FAILED,
     )
 
 
-@router.post("/notificationtodriver",response_model=Union[ErrorResponse,EmailErrorResponse])
-def send_notification_to_userappid(notification_data : FCMSend, 
-                                   user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                   db: Session = Depends(get_db)):
-    return send_notification_to_user(db,notification_data)
+def _map_user_notify_result(result: EmailErrorResponse) -> EmailErrorResponse:
+    message = getattr(result, "message", None) or ""
+    if message == "NOTIFICATION_SENT":
+        return EmailErrorResponse(message="NOTIFICATION_SENT")
+    if message == "NO_TOKEN":
+        return EmailErrorResponse(message="NO_TOKEN")
+    if message == "USER_NOT_FOUND":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="USER_NOT_FOUND",
+        )
+    _raise_notification_dispatch_failed()
 
-@router.post("/sendnotificationtoselecteddrivers",response_model=SendNotificationResponse)
-def send_notification_to_selected_(driver_data : FCMSendDrivers, 
-                                   user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                   db: Session = Depends(get_db)):
-    return send_notification_to_selected_users(db,driver_data)
+
+def _map_raw_token_notify_result(result: dict) -> EmailErrorResponse:
+    if not isinstance(result, dict):
+        _raise_notification_dispatch_failed()
+    if result.get("success") or result.get("message") == "NOTIFICATION_SENT":
+        return EmailErrorResponse(message="NOTIFICATION_SENT")
+    if result.get("message") in {"ERROR_MISSING_FCMTOKEN", "NO_TOKEN"}:
+        return EmailErrorResponse(message="NO_TOKEN")
+    _raise_notification_dispatch_failed()
+
+
+@router.post(
+    "/sendemail",
+    response_model=Union[ErrorResponse, EmailErrorResponse],
+    include_in_schema=False,
+)
+def send_mail_to_user(
+    email_data: InternalEmailSendRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_email_access),
+):
+    """
+    Internal-only restricted email (PR31).
+
+    Requires Bearer JWT + X-OpenBid-Internal-Key. Hidden from public OpenAPI.
+    Plain text only; no CC/BCC/attachments; server-owned sender; recipient allow-list.
+    """
+    try:
+        return send_internal_email(db, jwt_sub=user_id, request=email_data)
+    except InternalEmailError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.detail) from None
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="INTERNAL_EMAIL_FAILED",
+        ) from None
+
+@router.post("/sendfcmnotification",response_model=Union[ErrorResponse,EmailErrorResponse])
+def send_notification_to_fcm_token(
+    fcm_data : FCMSend,
+    user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
+):
+    """Internal/admin only — raw FCM token dispatch. Not for ordinary mobile JWTs."""
+    try:
+        result = send_notification(
+            title=fcm_data.title,
+            body=fcm_data.body,
+            fcm_token=fcm_data.fcmToken,
+            url=fcm_data.url,
+            source=fcm_data.source,
+            destination=fcm_data.destination,
+            travel_date=fcm_data.travelDate,
+            pickup_time=fcm_data.pickupTime,
+            type=fcm_data.type,
+            sound_file=fcm_data.soundFile
+        )
+        return _map_raw_token_notify_result(result)
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()
+
+
+@router.post("/notificationtodriver",response_model=Union[ErrorResponse,EmailErrorResponse])
+def send_notification_to_userappid(
+    notification_data : FCMSend,
+    user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
+    db: Session = Depends(get_db),
+):
+    """Internal/admin only — notify by userAppId. Not for ordinary mobile JWTs."""
+    try:
+        result = send_notification_to_user(db, notification_data)
+        return _map_user_notify_result(result)
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()
 
 
 @router.post("/readimageprivatepath",response_model=Union[GenerateBlobSasResponse,ErrorResponse])
@@ -103,7 +173,9 @@ def upload_chat_support_docs(data: UploadSupportDocsRequest,
 def send_notification_to_all_drivers_api(
     data: SendNotificationToAllDriversRequest,
     user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
 ):
+    """Internal/admin only — topic broadcast to all drivers/vendors."""
     try:
         result = send_notification_to_all_drivers(
             title=data.title,
@@ -120,10 +192,12 @@ def send_notification_to_all_drivers_api(
             status=result.get("status", "failed"),
             totalProcessed=result.get("totalProcessed", 0),
             totalSuccess=result.get("totalSuccess", 0),
-            response=result.get("response", result),
+            response={"message": result.get("status", "failed")},
         )
-    except Exception as e:
-        return ErrorResponse(message="ERROR", error=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()
     
 @router.post(
     "/sendmarketingnotificationtonumbers",
@@ -132,8 +206,10 @@ def send_notification_to_all_drivers_api(
 def send_marketing_notification_to_numbers_api(
     data: SendMarketingNotificationToNumbersRequest,
     user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
     db: Session = Depends(get_db),
 ):
+    """Internal/admin only — marketing notify to selected userAppIds."""
     try:
         ids = data.phoneNumber if isinstance(data.phoneNumber, list) else []
 
@@ -147,16 +223,19 @@ def send_marketing_notification_to_numbers_api(
             notification_type=data.type or "default",
         )
 
+        # Do not expose recipient identity lists to callers.
         return SendMarketingNotificationToNumbersResponse(
             status=result.get("status", "failed"),
             totalProcessed=result.get("totalProcessed", 0),
             totalSuccess=result.get("totalSuccess", 0),
             totalFailed=result.get("totalFailed", 0),
-            noTokenIds=result.get("noTokenIds", []),
-            failedIds=result.get("failedIds", []),
+            noTokenIds=[],
+            failedIds=[],
         )
-    except Exception as e:
-        return ErrorResponse(message="ERROR", error=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()
     
 @router.post(
     "/sendmarketingnotificationtoallusers",
@@ -165,7 +244,9 @@ def send_marketing_notification_to_numbers_api(
 def send_marketing_notification_to_all_users_api(
     data: SendMarketingNotificationToAllUsersRequest,
     user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
 ):
+    """Internal/admin only — marketing topic broadcast to all users."""
     try:
         result = send_marketing_notification_to_all_users(
             title=data.title,
@@ -179,10 +260,12 @@ def send_marketing_notification_to_all_users_api(
             status=result.get("status", "failed"),
             totalProcessed=result.get("totalProcessed", 0),
             totalSuccess=result.get("totalSuccess", 0),
-            response=result.get("response"),
+            response={"message": result.get("status", "failed")},
         )
-    except Exception as e:
-        return ErrorResponse(message="ERROR", error=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()
     
 
 @router.post(
@@ -192,8 +275,16 @@ def send_marketing_notification_to_all_users_api(
 def send_notification_to_selected_drivers_api(
     data: SendNotificationToSelectedDriversRequest,
     user_id: str = Depends(get_current_user_id),
+    _: None = Depends(require_internal_notification_access),
     db: Session = Depends(get_db),
 ):
+    """
+    Internal/admin only — notify selected driver userAppIds.
+
+    Canonical single route (PR25 deduplicated the prior duplicate declaration).
+    Mutations call ``send_notification_to_selected_users`` directly and do not
+    require this HTTP surface.
+    """
     try:
         service_data = FCMSendDrivers(
             title=data.title,
@@ -211,5 +302,7 @@ def send_notification_to_selected_drivers_api(
             totalSuccess=result.totalSuccess,
             results=result.results,
         )
-    except Exception as e:
-        return ErrorResponse(message="ERROR", error=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        _raise_notification_dispatch_failed()

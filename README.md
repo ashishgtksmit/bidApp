@@ -38,6 +38,8 @@ python -m pytest tests/test_pr6_getuserdetails.py -q
 
 Authenticated cold-start / session refresh uses `GET /getuserdetails?userAppId=`.
 
+**PR23 ownership harden:** JWT `sub` is authoritative. The required query `userAppId` must equal JWT `sub` (mismatch → **403**). Legitimate PR6 callers that send their own id continue to work. Missing user keeps soft `NO REGISTERED` (compatible with existing bootstrap). Do not use this route to read another user’s profile.
+
 | Field | Semantics |
 |-------|-----------|
 | `USERAPPID` | Canonical app user id / phone |
@@ -238,4 +240,312 @@ python -m pytest tests/test_pr6_getuserdetails.py tests/test_pr7_catalogs.py \
   tests/test_pr11_vendor_bidding.py tests/test_pr14_vendor_manage_drivers.py \
   tests/test_pr15_vendor_manage_cars.py tests/test_pr16_vendor_onboarding.py \
   tests/test_pr17_vendor_bank.py -q
+```
+
+## PR19 — Reviews & Ratings
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getallreviewsforvendor` | JWT required; public-safe reviews for existing vendor (`VENDORID` query); empty → `[]`; missing vendor → **404** `TARGET_NOT_FOUND`; newest first (`VRID DESC`); no phones/FCM/internal ids |
+| `GET /getallreviewsforcustomer` | JWT `sub` only (no `CUSTOMERID`); empty → `[]`; joins rating **giver** (vendor) display fields |
+| `POST /insertfeedback` | Customer rates vendor; body `{RID, driverBehaviour, punctuality, carCondition, cleanliness, comments}`; reviewer=JWT; target=`requestWonBy`; eligibility `REQUEST - CONFIRMED` + past Asia/Kolkata pickup; sets `reviewDone=Y`; recalculates vendor aggregate; **201** `{message: INSERTED}`; duplicate → **409** `ALREADY_REVIEWED`; after commit Vendor snapshot refresh |
+| `POST /insertcustomerfeedback` | Vendor rates customer; body `{RID, RATING, COMMENTS}`; reviewer=JWT must equal `requestWonBy`; target=`customerAppId`; sets `customerReviewDone=Y`; recalculates customer aggregate; **201** `{message: INSERTED}`; after commit Customer snapshot refresh |
+
+Half-star ratings `0.5`–`5.0`. Decimal migration + unique RID indexes: `migrations/pr19_reviews_ratings_decimal_unique_rid/` (run preflights before apply). Aggregate audit script reports only — no auto repair.
+
+Flutter: `OpenBidReviewService` — FastAPI-only; no PHP fallback; no reviewer/target identity on mutations; 401 refresh-once; POST network/timeout → `unknownCommit`. Own-profile aggregates via `OpenBidUserProfileService` (approach B). PHP handlers retained unused.
+
+```bash
+python migrations/pr19_reviews_ratings_decimal_unique_rid/preflight_duplicate_review_rids.py
+python migrations/pr19_reviews_ratings_decimal_unique_rid/preflight_numeric_ratings.py
+python migrations/pr19_reviews_ratings_decimal_unique_rid/apply_migration.py
+python migrations/pr19_reviews_ratings_decimal_unique_rid/audit_aggregates.py
+python -m pytest tests/test_pr19_reviews_ratings.py -q
+```
+
+## PR20 — Booking History
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getallrequestforuser` | JWT `sub` owns rows (`customerAppId == sub`); past `REQUEST - CONFIRMED` only (Asia/Kolkata); newest pickup first, RID desc tie-break; empty → `[]`; minimized camelCase `CustomerBookingHistoryItem`; optional deprecated `customerAppId` mismatch → **403**; malformed pickup → **500** `HISTORY_DATA_INVALID` |
+| `GET /getallconfirmedrequestsforvendor` | JWT `sub` must equal `requestWonBy`; past `REQUEST - CONFIRMED` only; empty → `[]`; minimized camelCase `VendorBookingHistoryItem` including `customerReviewDone` + rating summary + safe car/driver display; optional deprecated `vendorId` mismatch → **403**; no vendor approval/lock gate for reading own history |
+
+Schemas: `app_v1/schemas/booking_history.py`. No pagination. No soft `NO_REQUESTS_FOUND` / SQL leakage. `getbookingreport` unchanged. Cancelled-history hardened in **PR21**. Worker/WSS unchanged.
+
+Flutter: `OpenBidBookingHistoryService` — FastAPI-only; no `customerAppId`/`vendorId`/`page`; 401 refresh-once; no process cache. Screens: `Csr_Booking_History.dart`, `Vendor_Confirmed_History.dart`. My Earnings migrated separately in **PR22** (`GET /vendor/earnings`). Vendor cancellation history → **PR21**. PHP handlers retained.
+
+```bash
+python -m pytest tests/test_pr20_booking_history.py -q
+```
+
+## PR21 — Vendor Cancellation History
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /getallcancelledrequestsforvendor` | JWT `sub` must equal `requestWonBy`; past `BOOKING - CANCELLED BY USER` only (Asia/Kolkata); newest pickup first, RID desc tie-break; empty → `[]`; minimized camelCase `VendorCancelledHistoryItem`; nullable `finalAmount` (null preserved); optional deprecated `vendorId` mismatch → **403**; no vendor approval/lock gate; no CustomerReview/driver/car joins; malformed pickup → **500** `HISTORY_DATA_INVALID`; SQL failure → **500** `HISTORY_QUERY_FAILED` |
+
+WSS Cancelled Trips tab remains responsible for current/future cancellations. Worker unchanged. Flutter: `OpenBidBookingHistoryService.getVendorCancellationHistory()`; screen `Vendor_Cancellation_History.dart`. No PHP fallback. PHP handlers retained. My Earnings migrated separately in **PR22**.
+
+```bash
+./bin/pytest tests/test_pr21_vendor_cancellation_history.py -q
+./bin/pytest tests/test_pr20_booking_history.py tests/test_pr12_customer_booking_cancellation.py -q
+```
+
+## PR22 — Vendor Earnings Report
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `GET /vendor/earnings` | JWT `sub` must equal `requestWonBy`; past `REQUEST - CONFIRMED` only (Asia/Kolkata); optional inclusive `startDate`/`endDate` (`yyyy-MM-dd`, both together or neither; max 24 calendar months); empty → **200** zero `VendorEarningsReport`; summary = gross completed booking value from `finalAmount` (INR integers; null→0; negatives excluded); `paymentStatus` ignored; monthly buckets (default last 6 months including current; range = intersecting months with zeros); trips = newest 10 (pickup desc, RID desc); no vendor approval/lock gate; no identity query params; SQL failure → **500** `REPORT_QUERY_FAILED`; range errors → **422** / `REPORT_RANGE_TOO_LARGE` |
+
+Schemas: `app_v1/schemas/vendor_earnings.py`. CRUD: `app_v1/crud/vendor_earnings.py`. Router: `app_v1/endpoints/reporting.py`. Does **not** join bids/reviews/customer. `GET /getbookingreport` unchanged. Worker/WSS/PR20/PR21 unchanged.
+
+Flutter: `OpenBidVendorEarningsService` under `lib/core/earnings/` — FastAPI-only; no `vendorId`/`phone`/`page`; 401 refresh-once; no process cache; no client totals. Screen: `My_Earnings_Page.dart`. Chart visual unchanged (bucket adapter + zero-max guard). No PHP fallback. PHP handlers retained.
+
+```bash
+./bin/pytest tests/test_pr22_vendor_earnings.py -q
+./bin/pytest tests/test_pr20_booking_history.py tests/test_pr21_vendor_cancellation_history.py -q
+```
+
+## PR23 — User Profile Image Upload
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `POST /profilepageupload` | JWT `sub` authoritative; optional transitional body `userAppId` must equal JWT when present (mismatch → **403**); JPEG/PNG only; JSON/base64 (raw or data-URI); decoded size ≤ **2 MB** else **413** `PROFILE_IMAGE_TOO_LARGE`; unsupported type → **415** `UNSUPPORTED_PROFILE_IMAGE_TYPE`; malformed/corrupt/MIME mismatch → **422** `INVALID_PROFILE_IMAGE`; missing user → **404** `USER_NOT_FOUND`; tombstone `*.DELETED*` → **403** `PROFILE_UPDATE_NOT_ALLOWED`; `lockApp` alone does **not** block; public Azure blob `{jwt_sub}_profile.{jpg\|png}`; cache-busted URL; response `{message: UPLOADED, url}` only; storage failure → **500** `PROFILE_UPLOAD_FAILED` without DB write; old different-path blob deleted only after successful commit |
+| `GET /getuserdetails` | PR6 fields unchanged; **PR23 ownership:** query `userAppId` must equal JWT `sub` (mismatch → **403**); missing user keeps soft `NO REGISTERED` |
+
+Flutter: `OpenBidUserProfileService.uploadProfileImage` — FastAPI-only; no PHP/`page`/`userAppId`/`phone`; 401 refresh-once; timeout → `unknownCommit`; Option B post-upload `getUserDetails` + `AppSessionMapper`; refresh-fail-after-commit local `picture`/`profilepic` fallback. Screen: `My_Profile.dart`. No text-profile editing. Worker/WSS unchanged. PHP handlers retained. Account deletion later migrated in PR24 (separate domain).
+
+```bash
+./bin/pytest tests/test_pr23_user_profile.py -q
+./bin/pytest tests/test_pr6_getuserdetails.py -q
+```
+
+## PR24 — Permanent Account Deletion
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `POST /deleteappuser` | JWT `sub` authoritative; body `password` + `deletionReason` (3–500); optional transitional `userAppId` must match JWT (mismatch → **403**); password via `verify_and_update_password` (upgrade stays in same txn); soft tombstone `{id}.DELETED[+n]`; `lockApp=true`; `user_login_status=LOGGEDOUT`; store `deletionReason`; IST `tableTimestamp`; clear DB `fcmToken`; post-commit topic unsubscribe (best effort); lifecycle gates → **409** `DELETION_BLOCKED_*`; wrong password → **409** `WRONG_PASSWORD`; missing/already tombstoned → **404** `USER_NOT_FOUND`; rate limit → **429** `DELETION_RATE_LIMITED`; success `{message: DELETED}` only; no row hard-delete; no related-history rewrite; no blob/chat erase |
+| Column length | SQLAlchemy `User.userAppId` → `String(64)`; migration package `migrations/pr24_user_tombstone_identifier_length/` (preflight + idempotent apply). Production apply not claimed by unit tests. |
+
+Flutter: `OpenBidAccountService` + `AppLocalSessionClearer` — FastAPI-only; no PHP/`page`/`userAppId`; 401 refresh-once; timeout/network → `unknownCommit` (clear local session + login; no auto-retry); definite failure reconnects realtime via HomePage callback. Screens: `Permanently_Delete_Account.dart`, `EnterPasswordDialogBox.dart`. Normal HomePage logout unchanged (`AppLogoutService`). Worker unchanged. PHP handlers retained.
+
+```bash
+./bin/pytest tests/test_pr24_account_deletion.py -q
+./bin/pytest tests/test_pr6_getuserdetails.py tests/test_pr23_user_profile.py -q
+```
+
+## PR25 — Notification Dispatch Cleanup / Hardening
+
+Business FCM remains **mutation-owned** (PR8–PR13 helpers). Generic utility routes are **not** mobile business APIs.
+
+| Endpoint | Auth after PR25 |
+|----------|-----------------|
+| `POST /notificationtodriver` | JWT + `X-OpenBid-Internal-Key` |
+| `POST /sendfcmnotification` | JWT + `X-OpenBid-Internal-Key` (raw token; internal only) |
+| `POST /sendnotificationtoselecteddrivers` | JWT + `X-OpenBid-Internal-Key` (single canonical route) |
+| `POST /sendnotificationtoalldrivers` | JWT + `X-OpenBid-Internal-Key` |
+| `POST /sendmarketingnotificationtonumbers` | JWT + `X-OpenBid-Internal-Key` |
+| `POST /sendmarketingnotificationtoallusers` | JWT + `X-OpenBid-Internal-Key` |
+
+Env: `INTERNAL_NOTIFICATION_KEY` (fail closed when unset). Header never logged. Ordinary mobile JWT alone → **403** `INTERNAL_NOTIFICATION_ACCESS_REQUIRED`.
+
+Flutter: dead `sendPushNotification*` helpers removed; **no** `lib/core/notifications/` service. Customer↔vendor and support/admin chat push migrated in **PR26/PR27** (`POST /chat/notifications`). Generic routes remain JWT + internal-key. PHP handlers retained. Worker unchanged.
+
+```bash
+./bin/pytest tests/test_pr25_notification_dispatch.py -q
+./bin/pytest tests/test_pr8_insertrequest.py tests/test_pr9_update_delete_request.py \
+  tests/test_pr10_customer_bids.py tests/test_pr11_vendor_bidding.py \
+  tests/test_pr12_customer_booking_cancellation.py tests/test_pr13_vendor_confirmed_trip.py -q
+```
+
+## PR26 — Chat Push Notification (customer↔vendor)
+
+Dedicated mobile endpoint (not a generic notify utility):
+
+| Endpoint | Auth |
+|----------|------|
+| `POST /chat/notifications` | JWT + `X-Client-Id` (no internal key) |
+
+Body: `{threadId, messageId}` only (`extra=forbid`). FastAPI reads Firebase RTDB `Chats/{threadId}/{messageId}` via Admin SDK (`FIREBASE_DATABASE_URL` + `FIREBASE_SERVICE_ACCOUNT`), verifies JWT sender, authorizes `customerAppId`/`requestWonBy` for `BID - CONFIRMED` / `REQUEST - CONFIRMED`, derives recipient FCM token + server-owned title/body/`//Chat_Main_Page`, rate-limits/idempotency via `api_rate_limit_buckets`. **PR27** extends the same route for support/admin threads. Chat photo media is **PR28** (`POST /chat/media`). Worker unchanged.
+
+Env (placeholders only):
+
+```
+FIREBASE_SERVICE_ACCOUNT=
+FIREBASE_DATABASE_URL=https://opnbd-a23e1-default-rtdb.asia-southeast1.firebasedatabase.app
+```
+
+```bash
+./bin/pytest tests/test_pr26_chat_notifications.py -q
+./bin/pytest tests/test_pr25_notification_dispatch.py -q
+```
+
+## PR27 — Support Chat Config + Support Push
+
+| Endpoint | Auth | Notes |
+|----------|------|-------|
+| `GET /chat/support/config` | JWT + `X-Client-Id` | Typed support identity; no FCM/email/KYC |
+| `POST /chat/notifications` | JWT + `X-Client-Id` | Classifies peer vs `admin-{phone}` support threads |
+
+**Support identity (Option A — shared account, not a staff role):** exactly one `admin_number` row whose phone matches a live, unlocked, non-tombstoned `usertable` row. Zero or multiple rows → config `available=false`; notification attempts → **503** `SUPPORT_CONFIGURATION_INVALID`. Missing FCM on support does **not** make config unavailable (`NO_TOKEN` on notify).
+
+**Authorization:**
+
+- User→support: `threadId == admin-{jwt_sub}`; RTDB sender=jwt; receiver=configured support; no booking relationship required.
+- Support→user: jwt_sub equals configured support; RTDB sender=support; `threadId == admin-{receiver}`; recipient live (tombstone/locked → soft skip).
+
+**Templates (privacy-preserving):** user→support title `New Support Message`; support→user title `OpenBid Support`; fixed bodies (no message text preview). Deep link `//Chat_Main_Page`. Peer PR26 sanitized 80-char preview unchanged.
+
+**Rate limits:** user→support 20/min sender, 15/min pair; support→user 60/min operator, 20/min pair; message event idempotency reuses `chat_notification:{threadId}:{messageId}`.
+
+**Ops:** support phone must map to a normal JWT-capable user with FCM for delivery. Not a multi-agent or explicit support-role system. PHP `getadminno`/`getuserdetails`/`newnotification` unused by migrated Flutter; handlers retained. Chat photo media is **PR28**. Worker unchanged. No DB migration.
+
+```bash
+./bin/pytest tests/test_pr27_support_chat.py -q
+./bin/pytest tests/test_pr26_chat_notifications.py tests/test_pr25_notification_dispatch.py -q
+```
+
+## PR28 — Chat Media Upload (photo)
+
+| Endpoint | Auth | Notes |
+|----------|------|-------|
+| `POST /chat/media` | JWT + `X-Client-Id` | One PHOTO per request; JSON/base64 data-URI |
+| `DELETE /chat/media` | JWT + `X-Client-Id` | Pre-RTDB-commit compensation only |
+
+**Authorization (before image processing where practical):** live unlocked sender; peer thread uses PR26 `customerAppId`/`requestWonBy` allow-list (`BID - CONFIRMED` / `REQUEST - CONFIRMED`) without requiring RTDB message; support uses PR27 identity (`admin-{user}`).
+
+**Limits:** JPEG/PNG only (server re-detects); decoded ≤ 2 MB → **413** `CHAT_MEDIA_TOO_LARGE`; unsupported → **415**; invalid → **422**. No server recompression.
+
+**Storage:** `AZURE_CHAT_DOCS_CONTAINER_URL` + `AZURE_CHAT_DOCS_SAS`. Deterministic path `chat/{sha256(threadId)[:32]}/{messageId}.{jpg|png}` (no raw phones). Durable **public** URL (privacy risk). Metadata digest idempotency (`contentsha256` + uploader/thread hashes). Same content → **200 UPLOADED**; different content → **409** `CHAT_MEDIA_CONFLICT`.
+
+**Cleanup:** Re-authorize; require RTDB message **absent**; delete deterministic blob only; missing blob → **DELETED**; message present → **409** `CHAT_MEDIA_ALREADY_COMMITTED`. Not a user deletion API. Best-effort orphans only.
+
+**Legacy:** `POST /uploadchatdoc` remains deployed/unhardened and is **not** the mobile contract. PHP `uploadchatdoc` retained unused by migrated Flutter. No worker changes. No DB migration.
+
+Env:
+
+```
+AZURE_CHAT_DOCS_CONTAINER_URL=
+AZURE_CHAT_DOCS_SAS=
+# RATE_LIMIT_CHAT_MEDIA_SENDER_PER_MIN=20
+# RATE_LIMIT_CHAT_MEDIA_PAIR_PER_MIN=15
+```
+
+```bash
+./bin/pytest tests/test_pr28_chat_media.py -q
+./bin/pytest tests/test_pr26_chat_notifications.py tests/test_pr27_support_chat.py -q
+```
+
+## PR29 — Missing Location Report
+
+| Endpoint | Auth | Notes |
+|----------|------|-------|
+| `POST /location-reports` | JWT + `X-Client-Id` | CityPointModal uncatalogued pickup/drop reports only |
+
+**Not** `POST /sendemail` (PR31: internal-key restricted + hidden from OpenAPI; PR29 does not depend on it). **Not** a catalog insert.
+
+**Auth / lifecycle:** JWT `sub` loads `usertable`. Missing/tombstoned → **404** `USER_NOT_FOUND`. `lockApp` → **403** `ACCOUNT_LOCKED`. Customer and vendor modes allowed (no `vendorApproved` gate).
+
+**Request** (`extra=forbid`):
+
+```json
+{
+  "locationName": "…",
+  "landmark": "…",
+  "regionId": 123,
+  "regionOther": false,
+  "usageType": "PICKUP"
+}
+```
+
+Others: `regionId: null`, `regionOther: true`. `usageType` is `PICKUP` or `DROP` only. Reject client phone/userAppId and any email-routing fields.
+
+**Region:** authoritative `regiondetails` lookup → canonical name; unknown id → **404** `REGION_NOT_FOUND`. No location/region table writes.
+
+**Validation:** trim; location 2–120; landmark 2–250; Unicode allowed; reject controls/CRLF/HTML/script/null.
+
+**Email:** env-owned recipients/from; fixed escaped HTML template; subject `OpenBid Missing Location Report — Pickup|Drop` (no phone in subject). Sync SMTP via `utils/email.py`. Success only after SMTP acceptance → `{ "message": "REPORT_SUBMITTED" }`. No BackgroundTasks / outbox / report table.
+
+Env:
+
+```
+LOCATION_REPORT_EMAIL_TO=
+LOCATION_REPORT_EMAIL_CC=
+LOCATION_REPORT_EMAIL_BCC=
+LOCATION_REPORT_EMAIL_FROM=customersupport@wizzride.com
+# Existing SMTP (required for delivery; never commit real secrets):
+# SMTP_CUSTOMERSUPPORT_USERNAME=
+# SMTP_CUSTOMERSUPPORT_PASSWORD=
+# SMTP_RESERVATIONS_USERNAME=
+# SMTP_RESERVATIONS_PASSWORD=
+# SMTP_FALLBACK_USERNAME=
+# SMTP_FALLBACK_PASSWORD=
+```
+
+Missing/invalid `LOCATION_REPORT_EMAIL_TO` or unsupported from → **503** `LOCATION_REPORT_CONFIGURATION_INVALID`. SMTP failure → **503** `LOCATION_REPORT_DELIVERY_FAILED` (no provider text).
+
+**Rate limits** (`api_rate_limit_buckets`; shared helper may fail-open on DB errors): 5/hour/user; 1/day/user+normalized location+canonical region+usageType → **429** `LOCATION_REPORT_RATE_LIMITED`.
+
+```bash
+./bin/pytest tests/test_pr29_new_location_report.py -q
+./bin/pytest tests/test_pr7_catalogs.py tests/test_pr16_vendor_onboarding.py -q
+```
+
+## PR30 — Customer Feedback Dead-Code Cleanup (no new API)
+
+PR30 did **not** add a customer-feedback API.
+
+* Mobile **Contact Us** uses PR27 support chat (`GET /chat/support/config` + RTDB + `POST /chat/notifications`), not email.
+* Orphaned Flutter PHP `page: sendemail` client (`Csr_Send_Feedback`) was removed; **no Flutter caller** of PHP or generic FastAPI email remains for customer feedback.
+* Dedicated missing-location email remains **`POST /location-reports`** (PR29).
+* Generic FastAPI **`POST /sendemail`** is **PR31-restricted**: JWT + `X-OpenBid-Internal-Key`, hidden from OpenAPI, recipient allow-list, fixed sender, plain text, no CC/BCC/attachments, fail-closed rate limits. Ordinary customer/vendor JWT alone → **403**. Still not for mobile clients. Future removal after ~30-day monitoring.
+* PHP `sendemail` handlers remain legacy/untrusted and deployed; Flutter-targeted `websocket-servermq` lacks the handler in the checked-in repository; richer PHP trees still contain insecure client-controlled email behavior and hardcoded credential debt.
+
+```bash
+# No PR30 backend endpoint tests — regressions only:
+./bin/pytest tests/test_pr29_new_location_report.py tests/test_pr27_support_chat.py tests/test_pr26_chat_notifications.py tests/test_pr25_notification_dispatch.py -q
+```
+
+## PR31 — Generic Email Route Hardening
+
+| Endpoint | Auth | OpenAPI | Notes |
+|----------|------|---------|-------|
+| `POST /sendemail` | JWT + `X-Client-Id` + `X-OpenBid-Internal-Key` | **Hidden** | Restricted internal plain-text mail only |
+
+**Not** for ordinary mobile JWTs. Dedicated flows (PR16 / PR29 / car / driver) continue to call in-process `utils.email.send_email` and do **not** use this HTTP route.
+
+**Request** (`InternalEmailSendRequest`, `extra=forbid`):
+
+```json
+{
+  "purpose": "OPERATIONS",
+  "toAddress": "ops@example.com",
+  "subject": "…",
+  "message": "…"
+}
+```
+
+`purpose` ∈ `ADMIN_TEST` | `OPERATIONS` | `MIGRATION_COMPAT`. Rejects `fromAddress`, CC/BCC, attachments, templates, HTML flags, identity fields, internal key in body.
+
+**Auth / lifecycle:** Missing/invalid JWT → **401**. Missing/invalid/unset internal key → **403** `INTERNAL_EMAIL_ACCESS_REQUIRED`. Missing/tombstoned user → **404** `USER_NOT_FOUND`. `lockApp` → **403** `ACCOUNT_LOCKED`.
+
+**Recipient policy:** `INTERNAL_EMAIL_ALLOWED_RECIPIENTS` and/or `INTERNAL_EMAIL_ALLOWED_DOMAINS` (comma-separated). Empty both → fail closed **503** `INTERNAL_EMAIL_CONFIGURATION_INVALID`. Disallowed recipient → **403** `INTERNAL_EMAIL_RECIPIENT_NOT_ALLOWED`.
+
+**Sender:** `INTERNAL_EMAIL_FROM` (default `customersupport@wizzride.com`); must be in helper SMTP map. Unsupported → **503** `INTERNAL_EMAIL_CONFIGURATION_INVALID`.
+
+**Content:** subject ≤200, message ≤20 000; reject CR/LF/null/controls in subject; plain text only (`is_html=False`).
+
+**Rate limits** (fail-closed): 5/min, 30/hour, 100/day per hashed caller; 10/hour exact recipient; 20/hour recipient domain; duplicate same caller+recipient+subject+body → **429** `INTERNAL_EMAIL_DUPLICATE_SUPPRESSED` (5 min). Over limit → **429** `INTERNAL_EMAIL_RATE_LIMITED`.
+
+**Success:** `{ "message": "SENT" }`. Delivery/config failures → safe **503** codes (no provider text).
+
+**Helper:** `send_email(..., is_html=True)` default preserved for PR16/PR29/car/driver.
+
+**PHP:** unchanged. **Credentials:** rotate operationally (see checklist in PR31 plan); do not claim rotation completed.
+
+**Future removal:** monitor denied/success traffic ~30 days, migrate any legitimate callers to dedicated endpoints, then remove route in a later approved PR.
+
+```bash
+./bin/pytest tests/test_pr31_generic_email_security.py -q
+./bin/pytest tests/test_pr29_new_location_report.py tests/test_pr16_vendor_onboarding.py -q
 ```

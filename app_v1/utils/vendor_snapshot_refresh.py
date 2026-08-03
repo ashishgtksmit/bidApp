@@ -1,13 +1,10 @@
-"""PR18 — post-commit vendor snapshot refresh for preference updates.
+"""Post-commit WSS snapshot refresh via openbid-worker ``POST /build_snapshot``.
 
-Propagation mechanism (chosen):
-  After a successful preference mutation commit, FastAPI invokes the existing
-  openbid-worker HTTP endpoint ``POST /build_snapshot`` with
-  ``{"appid": <jwt_sub>, "flag": "Vendor"}``.
+PR18 introduced Vendor-only preference refresh. PR19 generalizes the helper so
+review mutations can refresh the rated user's Vendor or Customer snapshot.
 
-  That reuses the worker's ``fetch_vendor_data`` builder, writes
-  ``ws:snapshot:Vendor:{appid}``, and publishes on ``ws_updates`` so
-  already-connected WSS clients receive the normal Vendor snapshot shape.
+Payload:
+  ``{"appid": "<userAppId>", "flag": "Vendor"|"Customer"}``
 
 Environment (same convention as openbid-ws):
   * ``WORKER_BASE_URL`` — e.g. ``https://<funcapp>.azurewebsites.net/api``
@@ -15,9 +12,9 @@ Environment (same convention as openbid-ws):
 
 Rules:
   * Call only AFTER DB commit
-  * Never raise into the preference API (business update stays committed)
-  * Log only safe operational metadata (appid length / status), never prefs/JWT
-  * Same-value preference replay should skip this hook (caller responsibility)
+  * Never raise into the business API (mutation stays committed)
+  * Log only safe operational metadata (appid length / status / flag)
+  * Never log review text, phones as values, JWTs, or rating payloads
 """
 
 from __future__ import annotations
@@ -29,6 +26,8 @@ from typing import Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_FLAGS = frozenset({"Vendor", "Customer"})
 
 
 def _worker_base_url() -> Optional[str]:
@@ -47,21 +46,29 @@ def _worker_function_key() -> Optional[str]:
     return None
 
 
-def request_vendor_snapshot_refresh(user_app_id: str) -> bool:
-    """Ask worker to rebuild+publish the Vendor snapshot for one appid.
+def request_snapshot_refresh(user_app_id: str, *, flag: str = "Vendor") -> bool:
+    """Ask worker to rebuild+publish one user's snapshot.
 
     Returns True when the worker HTTP call reports success; False otherwise.
     Never raises.
     """
     appid = (user_app_id or "").strip()
+    snapshot_flag = (flag or "").strip()
     if not appid:
-        logger.warning("vendor_snapshot_refresh skipped: empty appid")
+        logger.warning("snapshot_refresh skipped: empty appid")
+        return False
+    if snapshot_flag not in _ALLOWED_FLAGS:
+        logger.warning(
+            "snapshot_refresh skipped: invalid flag (appid_len=%s)",
+            len(appid),
+        )
         return False
 
     base = _worker_base_url()
     if not base:
         logger.warning(
-            "vendor_snapshot_refresh skipped: WORKER_BASE_URL unset (appid_len=%s)",
+            "snapshot_refresh skipped: WORKER_BASE_URL unset (flag=%s appid_len=%s)",
+            snapshot_flag,
             len(appid),
         )
         return False
@@ -72,27 +79,35 @@ def request_vendor_snapshot_refresh(user_app_id: str) -> bool:
     if function_key:
         params["code"] = function_key
 
-    payload = {"appid": appid, "flag": "Vendor"}
+    payload = {"appid": appid, "flag": snapshot_flag}
     try:
         with httpx.Client(timeout=15.0) as client:
             resp = client.post(url, params=params, json=payload)
     except Exception:
         logger.exception(
-            "vendor_snapshot_refresh HTTP error (appid_len=%s)",
+            "snapshot_refresh HTTP error (flag=%s appid_len=%s)",
+            snapshot_flag,
             len(appid),
         )
         return False
 
     if resp.status_code != 200:
         logger.warning(
-            "vendor_snapshot_refresh non-200 status=%s appid_len=%s",
+            "snapshot_refresh non-200 status=%s flag=%s appid_len=%s",
             resp.status_code,
+            snapshot_flag,
             len(appid),
         )
         return False
 
     logger.info(
-        "vendor_snapshot_refresh ok appid_len=%s",
+        "snapshot_refresh ok flag=%s appid_len=%s",
+        snapshot_flag,
         len(appid),
     )
     return True
+
+
+def request_vendor_snapshot_refresh(user_app_id: str) -> bool:
+    """PR18-compatible Vendor snapshot refresh wrapper."""
+    return request_snapshot_refresh(user_app_id, flag="Vendor")

@@ -22,12 +22,15 @@ def enforce_rate_limit(
     bucket_key: str,
     max_hits: int,
     window_seconds: int,
+    fail_closed: bool = False,
 ) -> Optional[ErrorResponse]:
     """
     Increment a shared counter for (bucket_key, window).
 
     Returns ErrorResponse(message="RATE_LIMITED") when over limit, else None.
-    Fail-open on unexpected DB errors so auth flows are not hard-blocked by limiter faults.
+    By default fail-open on unexpected DB errors so auth flows are not
+    hard-blocked by limiter faults. Pass ``fail_closed=True`` for high-risk
+    routes (PR31 internal email) that must deny on limiter failure.
     """
     if max_hits <= 0 or window_seconds <= 0:
         return None
@@ -69,6 +72,8 @@ def enforce_rate_limit(
                     .first()
                 )
                 if row is None:
+                    if fail_closed:
+                        return ErrorResponse(message="RATE_LIMITED")
                     return None
                 row.hit_count = (row.hit_count or 0) + 1
                 db.commit()
@@ -81,6 +86,8 @@ def enforce_rate_limit(
         return None
     except SQLAlchemyError:
         db.rollback()
+        if fail_closed:
+            return ErrorResponse(message="RATE_LIMITED")
         return None
 
 

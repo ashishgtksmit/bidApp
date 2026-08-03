@@ -1,60 +1,65 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional
-from datetime import datetime,time,date
+"""PR19 public-safe customer review schemas.
 
+Create body accepts only RID + RATING + COMMENTS.
+Identity is derived from JWT + request row.
+Half-step / text validation is enforced in CRUD with hard HTTPException details.
+"""
 
-class CustomerReviewBase(BaseModel):
-    generalRating : Optional[str] = None
-    comments : Optional[str] = None
+from __future__ import annotations
 
-    model_config={"from_attributes":True}
+from datetime import date
+from typing import Any, Optional, Union
+
+from pydantic import BaseModel, field_validator
+
 
 class CreateCustomerReview(BaseModel):
-    RID : int
-    VENDORID : int
-    CUSTOMERID : int
-    RATING : float
-    COMMENTS : Optional[str] = None
+    """Vendor → customer review insert (PR19)."""
 
-    @field_validator('RID','VENDORID','CUSTOMERID')
+    RID: int
+    RATING: Any
+    COMMENTS: Optional[Any] = ""
+
+    @field_validator("RID")
     @classmethod
-    def not_empt(cls, v):
-        if not v:
-            raise ValueError('FIELD_EMPTY_ERROR')
-        return v
-    
-    @field_validator('RATING')
-    @classmethod
-    def validate_rating(cls,v):
-        if v is None or not (0<= v <= 5):
-            raise ValueError("RATING_FIELD_ERROR")
-        return v
-    
-    model_config={"from_attributes":True}
+    def rid_positive(cls, v: int) -> int:
+        if isinstance(v, bool) or v is None or int(v) <= 0:
+            raise ValueError("INVALID_RID")
+        return int(v)
 
-class UpdateCustomerReview(BaseModel):
-    generalRating : Optional[str] = None
-    comments : Optional[str] = None
+    model_config = {"from_attributes": True}
 
-    model_config={"from_attributes":True}
 
-class CustomerReviewDetail(BaseModel):
-    RID : int
-    ratingGiverUserAppId : Optional[str] = Field(alias="ratingGivenBy")
-    ratingReceiverUserAppId : Optional[str] = Field(alias="ratingReceivedBy")
-    vendorFullName: Optional[str] = None
-    vendorProfilePicture: Optional[str] = None
+class CustomerReviewSummaryResponse(BaseModel):
+    """Public-safe customer (passenger) review list item (PR19)."""
+
+    reviewId: int
+    requestId: int
+    generalRating: float
+    comments: str = ""
+    travelDate: Optional[date] = None
     fromLocation: Optional[str] = None
-    fromLandmark: Optional[str] = None
     toLocation: Optional[str] = None
-    toLandmark: Optional[str] = None
-    pickUpDate: Optional[date] = None
-    pickUpTime: Optional[time] = None
-     
-    model_config={"from_attributes":True}
+    reviewerDisplayName: Optional[str] = None
+    reviewerProfileImageUrl: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class CustomerReviewInsertResponse(BaseModel):
+    message: str = "INSERTED"
+
+
+class CustomerReviewDetail(CustomerReviewSummaryResponse):
+    pass
+
 
 class NoReviewResponse(BaseModel):
-    message : str
+    message: str
 
 
+class UpdateCustomerReview(BaseModel):
+    generalRating: Optional[Union[str, float]] = None
+    comments: Optional[str] = None
 
+    model_config = {"from_attributes": True}

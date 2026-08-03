@@ -1,7 +1,11 @@
 import base64
 import binascii
+import io
+import logging
+import time
 from zoneinfo import ZoneInfo
 
+from PIL import Image
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -37,12 +41,26 @@ from ..utils.email import send_email
 from ..utils.fcm import subscribe_token_to_topics, TOPIC_ALL_USERS, TOPIC_ALL_VENDORS, unsubscribe_token_from_topics
 from ..services.vendor_filtering import get_all_vendors_enriched
 from datetime import date, datetime
-from typing import Optional
+from typing import Optional, Tuple
 from fastapi import HTTPException, status
 import re
 import os
 import html
 from ..models.request_table import Request
+from ..models.driver_details import DriverDetail
+from ..utils.security import verify_and_update_password
+
+_logger = logging.getLogger(__name__)
+
+_MAX_PROFILE_IMAGE_BYTES = 2 * 1024 * 1024
+_PROFILE_ALLOWED_FORMATS = {
+    "jpeg": ("image/jpeg", "jpg"),
+    "jpg": ("image/jpeg", "jpg"),
+    "png": ("image/png", "png"),
+}
+_PROFILE_ALLOWED_MIMES = {"image/jpeg", "image/png"}
+# Practical decompression-bomb guard (~25MP); Pillow default is higher.
+_PROFILE_MAX_IMAGE_PIXELS = 25_000_000
 
 def _vendor_rating_float(rating) -> float | None:
     if rating is None:
@@ -108,6 +126,7 @@ def get_users_all(db:Session):
         db.close()
     
 def get_user_details(db: Session, userAppId : str):
+    """PR6 session profile row(s). Does not close the request-scoped session."""
     try:
         users = db.query(User).filter(User.userAppId == str(userAppId).strip()).all()
 
@@ -117,8 +136,6 @@ def get_user_details(db: Session, userAppId : str):
         return [_to_get_user_details_response(user) for user in users]
     except SQLAlchemyError:
         return ErrorResponse(message="ERROR_PREPARE")
-    finally:
-        db.close()
 
 
 def check_user(db:Session, user_app_id : str):
@@ -781,60 +798,241 @@ def logout_user(db: Session, user_app_id: str):
 #     finally:
 #         db.close()
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+_DELETION_ACTIVE_BID_STATUSES = frozenset(
+    {"BID - OPEN", "BID - CONFIRMED", "REQUEST - CONFIRMED"}
+)
+_DELETION_CANCELLED_REQUEST_STATUSES = frozenset(
+    {
+        "REQUEST - CANCELLED BY USER",
+        "BOOKING - CANCELLED BY USER",
+    }
+)
+_USER_APP_ID_MAX_LEN = 64
 
-def delete_user(db: Session, user_data: UserDelete):
-    try:
-        # 1) Fetch the user (and validate password) in one go; no nested login call
-        user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
-        if not user:
-            return ErrorResponse(message="NOT_REGISTERED")
-        if user.password != user_data.password:
-            return ErrorResponse(message="USERNAME OR PASSWORD WRONG")
 
-        # 2) Build a unique deleted-ID: "<orig> DELETED", "<orig> DELETED1", "<orig> DELETED2", ...
-        base = f"{user_data.userAppId}.DELETED"
-        unique_deleted_id = base
-        counter = 1
+def _request_pickup_datetime(request_row: Request) -> datetime:
+    return datetime.combine(request_row.pickUpDate, request_row.pickUpTime)
 
-        # Check collisions against userAppId == candidate, not the original
-        while db.query(User).filter(User.userAppId == unique_deleted_id).first():
-            unique_deleted_id = f"{base}{counter}"
-            counter += 1
-            if counter > 1000:  # safety valve
-                return ErrorResponse(message="DELETE_ID_GENERATION_FAILED")
-        print(unique_deleted_id)
-        # 3) Update the same user row
-        updated = (
-            db.query(User)
-            .filter(
-                User.userAppId == user_data.userAppId,
-                User.password == user_data.password
-            )
-            .update({
-                User.userAppId: unique_deleted_id,
-                User.lockApp : True,
-                User.user_login_status: "LOGGEDOUT",
-                User.deletionReason: user_data.deletionReason,
-                User.tableTimestamp: func.current_timestamp(),
-            }, synchronize_session=False)
+
+def _evaluate_deletion_lifecycle_gates(db: Session, jwt_sub: str) -> None:
+    """Return the first blocking lifecycle gate as HTTP 409, else None."""
+    now_ist = _ist_now_naive()
+
+    open_req = (
+        db.query(Request.RID)
+        .filter(
+            Request.customerAppId == jwt_sub,
+            Request.requestStatus == "BID - OPEN",
+        )
+        .first()
+    )
+    if open_req is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="DELETION_BLOCKED_OPEN_REQUEST",
         )
 
+    handshake = (
+        db.query(Request.RID)
+        .filter(
+            Request.customerAppId == jwt_sub,
+            Request.requestStatus == "BID - CONFIRMED",
+        )
+        .first()
+    )
+    if handshake is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="DELETION_BLOCKED_HANDSHAKE",
+        )
+
+    future_customer = (
+        db.query(Request)
+        .filter(
+            Request.customerAppId == jwt_sub,
+            Request.requestStatus == "REQUEST - CONFIRMED",
+        )
+        .all()
+    )
+    for row in future_customer:
+        if _request_pickup_datetime(row) >= now_ist:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="DELETION_BLOCKED_FUTURE_BOOKING",
+            )
+
+    future_vendor = (
+        db.query(Request)
+        .filter(
+            Request.requestWonBy == jwt_sub,
+            Request.requestStatus == "REQUEST - CONFIRMED",
+        )
+        .all()
+    )
+    for row in future_vendor:
+        if _request_pickup_datetime(row) >= now_ist:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="DELETION_BLOCKED_FUTURE_VENDOR_TRIP",
+            )
+
+    bidder_key = int(jwt_sub) if jwt_sub.isdigit() else None
+    if bidder_key is not None:
+        active_bids = (
+            db.query(BidDetail, Request)
+            .join(Request, Request.RID == BidDetail.rID)
+            .filter(
+                BidDetail.bidderID == bidder_key,
+                BidDetail.bidStatus.in_(tuple(_DELETION_ACTIVE_BID_STATUSES)),
+            )
+            .all()
+        )
+        for _bid, req in active_bids:
+            status_text = str(getattr(req, "requestStatus", "") or "")
+            if status_text not in _DELETION_CANCELLED_REQUEST_STATUSES:
+                if status_text in _DELETION_ACTIVE_BID_STATUSES:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="DELETION_BLOCKED_ACTIVE_BID",
+                    )
+
+    drivers = (
+        db.query(DriverDetail)
+        .filter(DriverDetail.userAppId == jwt_sub)
+        .all()
+    )
+    driver_ids = [
+        int(d.DDID)
+        for d in drivers
+        if getattr(d, "DDID", None) is not None
+    ]
+    if driver_ids:
+        assigned = (
+            db.query(Request)
+            .filter(
+                Request.driverAssignedID.in_(driver_ids),
+                Request.requestStatus == "REQUEST - CONFIRMED",
+            )
+            .all()
+        )
+        for row in assigned:
+            if _request_pickup_datetime(row) >= now_ist:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="DELETION_BLOCKED_ASSIGNED_DRIVER",
+                )
+
+
+def _generate_unique_tombstone_id(db: Session, original_user_app_id: str) -> str:
+    """Canonical FastAPI tombstone: {id}.DELETED, {id}.DELETED1, ..."""
+    base = f"{original_user_app_id}.DELETED"
+    if len(base) > _USER_APP_ID_MAX_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ACCOUNT_DELETION_FAILED",
+        )
+    candidate = base
+    counter = 1
+    while db.query(User).filter(User.userAppId == candidate).first() is not None:
+        candidate = f"{base}{counter}"
+        if len(candidate) > _USER_APP_ID_MAX_LEN:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ACCOUNT_DELETION_FAILED",
+            )
+        counter += 1
+        if counter > 1000:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ACCOUNT_DELETION_FAILED",
+            )
+    return candidate
+
+
+def delete_user(db: Session, user_data: UserDelete, user_id: str):
+    """PR24 JWT-owned soft tombstone deletion.
+
+    Does not close the request-scoped DB session.
+    Does not hard-delete related rows, blobs, or chat.
+    """
+    jwt_sub = str(user_id).strip()
+    _reject_user_app_id_mismatch(jwt_sub, getattr(user_data, "userAppId", None))
+
+    old_token: Optional[str] = None
+    topics = [TOPIC_ALL_USERS]
+    also_vendor = False
+
+    try:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None or _is_tombstone_user(user):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
+
+        ok, new_hash = verify_and_update_password(
+            user_data.password,
+            user.password,
+        )
+        if not ok:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="WRONG_PASSWORD",
+            )
+        # Password upgrade participates in the same deletion transaction only.
+        if new_hash:
+            user.password = new_hash
+
+        _evaluate_deletion_lifecycle_gates(db, jwt_sub)
+
+        tombstone_id = _generate_unique_tombstone_id(db, jwt_sub)
+
+        old_token = (user.fcmToken or "").strip()
+        also_vendor = bool(getattr(user, "alsoVendor", False))
+        if also_vendor:
+            topics.append(TOPIC_ALL_VENDORS)
+
+        user.userAppId = tombstone_id
+        user.lockApp = True
+        user.user_login_status = "LOGGEDOUT"
+        user.deletionReason = user_data.deletionReason
+        user.fcmToken = None
+        user.tableTimestamp = _ist_now_naive()
+
         db.commit()
+        _logger.info("account_deletion_committed")
 
-        if updated > 0:
-            return ErrorResponse(message="DELETED")
-        else:
-            return ErrorResponse(message="NOT DELETED")
-
-    except SQLAlchemyError as e:
+    except HTTPException:
         db.rollback()
-        print(str(e))
-        return ErrorResponse(message="ERROR")
-    finally:
-        db.close()
-    
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        _logger.exception("account_deletion_failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ACCOUNT_DELETION_FAILED",
+        ) from None
+    except Exception:
+        db.rollback()
+        _logger.exception("account_deletion_failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ACCOUNT_DELETION_FAILED",
+        ) from None
+
+    if old_token and old_token.lower() not in {"null", "none", "na"}:
+        try:
+            unsubscribe_token_from_topics(old_token, topics)
+        except Exception:
+            _logger.info("account_deletion_fcm_unsubscribe_failed")
+
+    return ErrorResponse(message="DELETED")
+ 
 def update_vendor_bank_details(
     db: Session,
     user_data: UserBankDetailsUpdate,
@@ -891,125 +1089,272 @@ def update_vendor_bank_details(
             detail="Unable to update bank details",
         ) from None
 
-# def profile_image_upload(db: Session, user_data : UserImageUpload):
-#     try : 
-#         with db.begin():
-#             user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
-#             if not user:
-#                 return ErrorResponse(message="NOT_FOUND")
-            
-#             #Upload Image
-#             base_dir = os.path.join(os.path.dirname(__file__),'..','profilePicture')
-#             base_url = "http://43.204.100.185/bidApp/websocket-servermq/profilePicture"
-#             file_stem = re.sub(r'[^A-Za-z0-9_\-\.]', '', user_data.name.replace(' ', '_'))
-#             upload_result = upload_image(user_data.image, base_dir, file_stem, base_url)
-
-#             if upload_result["message"] != "UPLOADED":
-#                 return ErrorResponse(message=upload_result["message"])
-            
-#             #update Profile Picture
-
-#             update = db.query(User).filter(User.userAppId == user_data.userAppId).update({
-#                 User.profilePicture : upload_result["url"],
-#                 User.tableTimestamp : func.current_timestamp()
-#             })
-
-#             db.commit()
-
-#             if update > 0 :
-#                 return ImageResponse(message="UPLOADED", url=upload_result["url"])
-#         return EmailErrorResponse(message="ERROR_UPDATE", error="Database update failed")
+def _profile_blob_path_key(url: Optional[str]) -> str:
+    """URL without query string for same-path overwrite comparison."""
+    if not url:
+        return ""
+    return str(url).split("?", 1)[0].strip()
 
 
-#     except SQLAlchemyError as e:
-#         db.rollback()
-#         return EmailErrorResponse(message="ERROR_UPDATE", error=str(e))
-#     finally:
-#         db.close()
+def _is_tombstone_user(user: User) -> bool:
+    """Deleted / renamed tombstone rows (``*.DELETED*``) may not update profile images."""
+    app_id = str(getattr(user, "userAppId", "") or "")
+    return ".DELETED" in app_id.upper()
 
 
-def profile_image_upload(db: Session, user_data):
-    """
-    PHP-equivalent behavior of imageUpload():
-    - requires image and userAppId
-    - uploads to Azure using stable filename {APPID}_profile.jpg
-    - updates userTable.profilePicture
-    """
+def _decode_profile_image_payload(raw: str) -> Tuple[bytes, Optional[str]]:
+    """Decode raw or data-URI base64. Returns (bytes, claimed_mime_or_None)."""
+    image_str = str(raw or "").strip()
+    if not image_str:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        )
+
+    claimed_mime: Optional[str] = None
+    header_match = re.match(
+        r"^data:(image/[a-zA-Z0-9.+-]+);base64,",
+        image_str,
+        flags=re.IGNORECASE,
+    )
+    if header_match:
+        claimed_mime = header_match.group(1).lower()
+        if claimed_mime == "image/jpg":
+            claimed_mime = "image/jpeg"
+        image_str = image_str[len(header_match.group(0)) :]
+    elif image_str.lower().startswith("data:"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        )
+
+    clean = re.sub(r"\s+", "", image_str)
+    if not clean:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        )
 
     try:
-        image = getattr(user_data, "image", None)
-        app_id = getattr(user_data, "userAppId", None)
+        binary = base64.b64decode(clean, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        ) from None
 
-        if not image or not app_id:
-            return ErrorResponse(message="INVALID_INPUT")
+    if not binary:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        )
 
-        image_str = str(image).strip()
-        app_id = str(app_id).strip()
+    return binary, claimed_mime
 
-        # Optional header stripping like PHP
-        if re.match(r"^data:image/\w+;base64,", image_str, flags=re.IGNORECASE):
-            image_str = re.sub(r"^data:image/\w+;base64,", "", image_str, flags=re.IGNORECASE)
 
-        # Base64 validation
+def _validate_profile_image_bytes(
+    binary: bytes,
+    claimed_mime: Optional[str],
+) -> Tuple[str, str]:
+    """Validate decoded bytes; return (mime, ext) for JPEG/PNG only."""
+    if len(binary) > _MAX_PROFILE_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="PROFILE_IMAGE_TOO_LARGE",
+        )
+
+    if claimed_mime is not None and claimed_mime not in _PROFILE_ALLOWED_MIMES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="UNSUPPORTED_PROFILE_IMAGE_TYPE",
+        )
+
+    previous_max = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = _PROFILE_MAX_IMAGE_PIXELS
+    try:
         try:
-            binary = base64.b64decode(image_str, validate=True)
-        except (binascii.Error, ValueError):
-            return ErrorResponse(message="INVALID_IMAGE")
+            with Image.open(io.BytesIO(binary)) as img:
+                img.verify()
+                fmt = (img.format or "").lower()
+        except Image.DecompressionBombError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="INVALID_PROFILE_IMAGE",
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="INVALID_PROFILE_IMAGE",
+            ) from None
 
-        if not binary:
-            return ErrorResponse(message="INVALID_IMAGE")
+        try:
+            with Image.open(io.BytesIO(binary)) as img:
+                img.load()
+                fmt = (img.format or fmt or "").lower()
+        except Image.DecompressionBombError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="INVALID_PROFILE_IMAGE",
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="INVALID_PROFILE_IMAGE",
+            ) from None
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous_max
 
-        # Rebuild data URI for azure helper if needed
-        # PHP always stores as .jpg with stable name
-        # We keep stable naming parity here.
-        normalized_base64 = "data:image/jpeg;base64," + base64.b64encode(binary).decode("utf-8")
+    if fmt not in _PROFILE_ALLOWED_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="UNSUPPORTED_PROFILE_IMAGE_TYPE",
+        )
 
-        blob_name = f"{app_id}_profile"
+    mime, ext = _PROFILE_ALLOWED_FORMATS[fmt]
+    if claimed_mime is not None and claimed_mime != mime:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="INVALID_PROFILE_IMAGE",
+        )
+
+    return mime, ext
+
+
+def _append_cache_buster(file_url: str) -> str:
+    """Always append a fresh ``v=`` so successive uploads differ."""
+    url = str(file_url)
+    if "?" in url:
+        base, query = url.split("?", 1)
+        parts = [p for p in query.split("&") if p and not p.startswith("v=")]
+        stamp = str(int(time.time() * 1000))
+        if parts:
+            return f"{base}?{'&'.join(parts)}&v={stamp}"
+        return f"{base}?v={stamp}"
+    return f"{url}?v={int(time.time() * 1000)}"
+
+
+def _safe_delete_blob(url: Optional[str]) -> None:
+    if not url:
+        return
+    try:
+        azure_blob_delete_by_url(url)
+    except Exception:
+        _logger.warning("profile_image_blob_cleanup_failed")
+
+
+def profile_image_upload(db: Session, user_data: UserImageUpload, user_id: str):
+    """PR23 JWT-owned profile-image upload.
+
+    Updates only ``profilePicture``. Does not close the request-scoped session.
+    """
+    jwt_sub = str(user_id or "").strip()
+    if not jwt_sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+
+    _reject_user_app_id_mismatch(jwt_sub, getattr(user_data, "userAppId", None))
+
+    binary, claimed_mime = _decode_profile_image_payload(getattr(user_data, "image", ""))
+    mime, _ext = _validate_profile_image_bytes(binary, claimed_mime)
+
+    normalized_base64 = (
+        f"data:{mime};base64," + base64.b64encode(binary).decode("ascii")
+    )
+    blob_name = f"{jwt_sub}_profile"
+
+    new_blob_url: Optional[str] = None
+    old_url: Optional[str] = None
+    committed = False
+
+    try:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
+        if _is_tombstone_user(user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="PROFILE_UPDATE_NOT_ALLOWED",
+            )
+
+        old_url = getattr(user, "profilePicture", None)
 
         ok, file_url = azure_blob_upload(
             blob_name=blob_name,
             base64_data=normalized_base64,
-            make_public=True,   # profile pictures should be publicly accessible like PHP URL usage
-            container_type="profile" if "container_type" in azure_blob_upload.__code__.co_varnames else None
+            make_public=True,
+            max_upload_bytes=_MAX_PROFILE_IMAGE_BYTES,
         )
-
         if not ok:
-            # try to mimic PHP style if helper returned code-like error
-            return ErrorResponse(message=str(file_url or "AZURE_UPLOAD_FAILED"))
-
-        # Add cache-buster like PHP ?v=time()
-        # only if helper returned clean URL without query
-        if "?v=" not in str(file_url):
-            import time
-            separator = "&" if "?" in str(file_url) else "?"
-            file_url = f"{file_url}{separator}v={int(time.time())}"
-
-        updated = (
-            db.query(User)
-            .filter(User.userAppId == app_id)
-            .update(
-                {User.profilePicture: file_url},
-                synchronize_session=False
+            err = str(file_url or "").upper()
+            if "FILE_TOO_LARGE" in err:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail="PROFILE_IMAGE_TOO_LARGE",
+                )
+            if "UNSUPPORTED_IMAGE" in err:
+                raise HTTPException(
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                    detail="UNSUPPORTED_PROFILE_IMAGE_TYPE",
+                )
+            if "INVALID" in err:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="INVALID_PROFILE_IMAGE",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="PROFILE_UPLOAD_FAILED",
             )
-        )
 
-        if updated == 0:
-            db.rollback()
-            return ErrorResponse(message="DB_UPDATE_FAILED")
+        new_blob_url = str(file_url)
+        versioned_url = _append_cache_buster(new_blob_url)
 
+        user.profilePicture = versioned_url
+        user.tableTimestamp = _ist_now_naive()
         db.commit()
-        return ImageResponse(message="UPLOADED", url=file_url)
+        committed = True
 
+        old_key = _profile_blob_path_key(old_url)
+        new_key = _profile_blob_path_key(new_blob_url)
+        if old_key and new_key and old_key != new_key:
+            _safe_delete_blob(old_url)
+
+        return ImageResponse(message="UPLOADED", url=versioned_url)
+
+    except HTTPException:
+        if not committed:
+            db.rollback()
+            if new_blob_url is not None:
+                _safe_delete_blob(new_blob_url)
+        raise
     except SQLAlchemyError:
         db.rollback()
-        return ErrorResponse(message="DB_ERROR")
-
-    except Exception as e:
+        if new_blob_url is not None:
+            _safe_delete_blob(new_blob_url)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PROFILE_UPLOAD_FAILED",
+        ) from None
+    except Exception:
         db.rollback()
-        return ErrorResponse(message=str(e))
-    
+        if new_blob_url is not None:
+            _safe_delete_blob(new_blob_url)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PROFILE_UPLOAD_FAILED",
+        ) from None
 
-    
+
 
 def vendor_update(db : Session, vendor_data : VendorUpdate):    
     try:

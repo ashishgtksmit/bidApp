@@ -10,3 +10,6 @@ venv/
 .DS_Store
 .env
 .env.*.local
+app_v1/.env
+**/.env
+**/.env.local

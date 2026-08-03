@@ -66,7 +66,6 @@ def decode_token(
 ) -> Dict[str,Any]:
     secret = get_signing_secret(db,client_id)
     aud = JWT_AUDIENCE.strip() if JWT_AUDIENCE else None   # defensively strip
-    print(secret)
     try:
         return jwt.decode(
             token,
@@ -77,7 +76,6 @@ def decode_token(
             options={"verify_aud":verify_aud},
         )
     except JWTError as e:
-        print(e)
         raise ValueError(str(e))
         
     

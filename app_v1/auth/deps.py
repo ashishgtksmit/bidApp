@@ -28,7 +28,6 @@ def get_current_user_id(
 ) -> str:
     try:
         token = credentials.credentials  # the raw JWT
-        print(token)
         payload = decode_token(db=db, token=token, client_id=x_client_id)
         if payload.get("type") != "access":
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Token Type")

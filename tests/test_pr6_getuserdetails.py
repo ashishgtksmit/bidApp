@@ -8,20 +8,23 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("JWT_SECRET", "unit-test-jwt-secret")
-
-# crud.user imports FCM helpers that require firebase_admin (not needed here).
-import types
+os.environ.setdefault("JWT_ISSUER", "openbid-test")
+os.environ.setdefault("JWT_AUDIENCE", "openbid-clients")
 
 _fake_firebase = types.ModuleType("firebase_admin")
 _fake_firebase.credentials = types.ModuleType("firebase_admin.credentials")
@@ -30,10 +33,15 @@ sys.modules.setdefault("firebase_admin", _fake_firebase)
 sys.modules.setdefault("firebase_admin.credentials", _fake_firebase.credentials)
 sys.modules.setdefault("firebase_admin.messaging", _fake_firebase.messaging)
 
-from app_v1.database import Base  # noqa: E402
+from app_v1.database import Base, get_db  # noqa: E402
+from app_v1.auth.deps import get_current_user_id  # noqa: E402
 from app_v1.models.user_table import User  # noqa: E402
 from app_v1.schemas.user_table import GetUserDetailsResponse, NoUserResponse  # noqa: E402
 from app_v1.crud.user import get_user_details  # noqa: E402
+from app_v1.endpoints.user import router as user_router  # noqa: E402
+
+CUSTOMER_ID = "7022359323"
+OTHER_USER = "7000000002"
 
 
 @pytest.fixture()
@@ -163,3 +171,59 @@ def test_getuserdetails_missing_user(db):
     result = get_user_details(db, userAppId="0000000000")
     assert isinstance(result, NoUserResponse)
     assert result.message == "NO REGISTERED"
+
+
+def _memory_db():
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine, tables=[User.__table__])
+    Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    return engine, Session
+
+
+def _endpoint_client(engine, Session, user_id: str):
+    app = FastAPI()
+    app.include_router(user_router)
+
+    def _override_db():
+        db = Session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_current_user_id] = lambda: user_id
+    return TestClient(app)
+
+
+@pytest.fixture()
+def endpoint_db():
+    engine, Session = _memory_db()
+    db = Session()
+    try:
+        yield db, engine, Session
+    finally:
+        db.close()
+
+
+def test_getuserdetails_endpoint_matching_user_app_id_succeeds(endpoint_db):
+    db, engine, Session = endpoint_db
+    _add_customer(db, user_app_id=CUSTOMER_ID)
+    client = _endpoint_client(engine, Session, CUSTOMER_ID)
+    response = client.get("/getuserdetails", params={"userAppId": CUSTOMER_ID})
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["USERAPPID"] == CUSTOMER_ID
+    assert row["FULLNAME"] == "Customer User"
+
+
+def test_getuserdetails_endpoint_mismatched_user_app_id_403(endpoint_db):
+    db, engine, Session = endpoint_db
+    _add_customer(db, user_app_id=CUSTOMER_ID)
+    client = _endpoint_client(engine, Session, CUSTOMER_ID)
+    response = client.get("/getuserdetails", params={"userAppId": OTHER_USER})
+    assert response.status_code == 403

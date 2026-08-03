@@ -60,9 +60,43 @@ class UserUpdate(User):
     password : Optional[str] = None
 
 class UserDelete(TrimmedBaseModel):
-    userAppId : str
-    password : str
-    deletionReason : str
+    """PR24 authenticated self-account deletion body.
+
+    JWT ``sub`` is authoritative. Optional transitional ``userAppId`` must equal
+    JWT ``sub`` when provided; Flutter must not send it.
+    """
+
+    password: str = Field(..., min_length=1)
+    deletionReason: str = Field(..., min_length=3, max_length=500)
+    userAppId: Optional[str] = None
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def validate_password(cls, v):
+        text = str(v or "").strip()
+        if not text:
+            raise ValueError("password required")
+        return text
+
+    @field_validator("deletionReason", mode="before")
+    @classmethod
+    def validate_deletion_reason(cls, v):
+        if v is None:
+            raise ValueError("deletionReason required")
+        text = str(v).strip()
+        if len(text) < 3:
+            raise ValueError("deletionReason too short")
+        if len(text) > 500:
+            raise ValueError("deletionReason too long")
+        return text
+
+    @field_validator("userAppId", mode="before")
+    @classmethod
+    def validate_optional_user_app_id(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        return text or None
 
 class UserResponse(User):
     UID : int
@@ -213,9 +247,19 @@ class LogoutResponse(TrimmedBaseModel):
     userAppId : str
 
 class UserImageUpload(TrimmedBaseModel):
-    userAppId: str
-    image: str
-    name: str
+    """PR23 profile-image upload body.
+
+    JWT ``sub`` is authoritative. ``userAppId`` is optional transitional
+    compatibility only and must equal JWT ``sub`` when provided.
+    """
+
+    image: str = Field(..., min_length=1)
+    name: Optional[str] = None
+    userAppId: Optional[str] = None
+
+
+# Alias retained for OpenAPI / callers preferring the PR23 name.
+ProfileImageUploadRequest = UserImageUpload
 
 class VendorUpdate(TrimmedBaseModel):
     alsoVendor : bool

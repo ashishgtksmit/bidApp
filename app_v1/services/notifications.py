@@ -251,6 +251,11 @@ def _clean_token(token: Optional[str]) -> str:
     return token
 
 
+def _is_tombstone_user_app_id(user_app_id: Optional[str]) -> bool:
+    """PR24 soft-tombstone ids contain ``.DELETED`` (case-insensitive)."""
+    return ".DELETED" in str(user_app_id or "").upper()
+
+
 def _normalize_userappids(user_ids: List[str]) -> List[str]:
     cleaned = []
     seen = set()
@@ -290,6 +295,9 @@ def send_notification_to_user(db: Session, notification_data: FCMSend):
         if not user:
             return EmailErrorResponse(message="USER_NOT_FOUND")
 
+        if _is_tombstone_user_app_id(getattr(user, "userAppId", None)):
+            return EmailErrorResponse(message="USER_NOT_FOUND")
+
         fcm_token = _clean_token(user.fcmToken)
         if not fcm_token:
             return EmailErrorResponse(message="NO_TOKEN")
@@ -308,19 +316,16 @@ def send_notification_to_user(db: Session, notification_data: FCMSend):
         )
 
         if not result.get("success"):
-            return EmailErrorResponse(
-                message="ERROR_SENDING_NOTIFICATION",
-                error=str(result)
-            )
+            return EmailErrorResponse(message="ERROR_SENDING_NOTIFICATION")
 
         return EmailErrorResponse(message="NOTIFICATION_SENT")
 
-    except SQLAlchemyError as e:
+    except SQLAlchemyError:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_SENT", error=str(e))
-    except Exception as e:
+        return EmailErrorResponse(message="ERROR_SENT")
+    except Exception:
         db.rollback()
-        return EmailErrorResponse(message="ERROR_SENT", error=str(e))
+        return EmailErrorResponse(message="ERROR_SENT")
 
 
 def send_notification_to_selected_users(db: Session, data: FCMSendDrivers):
@@ -349,6 +354,10 @@ def send_notification_to_selected_users(db: Session, data: FCMSendDrivers):
             results[driver_id] = {"sent": False, "reason": "User not found"}
             continue
 
+        if _is_tombstone_user_app_id(getattr(user, "userAppId", None)):
+            results[driver_id] = {"sent": False, "reason": "User not found"}
+            continue
+
         fcm_token = _clean_token(user.fcmToken)
         if not fcm_token:
             results[driver_id] = {"sent": False, "reason": "No FCM token"}
@@ -369,9 +378,10 @@ def send_notification_to_selected_users(db: Session, data: FCMSendDrivers):
         if success:
             total_success += 1
 
+        # Safe per-recipient summary only — never return FCM provider payloads/tokens.
         results[driver_id] = {
             "sent": success,
-            "response": result
+            "reason": None if success else "DISPATCH_FAILED",
         }
 
     return SendNotificationResponse(
@@ -1004,8 +1014,8 @@ def notify_vendors_request_cancelled(rid: int) -> None:
                     sound_file="normal_notification",
                 )
             except Exception as e:
-                print(f"[FCM ERROR] token={token} err={e}")
+                print(f"[FCM ERROR] notify_vendors_request_cancelled category=token_send err={type(e).__name__}")
     except Exception as e:
-        print(f"[FCM ERROR] notify_vendors_request_cancelled err={e}")
+        print(f"[FCM ERROR] notify_vendors_request_cancelled category=helper err={type(e).__name__}")
     finally:
         db.close()

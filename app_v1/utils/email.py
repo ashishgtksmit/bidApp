@@ -146,16 +146,20 @@ def send_email(
     from_name: str,
     to_address: str,
     to_name: str,
-    cc_address: Optional[EmailStr] = None,
+    cc_address: Optional[str] = None,
     cc_name: Optional[str] = None,
     bcc_address: Optional[str] = None,
     bcc_name: Optional[str] = None,
-    attachment_path: Optional[str] = None
+    attachment_path: Optional[str] = None,
+    is_html: bool = True,
 ) -> Dict[str, Any]:
     """
     Send an email using Gmail SMTP with fallback mechanism.
     Adds better error detail, auto skip for invalid credentials,
     and structured logs.
+
+    ``is_html`` defaults to True so existing server-owned HTML callers
+    (PR16 / PR29 / car / driver) remain unchanged. Pass False for plain text.
     """
 
     # --- 1️⃣ Basic Validation ---
@@ -193,21 +197,26 @@ def send_email(
 
     smtp_host = "smtp.gmail.com"
     smtp_port = 587
+    mime_subtype = "html" if is_html else "plain"
 
     # --- 3️⃣ Inner mail sending function ---
-    def try_send_mail(config, from_addr, from_n):
+    def try_send_mail(config, from_addr, from_n, *, used_fallback: bool = False):
         msg = MIMEMultipart()
         msg["From"] = f"{from_n} <{from_addr}>"
         msg["To"] = f"{to_name} <{to_address}>"
         msg["Subject"] = subject
 
-        if cc_address and cc_name:
-            msg["Cc"] = f"{cc_name} <{cc_address}>"
-        if bcc_address and bcc_name:
-            msg["Bcc"] = f"{bcc_name} <{bcc_address}>"
+        # CC/BCC: name optional so server-owned multi-address lists work.
+        if cc_address:
+            msg["Cc"] = (
+                f"{cc_name} <{cc_address}>" if cc_name else str(cc_address)
+            )
+        if bcc_address:
+            msg["Bcc"] = (
+                f"{bcc_name} <{bcc_address}>" if bcc_name else str(bcc_address)
+            )
 
-        # Attach HTML body
-        msg.attach(MIMEText(message, "html"))
+        msg.attach(MIMEText(message, mime_subtype))
 
         # Attachment
         if attachment_path:
@@ -221,8 +230,8 @@ def send_email(
                     f"attachment; filename={os.path.basename(attachment_path)}"
                 )
                 msg.attach(part)
-            except Exception as e:
-                return {"message": "ERROR_INVALID_ATTACHMENT", "error": str(e)}
+            except Exception:
+                return {"message": "ERROR_INVALID_ATTACHMENT"}
 
         # --- 4️⃣ Send email ---
         try:
@@ -231,30 +240,31 @@ def send_email(
                 server.login(config["username"], config["password"])
                 server.send_message(msg)
 
-            print(f"{datetime.now()} ✅ Sent email to {to_address} via {from_addr}")
-            return {"message": "SENT"}
+            # Do not log recipient addresses or provider bodies (PII).
+            print(f"{datetime.now()} ✅ Sent email via configured sender")
+            return {"message": "SENT", "used_fallback": used_fallback}
 
         except smtplib.SMTPAuthenticationError as e:
             # Invalid app password or wrong credentials
-            error_code, error_msg = e.smtp_code, e.smtp_error.decode()
-            print(f"{datetime.now()} ❌ Auth Error ({error_code}): {error_msg}")
+            error_code = e.smtp_code
+            print(f"{datetime.now()} ❌ Auth Error ({error_code})")
             return {
                 "message": "ERROR_AUTH_FAILED",
                 "error_code": error_code,
-                "error": error_msg,
+                "used_fallback": used_fallback,
             }
 
-        except smtplib.SMTPRecipientsRefused as e:
-            print(f"{datetime.now()} ❌ Invalid recipient: {str(e)}")
-            return {"message": "ERROR_INVALID_RECIPIENT", "error": str(e)}
+        except smtplib.SMTPRecipientsRefused:
+            print(f"{datetime.now()} ❌ Invalid recipient")
+            return {"message": "ERROR_INVALID_RECIPIENT", "used_fallback": used_fallback}
 
-        except smtplib.SMTPConnectError as e:
-            print(f"{datetime.now()} ❌ Connection error: {str(e)}")
-            return {"message": "ERROR_SMTP_CONNECTION", "error": str(e)}
+        except smtplib.SMTPConnectError:
+            print(f"{datetime.now()} ❌ Connection error")
+            return {"message": "ERROR_SMTP_CONNECTION", "used_fallback": used_fallback}
 
         except smtplib.SMTPException as e:
-            print(f"{datetime.now()} ❌ SMTP general error: {str(e)}")
-            return {"message": "ERROR_SENDING_EMAIL", "error": str(e)}
+            print(f"{datetime.now()} ❌ SMTP general error: {type(e).__name__}")
+            return {"message": "ERROR_SENDING_EMAIL", "used_fallback": used_fallback}
 
     # --- 5️⃣ Try primary ---
     result = try_send_mail(smtp_config[from_address], from_address, from_name)
@@ -267,4 +277,9 @@ def send_email(
 
     # --- 6️⃣ Try fallback ---
     print(f"{datetime.now()} ⚠️ Retrying via fallback account...")
-    return try_send_mail(fallback_config, fallback_config["username"], "Wizzride Team")
+    return try_send_mail(
+        fallback_config,
+        fallback_config["username"],
+        "Wizzride Team",
+        used_fallback=True,
+    )

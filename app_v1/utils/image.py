@@ -623,3 +623,263 @@ def upload_vendor_profile_picture_azure(user_app_id: str, base64_data: str) -> d
         return {"message": result}
 
     return {"message": "UPLOADED", "url": result}
+
+
+# ---------------------------------------------------------------------------
+# PR28 — focused chat-media JPEG/PNG validation + Azure chat-docs helpers
+# ---------------------------------------------------------------------------
+
+_CHAT_MEDIA_MAX_BYTES = 2 * 1024 * 1024
+_CHAT_MEDIA_MAX_PIXELS = 25_000_000
+_CHAT_MEDIA_ALLOWED_MIMES = frozenset({"image/jpeg", "image/png"})
+_CHAT_MEDIA_FORMATS = {
+    "jpeg": ("image/jpeg", "jpg"),
+    "png": ("image/png", "png"),
+}
+
+
+class ChatMediaImageError(Exception):
+    """Typed image validation failure for chat media."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def detect_chat_media_signature(image_bytes: bytes) -> Optional[str]:
+    """Return image/jpeg or image/png from magic bytes, else None."""
+    if len(image_bytes) >= 3 and image_bytes[0:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(image_bytes) >= 8 and image_bytes[0:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return None
+
+
+def decode_chat_media_payload(raw: str) -> Tuple[bytes, Optional[str]]:
+    """
+    Strict base64 / data-URI decode for chat media.
+
+    Returns (bytes, claimed_mime_or_None).
+    Raises ChatMediaImageError with INVALID_CHAT_MEDIA / UNSUPPORTED_CHAT_MEDIA_TYPE.
+    """
+    image_str = str(raw or "").strip()
+    if not image_str:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    claimed_mime: Optional[str] = None
+    header_match = re.match(
+        r"^data:(image/[a-zA-Z0-9.+-]+);base64,",
+        image_str,
+        flags=re.IGNORECASE,
+    )
+    if header_match:
+        claimed_mime = header_match.group(1).lower()
+        if claimed_mime == "image/jpg":
+            claimed_mime = "image/jpeg"
+        image_str = image_str[len(header_match.group(0)) :]
+    elif image_str.lower().startswith("data:"):
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    if claimed_mime is not None and claimed_mime not in _CHAT_MEDIA_ALLOWED_MIMES:
+        raise ChatMediaImageError("UNSUPPORTED_CHAT_MEDIA_TYPE")
+
+    clean = re.sub(r"\s+", "", image_str)
+    if not clean:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    try:
+        binary = base64.b64decode(clean, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA") from exc
+
+    if not binary:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    return binary, claimed_mime
+
+
+def validate_chat_media_image_bytes(
+    binary: bytes,
+    claimed_mime: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    PR23-style JPEG/PNG validation. Returns (mime, ext).
+
+    Does not recompress. Client MIME is a hint only; bytes are authoritative.
+    """
+    if not binary:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    if len(binary) > _CHAT_MEDIA_MAX_BYTES:
+        raise ChatMediaImageError("CHAT_MEDIA_TOO_LARGE")
+
+    if claimed_mime is not None and claimed_mime not in _CHAT_MEDIA_ALLOWED_MIMES:
+        raise ChatMediaImageError("UNSUPPORTED_CHAT_MEDIA_TYPE")
+
+    sig_mime = detect_chat_media_signature(binary)
+    if sig_mime is None:
+        raise ChatMediaImageError("UNSUPPORTED_CHAT_MEDIA_TYPE")
+
+    previous_max = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = _CHAT_MEDIA_MAX_PIXELS
+    try:
+        try:
+            with Image.open(io.BytesIO(binary)) as img:
+                img.verify()
+                fmt = (img.format or "").lower()
+        except Image.DecompressionBombError as exc:
+            raise ChatMediaImageError("INVALID_CHAT_MEDIA") from exc
+        except Exception as exc:
+            raise ChatMediaImageError("INVALID_CHAT_MEDIA") from exc
+
+        try:
+            with Image.open(io.BytesIO(binary)) as img:
+                img.load()
+                fmt = (img.format or fmt or "").lower()
+        except Image.DecompressionBombError as exc:
+            raise ChatMediaImageError("INVALID_CHAT_MEDIA") from exc
+        except Exception as exc:
+            raise ChatMediaImageError("INVALID_CHAT_MEDIA") from exc
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous_max
+
+    if fmt not in _CHAT_MEDIA_FORMATS:
+        raise ChatMediaImageError("UNSUPPORTED_CHAT_MEDIA_TYPE")
+
+    mime, ext = _CHAT_MEDIA_FORMATS[fmt]
+    if sig_mime != mime:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+    if claimed_mime is not None and claimed_mime != mime:
+        raise ChatMediaImageError("INVALID_CHAT_MEDIA")
+
+    return mime, ext
+
+
+def _chat_docs_credentials() -> Tuple[str, str]:
+    container_url = os.getenv("AZURE_CHAT_DOCS_CONTAINER_URL", "").strip()
+    sas_token = os.getenv("AZURE_CHAT_DOCS_SAS", "").strip()
+    return container_url, sas_token
+
+
+def chat_docs_blob_public_url(relative_blob_path: str) -> str:
+    """SAS-less durable public URL for a chat-docs relative path."""
+    container_url, _ = _chat_docs_credentials()
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in relative_blob_path.split("/")
+    )
+    return f"{container_url.rstrip('/')}/{encoded_path}"
+
+
+class ChatDocsStorageError(Exception):
+    """Provider failure for chat-docs Azure operations (safe; no provider text)."""
+
+
+class ChatDocsNotFound(Exception):
+    """Blob missing on chat-docs container."""
+
+
+def chat_docs_head_metadata(relative_blob_path: str) -> Optional[Dict[str, str]]:
+    """
+    HEAD blob and return lowercase metadata map, or None if not found.
+
+    Raises ChatDocsStorageError on provider/config failure.
+    """
+    container_url, sas_token = _chat_docs_credentials()
+    if not container_url or not sas_token:
+        raise ChatDocsStorageError("AZURE_CONFIG_MISSING")
+
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in relative_blob_path.split("/")
+    )
+    head_url = f"{container_url.rstrip('/')}/{encoded_path}?{sas_token.lstrip('?')}"
+    headers = {"x-ms-version": "2024-11-04"}
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.head(head_url, headers=headers)
+    except Exception as exc:
+        raise ChatDocsStorageError("HEAD_FAILED") from exc
+
+    if response.status_code == 404:
+        return None
+    if response.status_code not in (200, 206):
+        raise ChatDocsStorageError("HEAD_FAILED")
+
+    meta: Dict[str, str] = {}
+    for key, value in response.headers.items():
+        lower = key.lower()
+        if lower.startswith("x-ms-meta-"):
+            meta[lower[len("x-ms-meta-") :]] = str(value)
+    return meta
+
+
+def chat_docs_upload_bytes(
+    *,
+    relative_blob_path: str,
+    content: bytes,
+    content_type: str,
+    metadata: Dict[str, str],
+) -> str:
+    """
+    Upload validated bytes to chat-docs with metadata. Returns public URL.
+
+    Raises ChatDocsStorageError on failure. Never returns SAS.
+    """
+    container_url, sas_token = _chat_docs_credentials()
+    if not container_url or not sas_token:
+        raise ChatDocsStorageError("AZURE_CONFIG_MISSING")
+
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in relative_blob_path.split("/")
+    )
+    upload_url = f"{container_url.rstrip('/')}/{encoded_path}?{sas_token.lstrip('?')}"
+
+    headers = {
+        "x-ms-blob-type": "BlockBlob",
+        "x-ms-version": "2024-11-04",
+        "Content-Type": content_type,
+    }
+    for meta_key, meta_val in metadata.items():
+        safe_key = re.sub(r"[^a-z0-9_]", "", str(meta_key).lower())
+        if not safe_key:
+            continue
+        headers[f"x-ms-meta-{safe_key}"] = str(meta_val)[:256]
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.put(upload_url, content=content, headers=headers)
+    except Exception as exc:
+        raise ChatDocsStorageError("UPLOAD_FAILED") from exc
+
+    # 201 created; 200 may occur on overwrite — PR28 avoids overwrite via conflict check.
+    if response.status_code not in (200, 201):
+        raise ChatDocsStorageError("UPLOAD_FAILED")
+
+    return f"{container_url.rstrip('/')}/{encoded_path}"
+
+
+def chat_docs_delete_blob(relative_blob_path: str) -> None:
+    """
+    Delete deterministic chat-docs blob. Missing blob is success.
+
+    Raises ChatDocsStorageError on provider/config failure.
+    """
+    container_url, sas_token = _chat_docs_credentials()
+    if not container_url or not sas_token:
+        raise ChatDocsStorageError("AZURE_CONFIG_MISSING")
+
+    encoded_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in relative_blob_path.split("/")
+    )
+    delete_url = f"{container_url.rstrip('/')}/{encoded_path}?{sas_token.lstrip('?')}"
+    headers = {"x-ms-version": "2024-11-04"}
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.delete(delete_url, headers=headers)
+    except Exception as exc:
+        raise ChatDocsStorageError("DELETE_FAILED") from exc
+
+    if response.status_code in (202, 404):
+        return
+    raise ChatDocsStorageError("DELETE_FAILED")

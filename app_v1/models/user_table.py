@@ -7,7 +7,8 @@ class User(Base):
     __tablename__ = "usertable"
 
     UID = Column(BigInteger,primary_key=True,autoincrement=True)
-    userAppId = Column(String(10),unique=True,nullable=False)
+    # PR24: expanded so soft-tombstone ids ({phone}.DELETED[+n]) are not truncated.
+    userAppId = Column(String(64),unique=True,nullable=False)
     password = Column(Text, nullable=False)
     alternateNumber = Column(String(10),nullable=True)
     fullName = Column(String(200),nullable=False)

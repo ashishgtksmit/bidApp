@@ -1,8 +1,9 @@
+import logging
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-from datetime import datetime,timedelta
-from typing import Optional
+from datetime import date, datetime, time, timedelta
+from typing import List, Optional, Union
 from zoneinfo import ZoneInfo
 from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,8 +24,17 @@ from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRid
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
                                      RequestConfirmedCommonResponse,GetBookingReportResponse,
                                      ReopenBookingResponse)
+from ..schemas.booking_history import (
+    CustomerBookingHistoryItem,
+    VendorBookingHistoryItem,
+    VendorCancelledHistoryItem,
+)
 from ..schemas.request_type_details import RequestTypeBase
 from ..utils.common import ErrorResponse,EmailErrorResponse, FCMSend
+
+logger = logging.getLogger(__name__)
+
+_CONFIRMED_STATUS = "REQUEST - CONFIRMED"
 from ..services.notifications import (
     FCMSendDrivers,
     notify_driver_assigned_to_customer_background,
@@ -172,115 +182,277 @@ def get_all_open_requests(db : Session):
 #     finally:
 #         db.close()
 
-def get_all_requests_for_user(db: Session, customer_app_id: str):
+def _history_flag_done(value: Optional[str]) -> bool:
+    """Map request reviewDone / customerReviewDone Y/N-ish to bool."""
+    if value is None:
+        return False
+    return str(value).strip().upper() == "Y"
+
+
+def _history_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _history_model_year(value) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or not text.lstrip("-").isdigit():
+        return None
     try:
-        if not customer_app_id or customer_app_id.strip() == "":
-            return NoBidsResponse(message="ERROR_MISSING_CUSTOMERAPPID")
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
-        requests = db.query(
-            Request,
-            DriverDetail.driverName,
-            DriverDetail.driverNumber,
-            DriverDetail.driverPhoto,
-            DriverDetail.driverDOB,
-            DriverDetail.driverGender,
-            DriverDetail.driverCity,
-            DriverDetail.driverLicense,
-            BidDetail.bidAmount,
-            BidDetail.CARID,
-            CarDetail.carRegNo,
-            CarDetail.carModel,
-            CarDetail.modelYear,
-            CarDetail.carColor,
-            CarDetail.ownerName,
-            CarDetail.registrationDoc,
-            CarDetail.powerOfAttorneyDoc,
-            CarDetail.registeredOn,
-            CarDetail.carOwnedBySameVendor,
-            CarDetail.CTD,
-            CarTypeDetail.car_type
-        ).outerjoin(
-            DriverDetail, DriverDetail.DDID == Request.driverAssignedID
-        ).outerjoin(
-            BidDetail,
-            (BidDetail.rID == Request.RID) &
-            (BidDetail.bidderID == Request.requestWonBy)
-        ).outerjoin(
-            CarDetail, CarDetail.CARID == BidDetail.CARID
-        ).outerjoin(
-            CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD
-        ).filter(
-            Request.customerAppId == customer_app_id
-        ).order_by(
-            Request.tableTimestamp.desc()
-        ).all()
 
-        if not requests:
-            return []
+def _history_pickup_datetime(req: Request) -> datetime:
+    """Combine pickup date/time; fail safely on malformed historical values."""
+    rid = getattr(req, "RID", None)
+    pickup_date = getattr(req, "pickUpDate", None)
+    pickup_time = getattr(req, "pickUpTime", None)
+    if not isinstance(pickup_date, date):
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=pickup_date_type",
+            rid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+    if not isinstance(pickup_time, time):
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=pickup_time_type",
+            rid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+    try:
+        d = pickup_date.date() if isinstance(pickup_date, datetime) else pickup_date
+        return datetime.combine(d, pickup_time)
+    except (TypeError, ValueError) as exc:
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=pickup_combine",
+            rid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        ) from exc
 
-        return [
-            RequestForUserResponse(
-                REQUESTID=req.RID,
-                FROMLOCATION=req.fromLocation,
-                FROMLANDMARK=req.fromLandmark,
-                TOLOCATION=req.toLocation,
-                TOLANDMARK=req.toLandmark,
-                PICKUPDATE=req.pickUpDate,
-                PICKUPTIME=req.pickUpTime,
-                NOOFADULTS=req.noOfAdults,
-                NOOFKIDS=req.noOfKids,
-                CARTYPE=req.carType,
-                ACREQUEST=req.acRequest,
-                CARRIERREQUEST=req.carrierRequest,
-                SPECIALREQUEST=req.specialRequest,
-                BIDENDTIME=req.bidEndTime,
-                REQUESTSTATUS=req.requestStatus,
-                PAYMENTSTATUS=req.paymentStatus,
-                CUSTOMERAPPID=req.customerAppId,
-                REQUESTWONBY=req.requestWonBy,
-                FINALAMOUNT=req.finalAmount,
-                NOOFBIDS=req.noOfBids,
-                REJECTIONREASON=req.rejectionReason,
-                REOPENBOOKING=req.requestReopened,
-                TABLETIMESTAMP=req.tableTimestamp,
-                REVIEWDONE=req.reviewDone,
 
-                DRIVERNAME=driver_name,
-                DRIVERNUMBER=driver_number,
-                DRIVERPHOTO=driver_photo,
-                DRIVERDOB=driver_dob,
-                DRIVERGENDER=driver_gender,
-                DRIVERCITY=driver_city,
-                DRIVERLICENSE=driver_license,
+def _history_pickup_date_value(req: Request, pickup_dt: datetime) -> date:
+    pickup_date = getattr(req, "pickUpDate", None)
+    if isinstance(pickup_date, datetime):
+        return pickup_date.date()
+    if isinstance(pickup_date, date):
+        return pickup_date
+    return pickup_dt.date()
 
-                BIDAMOUNT=bid_amount,
-                CARID=car_id,
-                CARREGNO=car_reg_no,
-                CARMODEL=car_model,
-                MODELYEAR=model_year,
-                CARCOLOR=car_color,
-                OWNERNAME=owner_name,
-                REGISTRATIONDOC=registration_doc,
-                POWEROFATTORNEYDOC=power_of_attorney_doc,
-                REGISTEREDON=registered_on,
-                CAROWNEDBYSAMEVENDOR=car_owned_by_same_vendor,
-                CTD=ctd,
-                CAR_TYPE=car_type
+
+def _history_pickup_time_value(req: Request, pickup_dt: datetime) -> time:
+    pickup_time = getattr(req, "pickUpTime", None)
+    if isinstance(pickup_time, time):
+        return pickup_time
+    return pickup_dt.time()
+
+
+def _assert_history_row_identity(req: Request) -> None:
+    """Fail safely when required ownership/status/RID fields are unusable."""
+    rid = getattr(req, "RID", None)
+    if rid is None:
+        logger.error("HISTORY_DATA_INVALID rid=None reason=missing_rid")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+    status_value = getattr(req, "requestStatus", None)
+    if not status_value or not str(status_value).strip():
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=missing_status",
+            rid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+
+
+def _history_cancellation_reason(value) -> str:
+    """Map rejectionReason for cancellation history; never return literal null."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "null":
+        return ""
+    return text
+
+
+def _history_nullable_final_amount(value) -> Optional[float]:
+    """Preserve null; do not coerce null to zero."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_required_location(value, *, rid, field: str) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text or text.lower() == "null":
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=missing_%s",
+            rid,
+            field,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+    return text
+
+
+def _history_required_customer_name(value, *, rid) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text or text.lower() == "null":
+        logger.error(
+            "HISTORY_DATA_INVALID rid=%s reason=missing_customer_name",
+            rid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_DATA_INVALID",
+        )
+    return text
+
+
+def get_all_requests_for_user(
+    db: Session,
+    user_id: str,
+    customer_app_id: Optional[str] = None,
+) -> List[CustomerBookingHistoryItem]:
+    """
+    Customer completed booking history (PR20).
+
+    JWT sub is authoritative. Optional transitional customerAppId must match
+    JWT or returns 403. Returns only past REQUEST - CONFIRMED rows owned by
+    JWT, newest pickup first (RID desc tie-break). Empty → [].
+    """
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    owner_id = str(user_id).strip()
+
+    if customer_app_id is not None and str(customer_app_id).strip():
+        if str(customer_app_id).strip() != owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized",
             )
-            for (
-                req,
-                driver_name, driver_number, driver_photo, driver_dob,
-                driver_gender, driver_city, driver_license,
-                bid_amount, car_id, car_reg_no, car_model, model_year,
-                car_color, owner_name, registration_doc,
-                power_of_attorney_doc, registered_on,
-                car_owned_by_same_vendor, ctd, car_type
-            ) in requests
-        ]
 
-    except SQLAlchemyError as e:
-        db.rollback()
-        return NoBidsResponse(message="ERROR_PREPARE", error=str(e))
+    try:
+        rows = (
+            db.query(
+                Request,
+                DriverDetail.driverName,
+                DriverDetail.driverPhoto,
+                DriverDetail.driverDOB,
+                DriverDetail.driverGender,
+                CarDetail.carRegNo,
+                CarDetail.carModel,
+                CarDetail.modelYear,
+            )
+            .outerjoin(
+                DriverDetail, DriverDetail.DDID == Request.driverAssignedID
+            )
+            .outerjoin(
+                BidDetail,
+                (BidDetail.rID == Request.RID)
+                & (BidDetail.bidderID == Request.requestWonBy),
+            )
+            .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
+            .filter(
+                Request.customerAppId == owner_id,
+                Request.requestStatus == _CONFIRMED_STATUS,
+            )
+            .all()
+        )
+    except SQLAlchemyError:
+        logger.exception(
+            "get_all_requests_for_user query failed owner_hash=%s",
+            hash(owner_id) % 100000,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_QUERY_FAILED",
+        )
+
+    now_ist = _now_ist_naive()
+    items: List[tuple] = []
+    for (
+        req,
+        driver_name,
+        driver_photo,
+        driver_dob,
+        driver_gender,
+        car_reg_no,
+        car_model,
+        model_year,
+    ) in rows:
+        _assert_history_row_identity(req)
+        if getattr(req, "customerAppId", None) != owner_id:
+            logger.error(
+                "HISTORY_DATA_INVALID rid=%s reason=ownership_mismatch",
+                getattr(req, "RID", None),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="HISTORY_DATA_INVALID",
+            )
+        pickup_dt = _history_pickup_datetime(req)
+        if pickup_dt >= now_ist:
+            continue
+        items.append(
+            (
+                pickup_dt,
+                int(req.RID),
+                CustomerBookingHistoryItem(
+                    requestId=int(req.RID),
+                    requestStatus=str(req.requestStatus),
+                    fromLocation=req.fromLocation or "",
+                    toLocation=req.toLocation or "",
+                    pickupDate=_history_pickup_date_value(req, pickup_dt),
+                    pickupTime=_history_pickup_time_value(req, pickup_dt),
+                    noOfAdults=int(req.noOfAdults or 0),
+                    noOfKids=int(req.noOfKids or 0),
+                    carType=req.carType or "",
+                    acRequested=bool(req.acRequest),
+                    carrierRequested=bool(req.carrierRequest),
+                    specialRequest=_history_optional_text(req.specialRequest),
+                    reviewDone=_history_flag_done(req.reviewDone),
+                    driverName=_history_optional_text(driver_name),
+                    driverProfileImageUrl=_history_optional_text(driver_photo),
+                    driverGender=_history_optional_text(driver_gender),
+                    driverDateOfBirth=driver_dob
+                    if isinstance(driver_dob, date)
+                    else None,
+                    carRegistrationNumber=_history_optional_text(car_reg_no),
+                    carModel=_history_optional_text(car_model),
+                    modelYear=_history_model_year(model_year),
+                ),
+            )
+        )
+
+    items.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in items]
+
 
 def get_rid_by_details(db : Session, from_location : str, to_location : str, pick_up_date : str, 
                        pick_up_time : str, no_of_adults : int, no_of_kids : int, car_type : str):
@@ -1220,80 +1392,144 @@ def get_all_confirmed_requests_for_customer(db: Session, user_app_id : str):
         db.close()
     
 
-from sqlalchemy import func
+def get_all_confirmed_requests_for_vendor(
+    db: Session,
+    user_id: str,
+    vendor_id: Optional[str] = None,
+) -> List[VendorBookingHistoryItem]:
+    """
+    Vendor completed trip history (PR20).
 
-def get_all_confirmed_requests_for_vendor(db: Session, vendor_id: str):
+    JWT sub is authoritative via requestWonBy. Optional transitional vendorId
+    must match JWT or returns 403. Past REQUEST - CONFIRMED only, newest
+    pickup first (RID desc tie-break). Empty → [].
+    Losing bidders never receive rows.
+    """
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    owner_id = str(user_id).strip()
+
+    if vendor_id is not None and str(vendor_id).strip():
+        if str(vendor_id).strip() != owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized",
+            )
+
     try:
-        with db.begin():
-
-            confirmed_requests = db.query(
+        confirmed_requests = (
+            db.query(
                 Request,
                 User.fullName,
-                User.city,
-                User.userAppId,
-                User.alternateNumber,
                 User.profilePicture,
-                CustomerReview.generalRating
-            ).join(
-                User, User.userAppId == Request.customerAppId
-            ).outerjoin(
-                CustomerReview, CustomerReview.RID == Request.RID
-            ).filter(
-                (Request.requestStatus == "REQUEST - CONFIRMED") &
-                (Request.requestWonBy == vendor_id) &
-                (
-                    func.str_to_date(
-                        func.concat(Request.pickUpDate, ' ', Request.pickUpTime),
-                        '%Y-%m-%d %H:%i:%s'
-                    ) < func.now()
-                )
-            ).all()
+                CustomerReview.generalRating,
+                CustomerReview.comments,
+                DriverDetail.driverName,
+                CarDetail.carRegNo,
+                CarDetail.carModel,
+            )
+            .join(User, User.userAppId == Request.customerAppId)
+            .outerjoin(CustomerReview, CustomerReview.RID == Request.RID)
+            .outerjoin(
+                DriverDetail, DriverDetail.DDID == Request.driverAssignedID
+            )
+            .outerjoin(
+                BidDetail,
+                (BidDetail.rID == Request.RID)
+                & (BidDetail.bidderID == Request.requestWonBy),
+            )
+            .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
+            .filter(
+                Request.requestStatus == _CONFIRMED_STATUS,
+                Request.requestWonBy == owner_id,
+            )
+            .all()
+        )
+    except SQLAlchemyError:
+        logger.exception(
+            "get_all_confirmed_requests_for_vendor query failed owner_hash=%s",
+            hash(owner_id) % 100000,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_QUERY_FAILED",
+        )
 
-            if not confirmed_requests:
-                return EmailErrorResponse(message="NO_REQUESTS_FOUND")
+    now_ist = _now_ist_naive()
+    items: List[tuple] = []
+    for (
+        req,
+        full_name,
+        profile_picture,
+        general_rating,
+        review_comments,
+        driver_name,
+        car_reg_no,
+        car_model,
+    ) in confirmed_requests:
+        _assert_history_row_identity(req)
+        if getattr(req, "requestWonBy", None) != owner_id:
+            logger.error(
+                "HISTORY_DATA_INVALID rid=%s reason=won_by_mismatch",
+                getattr(req, "RID", None),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="HISTORY_DATA_INVALID",
+            )
+        pickup_dt = _history_pickup_datetime(req)
+        if pickup_dt >= now_ist:
+            continue
 
-            return [
-                RequestConfirmedForVendorResponse(
-                    REQUESTID=req.RID,
-                    FROMLOCATION=req.fromLocation,
-                    FROMLANDMARK=req.fromLandmark,
-                    TOLOCATION=req.toLocation,
-                    TOLANDMARK=req.toLandmark,
-                    PICKUPDATE=req.pickUpDate,
-                    PICKUPTIME=req.pickUpTime,
-                    NOOFADULTS=req.noOfAdults,
-                    NOOFKIDS=req.noOfKids,
-                    CARTYPE=req.carType,
-                    ACREQUEST=req.acRequest,
-                    CARRIERREQUEST=req.carrierRequest,
-                    BIDENDTIME=req.bidEndTime,
-                    REQUESTSTATUS=req.requestStatus,
-                    PAYMENTSTATUS=req.paymentStatus,
-                    CUSTOMERAPPID=req.customerAppId,
-                    REQUESTWONBY=req.requestWonBy,
-                    USERFULLNAME=full_name,
-                    CITY=city,
-                    PHONENUMBER=user_app_id,
-                    ALTNUMBER=alternate_number,
-                    PROFILEPIC=profile_picture,
-                    BIDAMOUNT=req.finalAmount,
-                    CUSTREVIEW_GENERALRATING=general_rating
-                )
-                for (
-                    req,
-                    full_name,
-                    city,
-                    user_app_id,
-                    alternate_number,
-                    profile_picture,
-                    general_rating
-                ) in confirmed_requests
-            ]
+        rating_value: Optional[float] = None
+        if general_rating is not None:
+            try:
+                rating_value = float(general_rating)
+            except (TypeError, ValueError):
+                rating_value = None
 
-    except SQLAlchemyError as e:
-        db.rollback()
-        return EmailErrorResponse(message="ERROR", error=str(e))
-    
+        items.append(
+            (
+                pickup_dt,
+                int(req.RID),
+                VendorBookingHistoryItem(
+                    requestId=int(req.RID),
+                    requestStatus=str(req.requestStatus),
+                    fromLocation=req.fromLocation or "",
+                    toLocation=req.toLocation or "",
+                    pickupDate=_history_pickup_date_value(req, pickup_dt),
+                    pickupTime=_history_pickup_time_value(req, pickup_dt),
+                    noOfAdults=int(req.noOfAdults or 0),
+                    noOfKids=int(req.noOfKids or 0),
+                    carType=req.carType or "",
+                    acRequested=bool(req.acRequest),
+                    carrierRequested=bool(req.carrierRequest),
+                    specialRequest=_history_optional_text(req.specialRequest),
+                    finalAmount=float(req.finalAmount or 0),
+                    customerDisplayName=(full_name or "").strip() or "Passenger",
+                    customerProfileImageUrl=_history_optional_text(
+                        profile_picture
+                    ),
+                    customerReviewDone=_history_flag_done(
+                        req.customerReviewDone
+                    ),
+                    customerGeneralRating=rating_value,
+                    customerReviewComments=_history_optional_text(
+                        review_comments
+                    ),
+                    carRegistrationNumber=_history_optional_text(car_reg_no),
+                    carModel=_history_optional_text(car_model),
+                    driverName=_history_optional_text(driver_name),
+                ),
+            )
+        )
+
+    items.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in items]
+
 
 def reopen_request(
     db: Session,
@@ -1801,117 +2037,111 @@ def assign_driver_to_request(
 
 
 
-def get_all_cancelled_requests_for_vendor(db: Session, vendor_id: str):
-    try:
-        timestamp_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        request_status = "BOOKING - CANCELLED BY USER"
+def get_all_cancelled_requests_for_vendor(
+    db: Session,
+    user_id: str,
+    vendor_id: Optional[str] = None,
+) -> List[VendorCancelledHistoryItem]:
+    """
+    Vendor cancelled trip history (PR21).
 
+    JWT sub is authoritative via requestWonBy. Optional transitional vendorId
+    must match JWT or returns 403. Past BOOKING - CANCELLED BY USER only,
+    newest pickup first (RID desc tie-break). Empty → [].
+    Losing bidders never receive rows. No approval/lock gate.
+    """
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
+    owner_id = str(user_id).strip()
+
+    if vendor_id is not None and str(vendor_id).strip():
+        if str(vendor_id).strip() != owner_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized",
+            )
+
+    try:
         cancelled_requests = (
             db.query(
-                Request.RID,
-                Request.fromLocation,
-                Request.fromLandmark,
-                Request.toLocation,
-                Request.toLandmark,
-                Request.pickUpDate,
-                Request.pickUpTime,
-                Request.noOfAdults,
-                Request.noOfKids,
-                Request.carType,
-                Request.acRequest,
-                Request.carrierRequest,
-                Request.bidEndTime,
-                Request.requestStatus,
-                Request.paymentStatus,
-                Request.customerAppId,
-                Request.requestWonBy,
-                Request.finalAmount,
-                Request.customerReviewDone,
-                Request.rejectionReason,
+                Request,
                 User.fullName,
-                User.city,
-                User.userAppId,
-                User.alternateNumber,
                 User.profilePicture,
-                CustomerReview.generalRating,
             )
             .join(User, User.userAppId == Request.customerAppId)
-            .outerjoin(CustomerReview, CustomerReview.RID == Request.RID)
             .filter(
-                Request.requestStatus == request_status,
-                Request.requestWonBy == vendor_id,
-                func.str_to_date(
-                    func.concat(Request.pickUpDate, " ", Request.pickUpTime),
-                    "%Y-%m-%d %H:%i:%s",
-                ) < timestamp_value,
+                Request.requestStatus == STATUS_BOOKING_CANCELLED_BY_USER,
+                Request.requestWonBy == owner_id,
             )
             .all()
         )
+    except SQLAlchemyError:
+        logger.exception(
+            "get_all_cancelled_requests_for_vendor query failed owner_hash=%s",
+            hash(owner_id) % 100000,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="HISTORY_QUERY_FAILED",
+        )
 
-        if not cancelled_requests:
-            return EmailErrorResponse(message="NO REQUESTS FOUND")
-
-        return [
-            RequestConfirmedForVendorResponse(
-                REQUESTID=RID,
-                FROMLOCATION=fromLocation,
-                FROMLANDMARK=fromLandmark,
-                TOLOCATION=toLocation,
-                TOLANDMARK=toLandmark,
-                PICKUPDATE=pickUpDate,
-                PICKUPTIME=pickUpTime,
-                NOOFADULTS=noOfAdults,
-                NOOFKIDS=noOfKids,
-                CARTYPE=carType,
-                ACREQUEST=acRequest,
-                CARRIERREQUEST=carrierRequest,
-                BIDENDTIME=bidEndTime,
-                REQUESTSTATUS=requestStatus,
-                PAYMENTSTATUS=paymentStatus,
-                CUSTOMERAPPID=customerAppId,
-                REQUESTWONBY=requestWonBy,
-                USERFULLNAME=fullName,
-                CITY=city,
-                PHONENUMBER=userAppId,
-                ALTNUMBER=alternateNumber,
-                PROFILEPIC=profilePicture,
-                BIDAMOUNT=finalAmount,
-                CUSTREVIEW_GENERALRATING=generalRating,
-                CANCELLATIONREASON=rejectionReason,
+    now_ist = _now_ist_naive()
+    items: List[tuple] = []
+    for req, full_name, profile_picture in cancelled_requests:
+        _assert_history_row_identity(req)
+        if getattr(req, "requestWonBy", None) != owner_id:
+            logger.error(
+                "HISTORY_DATA_INVALID rid=%s reason=won_by_mismatch",
+                getattr(req, "RID", None),
             )
-            for (
-                RID,
-                fromLocation,
-                fromLandmark,
-                toLocation,
-                toLandmark,
-                pickUpDate,
-                pickUpTime,
-                noOfAdults,
-                noOfKids,
-                carType,
-                acRequest,
-                carrierRequest,
-                bidEndTime,
-                requestStatus,
-                paymentStatus,
-                customerAppId,
-                requestWonBy,
-                finalAmount,
-                customerReviewDone,
-                rejectionReason,
-                fullName,
-                city,
-                userAppId,
-                alternateNumber,
-                profilePicture,
-                generalRating,
-            ) in cancelled_requests
-        ]
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="HISTORY_DATA_INVALID",
+            )
+        pickup_dt = _history_pickup_datetime(req)
+        if pickup_dt >= now_ist:
+            continue
 
-    except SQLAlchemyError as e:
-        db.rollback()
-        return EmailErrorResponse(message="ERROR", error=str(e))
+        rid = int(req.RID)
+        items.append(
+            (
+                pickup_dt,
+                rid,
+                VendorCancelledHistoryItem(
+                    requestId=rid,
+                    requestStatus=str(req.requestStatus),
+                    fromLocation=_history_required_location(
+                        req.fromLocation, rid=rid, field="from_location"
+                    ),
+                    toLocation=_history_required_location(
+                        req.toLocation, rid=rid, field="to_location"
+                    ),
+                    pickupDate=_history_pickup_date_value(req, pickup_dt),
+                    pickupTime=_history_pickup_time_value(req, pickup_dt),
+                    noOfAdults=int(req.noOfAdults or 0),
+                    noOfKids=int(req.noOfKids or 0),
+                    carType=req.carType or "",
+                    acRequested=bool(req.acRequest),
+                    carrierRequested=bool(req.carrierRequest),
+                    finalAmount=_history_nullable_final_amount(req.finalAmount),
+                    customerDisplayName=_history_required_customer_name(
+                        full_name, rid=rid
+                    ),
+                    customerProfileImageUrl=_history_optional_text(
+                        profile_picture
+                    ),
+                    cancellationReason=_history_cancellation_reason(
+                        req.rejectionReason
+                    ),
+                ),
+            )
+        )
+
+    items.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [row[2] for row in items]
 
 
 def get_all_requests_by_request_status(db: Session, customer_id : int, request_status : str):

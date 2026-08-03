@@ -1,4 +1,6 @@
-from pydantic import BaseModel,EmailStr
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict, EmailStr
 from datetime import datetime
 from typing import Any,Optional,List
 
@@ -130,7 +132,7 @@ class SMSErrorResponse(BaseModel):
     message: str
     error: Optional[str] = None
 
-# Schema for email input
+# Schema for email input (legacy unrestricted shape — not used by PR31 /sendemail)
 class EmailSend(BaseModel):
     message: str
     subject: str
@@ -143,6 +145,25 @@ class EmailSend(BaseModel):
     bcc_address: Optional[EmailStr] = None
     bcc_name: Optional[str] = None
     attachment_path: Optional[str] = None
+
+
+class InternalEmailPurpose(str, Enum):
+    """Bounded purpose identifiers for PR31 internal /sendemail audit/rate buckets."""
+
+    ADMIN_TEST = "ADMIN_TEST"
+    OPERATIONS = "OPERATIONS"
+    MIGRATION_COMPAT = "MIGRATION_COMPAT"
+
+
+class InternalEmailSendRequest(BaseModel):
+    """Restricted internal email request. No CC/BCC/attachments/HTML/from selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    purpose: InternalEmailPurpose
+    toAddress: EmailStr
+    subject: str
+    message: str
 
 
 # Response schema for email errors

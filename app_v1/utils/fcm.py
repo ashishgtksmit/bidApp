@@ -636,6 +636,9 @@ def _get_firebase_admin_app():
     """
     Initialize Firebase Admin SDK once and reuse it.
     Uses the same FIREBASE_SERVICE_ACCOUNT env JSON already used elsewhere.
+
+    When FIREBASE_DATABASE_URL is set, it is applied at initialize time so
+    messaging and RTDB share one OpenBid Admin app (PR26).
     """
     raw = os.getenv("FIREBASE_SERVICE_ACCOUNT", "").strip()
     if not raw:
@@ -651,11 +654,16 @@ def _get_firebase_admin_app():
     if missing:
         raise ValueError(f"ERROR_INCOMPLETE_SERVICE_ACCOUNT: missing {', '.join(missing)}")
 
+    options = None
+    database_url = (os.getenv("FIREBASE_DATABASE_URL") or "").strip()
+    if database_url:
+        options = {"databaseURL": database_url}
+
     try:
         return firebase_admin.get_app()
     except ValueError:
         cred = credentials.Certificate(service_account)
-        return firebase_admin.initialize_app(cred)
+        return firebase_admin.initialize_app(cred, options)
 
 
 def subscribe_tokens_to_topic(tokens: List[str], topic: str) -> Dict[str, Any]:

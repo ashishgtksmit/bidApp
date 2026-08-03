@@ -5,10 +5,15 @@ from ..schemas.request_table import (RequestResponse,NoBidsResponse,RequestByRid
                                      RequestCreate,AssignDriverRequest,RequestForUserResponse,
                                      RequestConfirmedCommonResponse,GetBookingReportResponse,
                                      CancelBookingBody, ReopenBookingResponse)
+from ..schemas.booking_history import (
+    CustomerBookingHistoryItem,
+    VendorBookingHistoryItem,
+    VendorCancelledHistoryItem,
+)
 from ..schemas.request_type_details import RequestTypeBase
 from ..schemas.bid_details import VendorRejectBody
 from ..utils.common import ErrorResponse,EmailErrorResponse
-from typing import List, Union
+from typing import List, Optional, Union
 from ..database import get_db
 from ..crud.request import (get_all_open_requests,get_all_requests_for_user,get_rid_by_details,
                             get_booking_report,get_all_open_requests_for_vendor,get_request_type,
@@ -30,11 +35,31 @@ def get_open_requests(db: Session = Depends(get_db),
     return get_all_open_requests(db)
 
 
-@router.get("/getallrequestforuser",response_model=Union[List[RequestForUserResponse],NoBidsResponse])
-def get_requests_user(customerAppId : str = Query(...), 
-                      user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                      db:Session = Depends(get_db)):
-    return get_all_requests_for_user(db,customer_app_id=customerAppId)
+@router.get(
+    "/getallrequestforuser",
+    response_model=List[CustomerBookingHistoryItem],
+    summary="Customer completed booking history (PR20)",
+)
+def get_requests_user(
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    customerAppId: Optional[str] = Query(
+        None,
+        description="Deprecated transitional identity. Must match JWT sub if sent.",
+        deprecated=True,
+    ),
+):
+    """
+    Past REQUEST - CONFIRMED bookings owned by JWT sub.
+
+    Flutter must not send customerAppId. Optional mismatch → 403.
+    Empty history → [].
+    """
+    return get_all_requests_for_user(
+        db,
+        user_id=user_id,
+        customer_app_id=customerAppId,
+    )
 
 
 @router.get("/getridbydetails",response_model=Union[RequestByRidResponse, NoBidsResponse])
@@ -180,11 +205,31 @@ def get_all_confirmed_customer_requests(db: Session = Depends(get_db),
                                         userAppId:str = Query(...)):
     return get_all_confirmed_requests_for_customer(db,user_app_id=userAppId)
 
-@router.get("/getallconfirmedrequestsforvendor",response_model=Union[List[RequestConfirmedForVendorResponse],EmailErrorResponse])
-def get_all_confirmed_vendor_requests(db: Session = Depends(get_db),
-                                      user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                      vendorId:str = Query(...)):
-    return get_all_confirmed_requests_for_vendor(db,vendor_id=vendorId)
+@router.get(
+    "/getallconfirmedrequestsforvendor",
+    response_model=List[VendorBookingHistoryItem],
+    summary="Vendor completed trip history (PR20)",
+)
+def get_all_confirmed_vendor_requests(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    vendorId: Optional[str] = Query(
+        None,
+        description="Deprecated transitional identity. Must match JWT sub if sent.",
+        deprecated=True,
+    ),
+):
+    """
+    Past REQUEST - CONFIRMED trips won by JWT sub (requestWonBy).
+
+    Flutter must not send vendorId. Optional mismatch → 403.
+    Empty history → [].
+    """
+    return get_all_confirmed_requests_for_vendor(
+        db,
+        user_id=user_id,
+        vendor_id=vendorId,
+    )
 
 @router.put("/reopenbooking", response_model=ReopenBookingResponse)
 def reopen_booking(
@@ -231,12 +276,31 @@ def driver_assign_to_request(
         background_tasks=background_tasks,
     )
 
-@router.get("/getallcancelledrequestsforvendor",response_model=Union[List[RequestConfirmedForVendorResponse],EmailErrorResponse])
-def get_all_vendor_cancelled_requests(db: Session = Depends(get_db),
-                                      vendorId:str = Query(...),
-                                      user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
-                                      ):
-    return get_all_cancelled_requests_for_vendor(db,vendor_id=vendorId)
+@router.get(
+    "/getallcancelledrequestsforvendor",
+    response_model=List[VendorCancelledHistoryItem],
+    summary="Vendor cancelled trip history (PR21)",
+)
+def get_all_vendor_cancelled_requests(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+    vendorId: Optional[str] = Query(
+        None,
+        description="Deprecated transitional identity. Must match JWT sub if sent.",
+        deprecated=True,
+    ),
+):
+    """
+    Past BOOKING - CANCELLED BY USER trips won by JWT sub (requestWonBy).
+
+    Flutter must not send vendorId. Optional mismatch → 403.
+    Empty history → []. Current/future cancellations remain on WSS.
+    """
+    return get_all_cancelled_requests_for_vendor(
+        db,
+        user_id=user_id,
+        vendor_id=vendorId,
+    )
 
 @router.get("/getallrequestforuserbystatus",response_model=Union[List[RequestConfirmedCommonResponse],EmailErrorResponse])
 def get_all_requests_by_request_status_endpoint(db:Session = Depends(get_db),

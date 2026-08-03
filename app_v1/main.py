@@ -13,6 +13,8 @@ from .endpoints.user import router as user_router
 from .endpoints.driver import router as driver_router
 from .endpoints.utils import router as utils_router
 from .endpoints.auth import router as auth_router
+from .endpoints.reporting import router as reporting_router
+from .endpoints.chat import router as chat_router
 from .database import Base, engine
 from .auth.deps import get_current_user_id
 # Ensure PR5 OTP / reset-token / rate-limit tables are registered before create_all.
@@ -50,6 +52,8 @@ app.include_router(bid_router, tags=['Bids'])
 app.include_router(user_router, tags=['User'])
 app.include_router(driver_router, tags=['Driver'])
 app.include_router(utils_router, tags=['Utilities'])
+app.include_router(reporting_router, tags=['Reporting'])
+app.include_router(chat_router, tags=['Chat'])
 
 Base.metadata.create_all(bind=engine)
 
