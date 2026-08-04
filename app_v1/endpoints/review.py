@@ -3,7 +3,7 @@ from typing import List
 from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
-from ..auth.deps import get_current_user_id
+from ..auth.deps import AuthenticatedUser, get_current_user
 from ..crud.review import (
     create_vendor_review,
     get_reviews_for_customer,
@@ -31,10 +31,11 @@ router = APIRouter()
 )
 def get_reviews_vendor(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     VENDORID: str = Query(...),
 ):
     """Public-safe vendor reviews for an existing vendor (any authenticated user)."""
+    user_id = current_user.user_app_id
     _ = user_id  # JWT gate only — vendor reviews are intentionally public-safe
     return get_reviews_for_vendor(db, vendor_id=VENDORID)
 
@@ -45,9 +46,10 @@ def get_reviews_vendor(
 )
 def get_reviews_customer(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """JWT-owned passenger reviews. CUSTOMERID query param is not accepted."""
+    user_id = current_user.user_app_id
     return get_reviews_for_customer(db, jwt_sub=user_id)
 
 
@@ -60,9 +62,10 @@ def insert_vendor_feedback(
     feedback_data: ReviewCreate,
     response: Response,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Customer rates the winning vendor for an eligible completed trip."""
+    user_id = current_user.user_app_id
     result = create_vendor_review(db, feedback_data, jwt_sub=user_id)
     response.status_code = status.HTTP_201_CREATED
     return result
@@ -77,9 +80,10 @@ def create_customer_review(
     insert_data: CreateCustomerReview,
     response: Response,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """Vendor rates the passenger for an eligible completed trip."""
+    user_id = current_user.user_app_id
     result = insert_customer_review(db, insert_data, jwt_sub=user_id)
     response.status_code = status.HTTP_201_CREATED
     return result

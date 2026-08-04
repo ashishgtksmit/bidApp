@@ -42,7 +42,7 @@ sys.modules.setdefault("firebase_admin.messaging", _fake_firebase.messaging)
 sys.modules.setdefault("firebase_admin.db", _fake_firebase.db)
 
 from app_v1.database import Base, get_db  # noqa: E402
-from app_v1.auth.deps import get_current_user_id  # noqa: E402
+from app_v1.auth.deps import AuthenticatedUser, get_current_user, get_current_user_id  # noqa: E402
 from app_v1.models.user_table import User  # noqa: E402
 from app_v1.models.request_table import Request  # noqa: E402
 from app_v1.models.otp_challenge import ApiRateLimitBucket  # noqa: E402
@@ -57,6 +57,20 @@ OTHER_ID = "9000000001"
 THREAD_ID = f"{SENDER_ID}-{RECIPIENT_ID}"  # SENDER < RECIPIENT numerically? 702.. < 863..
 MESSAGE_ID = "-NabcChatMsg001"
 
+
+
+def _pr38_auth_user(user_app_id: str, *, uid: int = 1):
+    """Test helper: AuthenticatedUser with phone business id (PR38)."""
+    from app_v1.auth.deps import AuthenticatedUser
+    return AuthenticatedUser(
+        uid=uid,
+        auth_subject=f"test-auth-subject-{user_app_id}",
+        user_app_id=str(user_app_id),
+        account_session_id="test-account-session",
+        session_version=1,
+        roles=("user",),
+        identity_version=2,
+    )
 
 @pytest.fixture()
 def engine():
@@ -98,6 +112,7 @@ def client(engine, db_session):
     app.include_router(utils_mod.router)
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: SENDER_ID
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(SENDER_ID)
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -272,12 +287,14 @@ def test_tombstoned_sender_forbidden(client, db_session):
     tomb = f"{SENDER_ID}.DELETED"
     # Override JWT to tombstone id
     client.app.dependency_overrides[get_current_user_id] = lambda: tomb
+    client.app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(tomb)
     _seed_user(db_session, tomb, full_name="Gone")
     _seed_user(db_session, RECIPIENT_ID)
     r = client.post("/chat/notifications", json=_body(), headers=_auth_headers())
     assert r.status_code == 403
     assert r.json()["detail"] == "CHAT_NOTIFICATION_NOT_ALLOWED"
     client.app.dependency_overrides[get_current_user_id] = lambda: SENDER_ID
+    client.app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(SENDER_ID)
 
 
 def test_locked_sender_forbidden(client, db_session):

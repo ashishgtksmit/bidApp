@@ -44,7 +44,7 @@ sys.modules.setdefault("firebase_admin.credentials", _fake_firebase.credentials)
 sys.modules.setdefault("firebase_admin.messaging", _fake_firebase.messaging)
 
 from app_v1.database import Base, get_db  # noqa: E402
-from app_v1.auth.deps import get_current_user_id  # noqa: E402
+from app_v1.auth.deps import AuthenticatedUser, get_current_user, get_current_user_id  # noqa: E402
 from app_v1.auth import internal as internal_auth  # noqa: E402
 from app_v1.auth import jwt as jwt_mod  # noqa: E402
 from app_v1.models.user_table import User  # noqa: E402
@@ -63,6 +63,20 @@ TOMBSTONE_ID = "7022359323.DELETED"
 ALLOWED_TO = "ops@example.com"
 DOMAIN_TO = "alerts@wizzride.com"
 
+
+
+def _pr38_auth_user(user_app_id: str, *, uid: int = 1):
+    """Test helper: AuthenticatedUser with phone business id (PR38)."""
+    from app_v1.auth.deps import AuthenticatedUser
+    return AuthenticatedUser(
+        uid=uid,
+        auth_subject=f"test-auth-subject-{user_app_id}",
+        user_app_id=str(user_app_id),
+        account_session_id="test-account-session",
+        session_version=1,
+        roles=("user",),
+        identity_version=2,
+    )
 
 @pytest.fixture()
 def engine():
@@ -112,6 +126,7 @@ def client(engine, db_session):
     app.include_router(location_mod.router)
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: USER_ID
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(USER_ID)
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -132,6 +147,7 @@ def client_vendor(engine):
     app.include_router(utils_mod.router)
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: VENDOR_ID
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(VENDOR_ID)
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -334,6 +350,7 @@ def test_10_tombstoned_user_rejected(client, db_session, engine, mock_sent):
     app.include_router(utils_mod.router)
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: TOMBSTONE_ID
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(TOMBSTONE_ID)
     with TestClient(app) as c:
         r = c.post("/sendemail", json=_valid_body(), headers=_auth_headers())
     assert r.status_code == 404
@@ -897,6 +914,7 @@ def test_76_different_callers_separate_buckets(client, seeded, engine, mock_sent
     app.include_router(utils_mod.router)
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: VENDOR_ID
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(VENDOR_ID)
     with TestClient(app) as c:
         r = c.post(
             "/sendemail",

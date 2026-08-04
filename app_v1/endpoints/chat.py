@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from ..auth.deps import get_current_user_id
+from ..auth.deps import AuthenticatedUser, get_current_user
 from ..crud.admin_number import resolve_support_identity
 from ..database import get_db
 from ..schemas.chat_media import (
@@ -44,7 +44,7 @@ router = APIRouter()
     },
 )
 def get_support_chat_config(
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -53,6 +53,7 @@ def get_support_chat_config(
     Never returns FCM tokens, email, bank/KYC, or AdminNumber dumps.
     Zero or multiple AdminNumber rows → available=false (safe unavailable).
     """
+    user_id = current_user.user_app_id
     # user_id proves auth; config is global for the environment.
     _ = user_id
     try:
@@ -96,7 +97,7 @@ def get_support_chat_config(
 )
 def create_chat_notification(
     body: ChatNotificationRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -106,6 +107,7 @@ def create_chat_notification(
     Body: threadId + messageId only. Recipient token, title, body, and URL are
     derived on the server. Notification failure never deletes the RTDB message.
     """
+    user_id = current_user.user_app_id
     try:
         outcome = dispatch_chat_notification(
             db,
@@ -142,7 +144,7 @@ def create_chat_notification(
 )
 def upload_chat_media_endpoint(
     body: ChatMediaUploadRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -152,6 +154,7 @@ def upload_chat_media_endpoint(
     No client-controlled sender/receiver/path/container. RTDB write remains on
     the client after a successful upload. Not the legacy ``/uploadchatdoc`` route.
     """
+    user_id = current_user.user_app_id
     try:
         outcome = upload_chat_media(
             db,
@@ -189,7 +192,7 @@ def upload_chat_media_endpoint(
 )
 def cleanup_chat_media_endpoint(
     body: ChatMediaCleanupRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -199,6 +202,7 @@ def cleanup_chat_media_endpoint(
     exists at ``Chats/{threadId}/{messageId}``. Never accepts URL/path/container
     from the client. Not a user-facing chat deletion API.
     """
+    user_id = current_user.user_app_id
     try:
         outcome = cleanup_chat_media(
             db,

@@ -10,11 +10,23 @@ Current OpenBid Flutter **does not** call PHP `entryApi.php`. Production mobile 
 * Authenticated WSS (`OpenBidEnvironment.webSocketUrl` + `OpenBidRealtimeService`)
 * Firebase RTDB (chat) and FCM (push)
 
-**PR34 (Flutter-only):** shared authenticated request executor for pilot services. **No FastAPI production changes** in PR34. No backend auth-retry was added.
+**PR34 (Flutter-only):** shared authenticated request executor introduced for 4 pilot services. **No FastAPI production changes** in PR34. No backend auth-retry was added.
+
+**PR35 (Flutter-only):** the remaining 16 authenticated domain services migrated onto the same shared executor (20 of 20 total). `PushNotificationService.syncFcmTokenToServer` remained excluded/unmigrated at PR35 time. **No FastAPI production changes** in PR35 either — the executor consolidation was entirely client-side.
+
+**PR36:** `PUT /fcmtokenupdate` ownership hardened (JWT `sub` sole authority, JSON body, no `userAppId`) and `PushNotificationService.syncFcmTokenToServer` migrated onto the shared executor via a new `OpenBidFcmTokenService`, closing the PR35 outlier (21 of 21 authenticated domain services now on the shared executor). See **PR36 — FCM Token Sync Hardening** below.
+
+**PR37:** Refresh-token lifecycle hardening — refresh-token-only `POST /refresh`, `sessionVersion`/`accountSessionId` DB identity, JWT session claims, password-reset/deletion revocation, hard HTTP refresh errors, Flutter token-pair v2 + auth-session generation. Migration package: `migrations/pr37_account_session_identity/`. Production apply **not** claimed unless operators run it.
+
+**PR38:** Immutable JWT subject — `authSubjectId` column + migration package `migrations/pr38_immutable_auth_subject/`; newly minted tokens use `sub=authSubjectId` with `identity_version=2` (`JWT_IDENTITY_VERSION_TO_MINT=2` default). Dual-compat accepts PR37 phone-sub while `JWT_ALLOW_LEGACY_PHONE_SUB=true` (default; when `false` → phone-sub → `SESSION_INVALID`). Typed `AuthenticatedUser` dependency; ownership compares use `user_app_id` (phone). `GET /getuserdetails` is queryless; `POST /logout` is JWT-owned. Phone remains the business id (columns / RTDB / worker). Worker/WSS protocol **unchanged**. Production migration apply, compatibility sunset, manual QA, and production telemetry **not** claimed. See `docs/OPENBID_IMMUTABLE_JWT_SUBJECT_PR38_PLAN.md`.
 
 ### Client assumption — `POST /refresh`
 
-Flutter clients assume `/refresh` still requires a **still-valid access JWT** (endpoint depends on authenticated current user). The Flutter `tokenRefreshBuffer` (120 seconds) is therefore the primary expiry protection. A hard-expired access token may be unable to refresh under the current contract. PR34 does not change this backend behavior.
+**PR37:** `/refresh` authenticates with the **refresh token body only**. A valid access JWT is **not** required. Older clients may still send `Authorization`; FastAPI ignores it for refresh ownership. Flutter posts `{ "refresh_token": "..." }` on the raw client with no Bearer header. Access lifetime remains minutes; refresh lifetime uses **days** (`REFRESH_TOKEN_EXPIRE_DAYS`). New tokens carry `session_version` + `session_id` (+ `jti`); legacy claimless refresh tokens are rejected (forced re-login). See `docs/OPENBID_REFRESH_TOKEN_LIFECYCLE_PR37_PLAN.md`.
+
+**PR38:** Refresh still validates refresh token only and remints with PR37 session claims; successful legacy phone-sub refresh converts to `authSubjectId` subject when minting `identity_version=2`.
+
+**WARNING:** Fixing the refresh expiry unit bug changes effective refresh lifetime from approximately **30 minutes** to **30 days** when `REFRESH_TOKEN_EXPIRE_DAYS=30`.
 
 PHP handlers in sibling `bidApp` trees **remain deployed** for old app versions or separate products. **PR33 did not delete PHP handlers** and made **no backend contract change**. Production telemetry is required before any PHP server retirement. PR10/PR11 bid routes remain active FastAPI sources for customer/vendor bidding.
 
@@ -54,9 +66,11 @@ python -m pytest tests/test_pr6_getuserdetails.py -q
 
 ## PR6 — GET /getuserdetails session profile contract
 
-Authenticated cold-start / session refresh uses `GET /getuserdetails?userAppId=`.
+Authenticated cold-start / session refresh uses `GET /getuserdetails`.
 
-**PR23 ownership harden:** JWT `sub` is authoritative. The required query `userAppId` must equal JWT `sub` (mismatch → **403**). Legitimate PR6 callers that send their own id continue to work. Missing user keeps soft `NO REGISTERED` (compatible with existing bootstrap). Do not use this route to read another user’s profile.
+**PR38:** Queryless / JWT-owned — no `userAppId` query; backend resolves via `AuthenticatedUser`. Dual-compat phone-sub tokens still work while `JWT_ALLOW_LEGACY_PHONE_SUB=true`.
+
+**PR23 ownership harden (historical):** When a query `userAppId` was required, it had to equal JWT phone-`sub` (mismatch → **403**). Missing user keeps soft `NO REGISTERED` (compatible with existing bootstrap). Do not use this route to read another user’s profile.
 
 | Field | Semantics |
 |-------|-----------|
@@ -70,7 +84,7 @@ Authenticated cold-start / session refresh uses `GET /getuserdetails?userAppId=`
 
 Missing user → `{ "message": "NO REGISTERED" }`.
 
-FCM: `POST /login` persists `fcmToken`; authenticated `PUT /fcmtokenupdate` also runs server-side topic subscription.
+FCM: `POST /login` persists `fcmToken`; authenticated `PUT /fcmtokenupdate` also runs server-side topic subscription. **PR36 hardened `PUT /fcmtokenupdate` ownership and contract** — see **PR36 — FCM Token Sync Hardening** below.
 
 ## PR8 — POST /insertrequest (create request)
 
@@ -562,6 +576,46 @@ PR30 did **not** add a customer-feedback API.
 **PHP:** unchanged. **Credentials:** rotate operationally (see checklist in PR31 plan); do not claim rotation completed.
 
 **Future removal:** monitor denied/success traffic ~30 days, migrate any legitimate callers to dedicated endpoints, then remove route in a later approved PR.
+
+## PR36 — FCM Token Sync Hardening
+
+Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authoritative IDOR and removing the last Flutter authenticated-executor outlier. **Flutter-only cross-reference:** `PushNotificationService.syncFcmTokenToServer` migrated onto `OpenBidAuthenticatedRequestExecutor` via a new `OpenBidFcmTokenService` — see `docs/FLUTTER_FCM_TOKEN_SYNC_FASTAPI_PR36_PLAN.md`.
+
+| Endpoint | Auth | Notes |
+|----------|------|-------|
+| `PUT /fcmtokenupdate` | JWT + `X-Client-Id` | JSON body only — no query params |
+
+**Contract:**
+
+```json
+{ "fcmToken": "<non-empty token>" }
+```
+
+`FcmTokenUpdateRequest` (`extra=forbid`); `fcmToken` required, 1–4096 chars.
+
+**Ownership (fixes a release-blocking IDOR):** JWT `sub` is the sole authority — the endpoint no longer accepts or trusts a client-supplied `userAppId`. Previously the route required a JWT but selected the mutation row by client query `userAppId`, so any authenticated caller could overwrite another live user's stored FCM token. That is now impossible: a caller can only ever set their own row's token.
+
+**Behaviour:**
+
+- Missing / tombstoned user → **404** `USER_NOT_FOUND`.
+- Locked (`lockApp=true`) live users are **allowed** to sync — account-lock UX still benefits from reaching the device.
+- Same-value replay → **200** `{ "message": "UPDATED" }` with **no** DB write, **no** `tableTimestamp` bump, and **no** forced topic re-subscribe.
+- Changed token → updates `User.fcmToken` only; does **not** bump the general `tableTimestamp` (FCM registration is infrastructure state, not business data).
+- Topic subscribe (`allusers` + `allvendors` if `alsoVendor`) runs **after** commit, best-effort; a subscribe failure still returns `UPDATED` (never surfaces provider errors to the client).
+- Row is locked with `SELECT ... FOR UPDATE` before comparison/write to avoid a logout/update race.
+
+**Errors:** hard **401** (JWT), **404** `USER_NOT_FOUND`, **422** (empty/oversized/invalid token), **429** `FCM_TOKEN_UPDATE_RATE_LIMITED`, **500** `FCM_TOKEN_UPDATE_FAILED`. Soft-200 `FAILED`/`ERROR` bodies are **retired** for this route.
+
+**Rate limiting:** `RATE_LIMIT_FCM_TOKEN_UPDATE_PER_USER` (default **10**) changed-token attempts per `RATE_LIMIT_FCM_TOKEN_UPDATE_WINDOW_SECONDS` (default **3600**) per user, via the shared `api_rate_limit_buckets` helper. Same-value replays do **not** consume the budget. The limiter is **fail-open** on DB errors (existing `enforce_rate_limit` default) — a limiter outage does not block legitimate token registration.
+
+**Logout fix:** `logout_user` CRUD now accepts an `fcm_token` kwarg. The endpoint already called it with `fcm_token=fcmToken`, but the prior CRUD signature had no such parameter — a pre-existing mismatch documented in earlier PR6/PR35 planning. Server-side logout continues to clear the DB token and unsubscribe the previously stored token from topics.
+
+**Not changed:** single-token model (`User.fcmToken` remains one column; no DB migration); Firebase project / service-account configuration; PHP / worker / WSS / RTDB; business FCM (still mutation-owned, PR8–PR13); chat push (PR26/PR27); internal notify routes (PR25).
+
+```bash
+./bin/pytest tests/test_pr36_fcm_token_sync.py -q
+./bin/pytest tests/test_pr6_getuserdetails.py tests/test_pr24_account_deletion.py -q
+```
 
 ```bash
 ./bin/pytest tests/test_pr31_generic_email_security.py -q

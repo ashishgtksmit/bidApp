@@ -34,7 +34,7 @@ sys.modules.setdefault("firebase_admin.credentials", _fake_firebase.credentials)
 sys.modules.setdefault("firebase_admin.messaging", _fake_firebase.messaging)
 
 from app_v1.database import Base, get_db  # noqa: E402
-from app_v1.auth.deps import get_current_user_id  # noqa: E402
+from app_v1.auth.deps import AuthenticatedUser, get_current_user, get_current_user_id  # noqa: E402
 from app_v1.models.user_table import User  # noqa: E402
 from app_v1.schemas.user_table import GetUserDetailsResponse, NoUserResponse  # noqa: E402
 from app_v1.crud.user import get_user_details  # noqa: E402
@@ -43,6 +43,20 @@ from app_v1.endpoints.user import router as user_router  # noqa: E402
 CUSTOMER_ID = "7022359323"
 OTHER_USER = "7000000002"
 
+
+
+def _pr38_auth_user(user_app_id: str, *, uid: int = 1):
+    """Test helper: AuthenticatedUser with phone business id (PR38)."""
+    from app_v1.auth.deps import AuthenticatedUser
+    return AuthenticatedUser(
+        uid=uid,
+        auth_subject=f"test-auth-subject-{user_app_id}",
+        user_app_id=str(user_app_id),
+        account_session_id="test-account-session",
+        session_version=1,
+        roles=("user",),
+        identity_version=2,
+    )
 
 @pytest.fixture()
 def db():
@@ -197,6 +211,7 @@ def _endpoint_client(engine, Session, user_id: str):
 
     app.dependency_overrides[get_db] = _override_db
     app.dependency_overrides[get_current_user_id] = lambda: user_id
+    app.dependency_overrides[get_current_user] = lambda: _pr38_auth_user(user_id)
     return TestClient(app)
 
 
@@ -219,6 +234,17 @@ def test_getuserdetails_endpoint_matching_user_app_id_succeeds(endpoint_db):
     row = response.json()[0]
     assert row["USERAPPID"] == CUSTOMER_ID
     assert row["FULLNAME"] == "Customer User"
+
+
+def test_getuserdetails_endpoint_queryless_succeeds(endpoint_db):
+    """PR38 — current Flutter path: no userAppId query."""
+    db, engine, Session = endpoint_db
+    _add_customer(db, user_app_id=CUSTOMER_ID)
+    client = _endpoint_client(engine, Session, CUSTOMER_ID)
+    response = client.get("/getuserdetails")
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["USERAPPID"] == CUSTOMER_ID
 
 
 def test_getuserdetails_endpoint_mismatched_user_app_id_403(endpoint_db):

@@ -18,7 +18,7 @@ from ..utils.common import ErrorResponse
 from ..database import get_db
 from sqlalchemy.orm import Session
 from ..crud.auth import login_user_auth, refresh_tokens, insert_user, update_password
-from ..auth.deps import get_current_user_id
+from ..auth.deps import validate_access_session
 from ..auth.jwt import decode_token
 from ..utils.otp import verify_otp_for_user
 from ..utils.rate_limit import client_ip_from_request, enforce_rate_limit
@@ -28,7 +28,7 @@ router = APIRouter()
 
 @router.post("/insertuser",response_model=ErrorResponse)
 def create_user(user_data:UserCreate, db:Session=Depends(get_db),
-                # user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                # AuthenticatedUser gate intentionally not applied (public registration).
                 ):
     return insert_user(db,user_data)
 
@@ -93,14 +93,25 @@ def user_update_password(
         reset_token=resetToken,
     )
 
-@router.post("/refresh", response_model=Union[TokenPair, ErrorResponse])
+@router.post(
+    "/refresh",
+    response_model=TokenPair,
+    # PR37: refresh_token body is the only credential. Authorization may be
+    # present from older clients but is never required or validated here.
+)
 def refresh_token_endpoint(
+    request: Request,
     data: RefreshRequest,
-    db: Session = Depends(get_db)
-    ,user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+    db: Session = Depends(get_db),
     x_client_id: Optional[str] = Header(default=None, alias="X-Client-Id"),
 ):
-    return refresh_tokens(db=db, refresh_token=data.refresh_token, client_id=x_client_id)
+    """Mint a new token pair from a valid refresh token (no access JWT gate)."""
+    return refresh_tokens(
+        db=db,
+        refresh_token=data.refresh_token,
+        client_id=x_client_id,
+        client_ip=client_ip_from_request(request),
+    )
 
 # --------------------------------------------------
 # NEW: strict WebSocket auth + exp for TTL
@@ -120,7 +131,7 @@ def ws_validate_for_websocket(
     - Returns appid + normalized flag + token exp (unix ts)
     """
 
-    # 1) Decode/validate JWT
+    # 1) Decode/validate JWT + PR38 identity resolve (returns AuthenticatedUser)
     try:
         payload = decode_token(
             db=db,
@@ -128,23 +139,13 @@ def ws_validate_for_websocket(
             client_id=body.client_id,
             verify_aud=True,
         )
+        authenticated = validate_access_session(db, payload=payload)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
-        )
-
-    if payload.get("type") != "access":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token type",
-        )
-
-    user_app_id = payload.get("sub")
-    if not user_app_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Token missing 'sub'",
         )
 
     exp = payload.get("exp")
@@ -154,16 +155,16 @@ def ws_validate_for_websocket(
             detail="Token missing 'exp'",
         )
 
-    # 2) Load user from DB
+    # 2) Load user from DB by UID (phone appid returned to worker unchanged)
     user = (
         db.query(User)
-        .filter(User.userAppId == user_app_id)
+        .filter(User.UID == authenticated.uid)
         .first()
     )
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
         )
 
     # 3) Normalize and validate flag

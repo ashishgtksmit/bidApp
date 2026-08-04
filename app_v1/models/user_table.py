@@ -1,6 +1,18 @@
+import uuid
 
 from sqlalchemy import Column, BigInteger, Text, Integer, String, Date, TIMESTAMP,Boolean,func
 from ..database import Base
+
+
+def _new_account_session_id() -> str:
+    """Cryptographically random per-row session identity (not derived from phone/UID)."""
+    return uuid.uuid4().hex
+
+
+def _new_auth_subject_id() -> str:
+    """Opaque immutable auth subject (never derived from phone/UID/email/session)."""
+    return uuid.uuid4().hex
+
 
 class User(Base):
     # __tablename__ = "userTable"
@@ -10,6 +22,22 @@ class User(Base):
     # PR24: expanded so soft-tombstone ids ({phone}.DELETED[+n]) are not truncated.
     userAppId = Column(String(64),unique=True,nullable=False)
     password = Column(Text, nullable=False)
+    # PR37 — per-account session identity (never expose in API/Flutter responses)
+    sessionVersion = Column(Integer, nullable=False, default=1)
+    accountSessionId = Column(
+        String(64),
+        nullable=False,
+        unique=True,
+        default=_new_account_session_id,
+    )
+    # PR38 — opaque immutable JWT subject (never expose in normal API/Flutter responses)
+    authSubjectId = Column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+        default=_new_auth_subject_id,
+    )
     alternateNumber = Column(String(10),nullable=True)
     fullName = Column(String(200),nullable=False)
     emailId = Column(String(200),nullable=False)

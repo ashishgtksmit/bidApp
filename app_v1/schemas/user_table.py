@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from typing import Literal, Optional,List,Union,Dict
 from datetime import date, datetime
 
@@ -12,6 +12,40 @@ class TrimmedBaseModel(BaseModel):
         if isinstance(v, str):
             return v.strip()
         return v
+
+
+_FCM_TOKEN_MAX_LENGTH = 4096
+_FCM_TOKEN_REJECT_LITERALS = frozenset({"null", "none", "na"})
+
+
+class FcmTokenUpdateRequest(BaseModel):
+    """PR36 authenticated FCM token registration body.
+
+    JWT ``sub`` selects the user row. Client must not supply ownership fields.
+    Extra body fields are rejected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fcmToken: str = Field(..., min_length=1, max_length=_FCM_TOKEN_MAX_LENGTH)
+
+    @field_validator("fcmToken", mode="before")
+    @classmethod
+    def validate_fcm_token(cls, v):
+        if v is None:
+            raise ValueError("INVALID_FCM_TOKEN")
+        text = str(v).strip()
+        if not text:
+            raise ValueError("INVALID_FCM_TOKEN")
+        if text.lower() in _FCM_TOKEN_REJECT_LITERALS:
+            raise ValueError("INVALID_FCM_TOKEN")
+        if len(text) > _FCM_TOKEN_MAX_LENGTH:
+            raise ValueError("INVALID_FCM_TOKEN")
+        if any(ord(ch) < 32 for ch in text):
+            raise ValueError("INVALID_FCM_TOKEN")
+        if any(ch.isspace() for ch in text):
+            raise ValueError("INVALID_FCM_TOKEN")
+        return text
     
 class User(TrimmedBaseModel):
     userAppId : str

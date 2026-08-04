@@ -22,7 +22,7 @@ from ..schemas.common_schema import (GenerateBlobSasRequest, GenerateBlobSasResp
                                      SendNotificationToSelectedDriversRequest, SendNotificationToSelectedDriversResponse)
 from ..database import get_db
 from typing import Union
-from ..auth.deps import get_current_user_id
+from ..auth.deps import AuthenticatedUser, get_current_user
 from ..auth.internal import (
     require_internal_notification_access,
     require_internal_email_access,
@@ -73,7 +73,7 @@ def _map_raw_token_notify_result(result: dict) -> EmailErrorResponse:
 def send_mail_to_user(
     email_data: InternalEmailSendRequest,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_email_access),
 ):
     """
@@ -82,6 +82,7 @@ def send_mail_to_user(
     Requires Bearer JWT + X-OpenBid-Internal-Key. Hidden from public OpenAPI.
     Plain text only; no CC/BCC/attachments; server-owned sender; recipient allow-list.
     """
+    user_id = current_user.user_app_id
     try:
         return send_internal_email(db, jwt_sub=user_id, request=email_data)
     except InternalEmailError as err:
@@ -97,10 +98,11 @@ def send_mail_to_user(
 @router.post("/sendfcmnotification",response_model=Union[ErrorResponse,EmailErrorResponse])
 def send_notification_to_fcm_token(
     fcm_data : FCMSend,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
 ):
     """Internal/admin only — raw FCM token dispatch. Not for ordinary mobile JWTs."""
+    user_id = current_user.user_app_id
     try:
         result = send_notification(
             title=fcm_data.title,
@@ -124,11 +126,12 @@ def send_notification_to_fcm_token(
 @router.post("/notificationtodriver",response_model=Union[ErrorResponse,EmailErrorResponse])
 def send_notification_to_userappid(
     notification_data : FCMSend,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
     db: Session = Depends(get_db),
 ):
     """Internal/admin only — notify by userAppId. Not for ordinary mobile JWTs."""
+    user_id = current_user.user_app_id
     try:
         result = send_notification_to_user(db, notification_data)
         return _map_user_notify_result(result)
@@ -140,8 +143,9 @@ def send_notification_to_userappid(
 
 @router.post("/readimageprivatepath",response_model=Union[GenerateBlobSasResponse,ErrorResponse])
 def generate_azure_blob_sas_endpoint(data: GenerateBlobSasRequest,
-                                        user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                                        current_user: AuthenticatedUser = Depends(get_current_user),  # ⬅️ now protected
                                         db: Session = Depends(get_db)):
+        user_id = current_user.user_app_id
         try:
             sas_url = generate_azure_blob_sas(blob_path=data.blobPath)
             return GenerateBlobSasResponse(message="SAS URL generated successfully", sasUrl=sas_url)
@@ -150,8 +154,9 @@ def generate_azure_blob_sas_endpoint(data: GenerateBlobSasRequest,
         
 @router.post("/uploadchatdoc",response_model=Union[UploadSupportDocsResponse,UploadSupportDocsErrorResponse])
 def upload_chat_support_docs(data: UploadSupportDocsRequest,
-                            user_id: str = Depends(get_current_user_id),  # ⬅️ now protected
+                            current_user: AuthenticatedUser = Depends(get_current_user),  # ⬅️ now protected
                             db: Session = Depends(get_db)):
+    user_id = current_user.user_app_id
     files = data.file if isinstance(data.file, list) else []
 
     if not files:
@@ -172,10 +177,11 @@ def upload_chat_support_docs(data: UploadSupportDocsRequest,
 )
 def send_notification_to_all_drivers_api(
     data: SendNotificationToAllDriversRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
 ):
     """Internal/admin only — topic broadcast to all drivers/vendors."""
+    user_id = current_user.user_app_id
     try:
         result = send_notification_to_all_drivers(
             title=data.title,
@@ -205,11 +211,12 @@ def send_notification_to_all_drivers_api(
 )
 def send_marketing_notification_to_numbers_api(
     data: SendMarketingNotificationToNumbersRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
     db: Session = Depends(get_db),
 ):
     """Internal/admin only — marketing notify to selected userAppIds."""
+    user_id = current_user.user_app_id
     try:
         ids = data.phoneNumber if isinstance(data.phoneNumber, list) else []
 
@@ -243,10 +250,11 @@ def send_marketing_notification_to_numbers_api(
 )
 def send_marketing_notification_to_all_users_api(
     data: SendMarketingNotificationToAllUsersRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
 ):
     """Internal/admin only — marketing topic broadcast to all users."""
+    user_id = current_user.user_app_id
     try:
         result = send_marketing_notification_to_all_users(
             title=data.title,
@@ -274,7 +282,7 @@ def send_marketing_notification_to_all_users_api(
 )
 def send_notification_to_selected_drivers_api(
     data: SendNotificationToSelectedDriversRequest,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     _: None = Depends(require_internal_notification_access),
     db: Session = Depends(get_db),
 ):
@@ -285,6 +293,7 @@ def send_notification_to_selected_drivers_api(
     Mutations call ``send_notification_to_selected_users`` directly and do not
     require this HTTP surface.
     """
+    user_id = current_user.user_app_id
     try:
         service_data = FCMSendDrivers(
             title=data.title,

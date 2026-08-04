@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from ..auth.deps import get_current_user_id
+from ..auth.deps import AuthenticatedUser, get_current_user
 from ..crud.vendor_earnings import get_vendor_earnings_report
 from ..database import get_db
 from ..schemas.vendor_earnings import VendorEarningsReport
@@ -23,7 +23,7 @@ router = APIRouter()
 )
 def vendor_earnings(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     startDate: Optional[str] = Query(
         None,
         description="Inclusive Asia/Kolkata start date (yyyy-MM-dd). Require with endDate.",
@@ -36,12 +36,13 @@ def vendor_earnings(
     """
     JWT-owned vendor earnings report.
 
-    Filters Request.requestWonBy == JWT sub.
+    Filters Request.requestWonBy == JWT-resolved userAppId.
     Counts past REQUEST - CONFIRMED pickups only (Asia/Kolkata).
     Metric is gross completed booking value (finalAmount), not paid/net.
     Optional startDate/endDate must both be supplied or both omitted.
     Empty eligible set → 200 zero-valued VendorEarningsReport.
     """
+    user_id = current_user.user_app_id
     return get_vendor_earnings_report(
         db,
         user_id=user_id,

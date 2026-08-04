@@ -49,6 +49,8 @@ import html
 from ..models.request_table import Request
 from ..models.driver_details import DriverDetail
 from ..utils.security import verify_and_update_password
+from ..utils.rate_limit import enforce_rate_limit
+import hashlib
 
 _logger = logging.getLogger(__name__)
 
@@ -582,24 +584,65 @@ def get_user_bank_details(
 #     finally:
 #         db.close()
 
-def fcm_token_update(db: Session, user_app_id: str, fcm_token: str):
+def fcm_token_update(
+    db: Session,
+    *,
+    user_id: str,
+    fcm_token: str,
+    auth_subject: str | None = None,
+):
+    """PR36 — JWT-owned FCM token set. Does not bump tableTimestamp.
+
+    PR38: rate-limit bucket uses hashed auth_subject when provided (never raw).
+    """
+    jwt_sub = str(user_id or "").strip()
+    cleaned_token = str(fcm_token or "").strip()
+    limit_identity = str(auth_subject or "").strip() or jwt_sub
+
+    if not jwt_sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+
     try:
         user = (
             db.query(User)
-            .filter(User.userAppId == str(user_app_id).strip())
+            .filter(User.userAppId == jwt_sub)
+            .with_for_update()
             .first()
         )
 
-        if not user:
-            return EmailErrorResponse(message="FAILED")
+        if user is None or _is_tombstone_user(user):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="USER_NOT_FOUND",
+            )
 
-        cleaned_token = str(fcm_token).strip() if fcm_token is not None else ""
-        if not cleaned_token or cleaned_token.lower() in {"null", "none", "na"}:
-            return EmailErrorResponse(message="ERROR", error="INVALID_FCM_TOKEN")
+        stored = (user.fcmToken or "").strip()
+        if stored == cleaned_token:
+            _logger.info(
+                "fcm_token_update_same_value user_hash=%s",
+                _safe_user_hash(limit_identity),
+            )
+            return ErrorResponse(message="UPDATED")
+
+        limited = enforce_rate_limit(
+            db,
+            bucket_key=f"fcmtokenupdate:user:{_safe_user_hash(limit_identity)}",
+            max_hits=int(os.getenv("RATE_LIMIT_FCM_TOKEN_UPDATE_PER_USER", "10")),
+            window_seconds=int(
+                os.getenv("RATE_LIMIT_FCM_TOKEN_UPDATE_WINDOW_SECONDS", "3600")
+            ),
+        )
+        if limited is not None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="FCM_TOKEN_UPDATE_RATE_LIMITED",
+            )
 
         user.fcmToken = cleaned_token
-        user.tableTimestamp = func.current_timestamp()
-
+        # FCM registration is infrastructure state — do not bump tableTimestamp.
         db.commit()
         db.refresh(user)
 
@@ -607,118 +650,61 @@ def fcm_token_update(db: Session, user_app_id: str, fcm_token: str):
         if bool(getattr(user, "alsoVendor", False)):
             topics.append(TOPIC_ALL_VENDORS)
 
-        topic_result = subscribe_token_to_topics(cleaned_token, topics)
-
-        if not topic_result.get("success"):
-            return EmailErrorResponse(
-                message="UPDATED",
-                error=f"TOPIC_SUBSCRIPTION_PARTIAL: {topic_result}"
+        try:
+            topic_result = subscribe_token_to_topics(cleaned_token, topics)
+            if not topic_result.get("success"):
+                _logger.info(
+                    "fcm_token_topic_subscribe_partial user_hash=%s",
+                    _safe_user_hash(limit_identity),
+                )
+        except Exception:
+            _logger.info(
+                "fcm_token_topic_subscribe_failed user_hash=%s",
+                _safe_user_hash(limit_identity),
             )
 
-        return EmailErrorResponse(message="UPDATED")
+        _logger.info(
+            "fcm_token_update_changed user_hash=%s",
+            _safe_user_hash(limit_identity),
+        )
+        return ErrorResponse(message="UPDATED")
 
-    except SQLAlchemyError as e:
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
         db.rollback()
-        return EmailErrorResponse(message="ERROR", error=str(e))
-    except Exception as e:
+        _logger.exception(
+            "fcm_token_update_db_failed user_hash=%s",
+            _safe_user_hash(limit_identity),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="FCM_TOKEN_UPDATE_FAILED",
+        ) from None
+    except Exception:
         db.rollback()
-        return EmailErrorResponse(message="ERROR", error=str(e))
+        _logger.exception(
+            "fcm_token_update_failed user_hash=%s",
+            _safe_user_hash(limit_identity),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="FCM_TOKEN_UPDATE_FAILED",
+        ) from None
 
-    
-# def login_user(db:Session, login_data : UserLogin):
-#     try:
-#         # Check for existing user
-#         with db.begin():
-#             user = db.query(
-#                 User.userAppId,
-#                 User.password, 
-#                 User.alternateNumber,
-#                 User.fullName,
-#                 User.emailId,
-#                 User.dob,
-#                 User.city,
-#                 User.gender,
-#                 User.profilePicture,
-#                 User.user_login_status,
-#                 User.alsoVendor,
-#                 User.rating,
-#                 User.customerRating,
-#                 User.totalNoOfReviews,
-#                 User.totalCustomerReviews             
-#                 ).filter(User.userAppId == login_data.userAppId).first()
 
-#             if not user:
-#                 return ErrorResponse(message="NOT REGISTERED")
-            
-#             # Unpack User
-#             (
-#                 user_app_id,
-#                 stored_password,
-#                 alternate_number,
-#                 full_name,
-#                 email_id,
-#                 dob,
-#                 city,
-#                 gender,
-#                 profile_picture,
-#                 user_login_status,
-#                 also_vendor,
-#                 rating,
-#                 customer_rating,
-#                 total_vendor_rating,
-#                 total_customer_rating
-#             ) = user
+def _safe_user_hash(user_app_id: str) -> str:
+    """Stable hashed user identifier for safe logs (never log raw phone)."""
+    digest = hashlib.sha256(str(user_app_id).encode("utf-8")).hexdigest()
+    return digest[:12]
 
-#             # Verify password
-#             if stored_password != login_data.password:
-#                 return ErrorResponse(message="USERNAME OR PASSWORD WRONG")
-            
-#             user_dict = {
-#                 "FULLNAME" : full_name,
-#                 "EMAIL" : email_id,
-#                 "APPID" : user_app_id,
-#                 "DOB" : dob,
-#                 "CITY" : city,
-#                 "GENDER" : gender,
-#                 "ALTERNATENUM" : alternate_number,
-#                 "PROFILEPIC" : profile_picture,
-#                 "VENDOR" : also_vendor,
-#                 "CUSTOMERRATING" : customer_rating,
-#                 "TOTALCUSTOMERRATING" : total_customer_rating
-#             }
 
-#             if also_vendor:
-#                 user_dict.update({
-#                     "VENDORRATING" : float(rating) if rating is not None else None,
-#                     "TOTALVENDORRATING" : total_vendor_rating
-#                 })
-            
-#             status = "LOGGEDIN"
-#             message = "LOGIN SUCCESS" if user_login_status != 'LOGGEDIN' else "ALREADY_LOGGEDIN"
+def logout_user(db: Session, user_app_id: str, fcm_token: Optional[str] = None):
+    """Clear login status and stored FCM token for the requested userAppId.
 
-#             updated = db.query(User).filter(
-#                 User.userAppId == login_data.userAppId,
-#                 User.password == login_data.password
-#             ).update({
-#                 User.user_login_status : status,
-#                 User.fcmToken : login_data.fcmToken,
-#                 User.tableTimestamp : func.current_timestamp()
-#             })
-
-#             db.commit()
-
-#             if updated==0:
-#                 return ErrorResponse(message="LOGIN_FAILED")
-            
-#             return LoginResponse(message=message,user=[user_dict])
-
-#     except SQLAlchemyError:
-#         db.rollback()
-#         return ErrorResponse(message="LOGIN_FAILED")
-#     finally:
-#         db.close()
-
-def logout_user(db: Session, user_app_id: str):
+    ``fcm_token`` is accepted for endpoint signature compatibility only.
+    Unsubscribe always uses the previously stored DB token.
+    """
     try:
         user = db.query(User).filter(User.userAppId == user_app_id).first()
         if not user:
@@ -730,8 +716,8 @@ def logout_user(db: Session, user_app_id: str):
         if bool(getattr(user, "alsoVendor", False)):
             topics.append(TOPIC_ALL_VENDORS)
 
-        status = "LOGGEDOUT"
-        user.user_login_status = status
+        status_value = "LOGGEDOUT"
+        user.user_login_status = status_value
         user.fcmToken = None
 
         db.commit()
@@ -743,15 +729,14 @@ def logout_user(db: Session, user_app_id: str):
                 pass
 
         return LogoutResponse(
-            message="LOGOUT_SUCCESS",
-            status=status,
+            messsage="LOGOUT_SUCCESS",
+            status=status_value,
             userAppId=user_app_id,
         )
 
     except SQLAlchemyError as e:
         db.rollback()
-        return ErrorResponse(message="LOGOUT_FAILED", error=str(e))
-    
+        return ErrorResponse(message="LOGOUT_FAILED", error=str(e))    
 # def delete_user(db : Session, user_data : UserDelete):
 #     try:                    
 #             # Verify user credentials using login_user
@@ -1002,6 +987,9 @@ def delete_user(db: Session, user_data: UserDelete, user_id: str):
         user.user_login_status = "LOGGEDOUT"
         user.deletionReason = user_data.deletionReason
         user.fcmToken = None
+        # PR37: revoke all outstanding tokens for this account row
+        user.sessionVersion = int(user.sessionVersion or 1) + 1
+        # accountSessionId retained on tombstone (phone-reuse protection)
         user.tableTimestamp = _ist_now_naive()
 
         db.commit()

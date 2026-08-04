@@ -1,211 +1,390 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from sqlalchemy.exc import SQLAlchemyError
-from ..schemas.user_table import UserLogin,LoginResponseWithTokens,TokenPair,UserCreate,WsAuthRequest,WsAuthResponse
-from ..utils.common import EmailErrorResponse
-from ..models.user_table import User
-from ..utils.security import verify_and_update_password
-from ..auth.jwt import create_token,decode_token,ACCESS_TOKEN_EXPIRE_MINUTES
-from typing import Optional
+"""Auth CRUD — login, refresh, insert, password reset (PR37 + PR38)."""
+
+from __future__ import annotations
+
+import hashlib
+import os
 from datetime import date, datetime
+from typing import Optional, Tuple
 
-# app_v1/crud/auth.py  (your file, patched)
-
-from sqlalchemy.orm import Session
+from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
-from ..schemas.user_table import UserLogin
-from ..schemas.user_table import LoginResponseWithTokens, TokenPair
+from sqlalchemy.orm import Session
+
+from ..auth.deps import (
+    record_legacy_refresh_converted,
+    resolve_token_user,
+)
+from ..auth.jwt import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    IDENTITY_VERSION_IMMUTABLE,
+    IDENTITY_VERSION_LEGACY_PHONE,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    identity_version_to_mint,
+)
+from ..models.user_table import User, _new_account_session_id, _new_auth_subject_id
+from ..schemas.user_table import (
+    LoginResponseWithTokens,
+    TokenPair,
+    UserCreate,
+    UserLogin,
+)
 from ..utils.common import EmailErrorResponse
-from ..models.user_table import User
+from ..utils.rate_limit import enforce_rate_limit
 from ..utils.security import verify_and_update_password
-from ..auth.jwt import create_token, decode_token, ACCESS_TOKEN_EXPIRE_MINUTES
-from typing import Optional
+
+
+def _is_tombstone_app_id(user_app_id: str | None) -> bool:
+    return ".DELETED" in str(user_app_id or "").upper()
+
+
+def _refresh_fingerprint(refresh_token: str) -> str:
+    return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:32]
+
+
+def _raise_refresh(status_code: int, detail: str) -> None:
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _roles_for_user(user: User) -> list[str]:
+    return ["vendor"] if bool(getattr(user, "alsoVendor", False)) else ["user"]
+
+
+def ensure_auth_subject_id(user: User) -> str:
+    """Return existing opaque authSubjectId, generating one if missing (pre-migration)."""
+    existing = str(getattr(user, "authSubjectId", "") or "").strip()
+    if existing:
+        return existing
+    user.authSubjectId = _new_auth_subject_id()
+    return str(user.authSubjectId)
+
+
+def _mint_subject_for_user(user: User) -> Tuple[str, int]:
+    """Return (auth_subject, identity_version) for newly minted tokens.
+
+    Version 2 → opaque authSubjectId.
+    Version 1 (emergency mint rollback only) → phone userAppId.
+    """
+    version = identity_version_to_mint()
+    if version == IDENTITY_VERSION_LEGACY_PHONE:
+        return str(user.userAppId), IDENTITY_VERSION_LEGACY_PHONE
+    auth_subject = ensure_auth_subject_id(user)
+    return auth_subject, IDENTITY_VERSION_IMMUTABLE
+
+
+def _mint_token_pair(
+    db: Session,
+    user: User,
+    *,
+    client_id: Optional[str],
+) -> TokenPair:
+    roles = _roles_for_user(user)
+    session_version = int(user.sessionVersion)
+    account_session_id = str(user.accountSessionId)
+    auth_subject, identity_version = _mint_subject_for_user(user)
+    access_token = create_access_token(
+        db=db,
+        auth_subject=auth_subject,
+        identity_version=identity_version,
+        session_version=session_version,
+        account_session_id=account_session_id,
+        client_id=client_id,
+        roles=roles,
+    )
+    refresh_token = create_refresh_token(
+        db=db,
+        auth_subject=auth_subject,
+        identity_version=identity_version,
+        session_version=session_version,
+        account_session_id=account_session_id,
+        client_id=client_id,
+    )
+    return TokenPair(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer",
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
 
 def login_user_auth(
-        db: Session,
-        login_data: UserLogin,
-        client_id: Optional[str],
+    db: Session,
+    login_data: UserLogin,
+    client_id: Optional[str],
 ):
     try:
-        # with db.begin():
-            user = db.query(
-                User.userAppId,
-                User.password,
-                User.alternateNumber,
-                User.fullName,
-                User.emailId,
-                User.dob,
-                User.city,
-                User.gender,
-                User.profilePicture,
-                User.user_login_status,
-                User.alsoVendor,
-                User.rating,
-                User.customerRating,
-                User.totalNoOfReviews,
-                User.totalCustomerReviews
-            ).filter(User.userAppId == login_data.userAppId).first()
+        user = (
+            db.query(User)
+            .filter(User.userAppId == login_data.userAppId)
+            .first()
+        )
 
-            if not user:
-                return EmailErrorResponse(message="NOT REGISTERED")
+        if not user:
+            return EmailErrorResponse(message="NOT REGISTERED")
 
-            (
-                user_app_id,
-                stored_password,
-                alternate_number,
-                full_name,
-                email_id,
-                dob,
-                city,
-                gender,
-                profile_picture,
-                user_login_status,
-                also_vendor,
-                rating,
-                customer_rating,
-                total_vendor_rating,
-                total_customer_rating
-            ) = user
+        if _is_tombstone_app_id(user.userAppId):
+            return EmailErrorResponse(message="NOT REGISTERED")
 
-            # 1) Verify password (supports bcrypt_sha256 and bcrypt)
-            ok, new_hash = verify_and_update_password(login_data.password, stored_password)
-            if not ok:
-                return EmailErrorResponse(message="USERNAME OR PASSWORD WRONG")
+        # 1) Verify password (supports bcrypt_sha256 and bcrypt)
+        ok, new_hash = verify_and_update_password(
+            login_data.password, user.password
+        )
+        if not ok:
+            return EmailErrorResponse(message="USERNAME OR PASSWORD WRONG")
 
-            # 2) If Passlib suggests an upgrade, persist it
-            if new_hash:
-                db.query(User).filter(User.userAppId == user_app_id).update({User.password: new_hash})
-                db.flush()
+        # 2) If Passlib suggests an upgrade, persist it (does NOT bump sessionVersion)
+        if new_hash:
+            user.password = new_hash
+            db.flush()
 
-            # 3) Build your original user payload
-            user_dict = {
-                "FULLNAME": full_name,
-                "EMAIL": email_id,
-                "APPID": user_app_id,
-                "DOB": dob,
-                "CITY": city,
-                "GENDER": gender,
-                "ALTERNATENUM": alternate_number,
-                "PROFILEPIC": profile_picture,
-                "VENDOR": also_vendor,
-                "CUSTOMERRATING": customer_rating,
-                "TOTALCUSTOMERRATING": total_customer_rating
-            }
-            if also_vendor:
-                user_dict.update({
-                    "VENDORRATING": float(rating) if rating is not None else None,
-                    "TOTALVENDORRATING": total_vendor_rating
-                })
+        user_app_id = user.userAppId
+        also_vendor = bool(user.alsoVendor)
 
-            status = "LOGGEDIN"
-            message = "LOGIN SUCCESS" if user_login_status != "LOGGEDIN" else "ALREADY_LOGGEDIN"
-
-            # 4) ✅ DO NOT compare with plaintext password here
-            updated = (
-                db.query(User)
-                .filter(User.userAppId == user_app_id)
-                .update({
-                    User.user_login_status: status,
-                    User.fcmToken: login_data.fcmToken,
-                    User.tableTimestamp: func.current_timestamp()
-                })
-            )
-            db.commit()
-            if updated == 0:
-                # This would be unusual now; keep as a safety
-                return EmailErrorResponse(message="LOGIN_FAILED")
-
-            # 5) Create tokens (typo fix: extra_claims)
-            roles = ["vendor"] if also_vendor else ["user"]
-            access_token = create_token(
-                db=db,
-                subject=user_app_id,
-                token_type="access",
-                client_id=client_id,
-                extra_claims={"roles": roles}   # <-- fixed name
-            )
-            refresh_token = create_token(
-                db=db,
-                subject=user_app_id,
-                token_type="refresh",
-                client_id=client_id
+        user_dict = {
+            "FULLNAME": user.fullName,
+            "EMAIL": user.emailId,
+            "APPID": user_app_id,
+            "DOB": user.dob,
+            "CITY": user.city,
+            "GENDER": user.gender,
+            "ALTERNATENUM": user.alternateNumber,
+            "PROFILEPIC": user.profilePicture,
+            "VENDOR": also_vendor,
+            "CUSTOMERRATING": user.customerRating,
+            "TOTALCUSTOMERRATING": user.totalCustomerReviews,
+        }
+        if also_vendor:
+            user_dict.update(
+                {
+                    "VENDORRATING": float(user.rating)
+                    if user.rating is not None
+                    else None,
+                    "TOTALVENDORRATING": user.totalNoOfReviews,
+                }
             )
 
-            return LoginResponseWithTokens(
-                message=message,
-                user=[user_dict],
-                access_token=access_token,
-                refresh_token=refresh_token,
-                token_type="bearer",
-                expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60  # seconds
-            )
+        login_status = "LOGGEDIN"
+        message = (
+            "LOGIN SUCCESS"
+            if user.user_login_status != "LOGGEDIN"
+            else "ALREADY_LOGGEDIN"
+        )
+
+        user.user_login_status = login_status
+        user.fcmToken = login_data.fcmToken
+        ensure_auth_subject_id(user)
+        user.tableTimestamp = func.current_timestamp()
+        db.commit()
+
+        pair = _mint_token_pair(db, user, client_id=client_id)
+
+        return LoginResponseWithTokens(
+            message=message,
+            user=[user_dict],
+            access_token=pair.access_token,
+            refresh_token=pair.refresh_token,
+            token_type="bearer",
+            expires_in=pair.expires_in,
+        )
 
     except SQLAlchemyError as e:
-        db.rollback()        
+        db.rollback()
         print(str(e))
         return EmailErrorResponse(message="LOGIN_FAILED")
     finally:
         db.close()
 
+
 def refresh_tokens(
-        db:Session,
-        refresh_token : str,
-        client_id : Optional[str]
+    db: Session,
+    refresh_token: str,
+    client_id: Optional[str],
+    *,
+    client_ip: Optional[str] = None,
 ):
-    try:
-        payload = decode_token(db=db,token=refresh_token,client_id=client_id)
-        if payload.get("type") != "refresh":
-            return EmailErrorResponse(message="INVALID_TOKEN_TYPE")
-        
-        user_app_id = payload.get("sub")
-        if not user_app_id:
-            return EmailErrorResponse(message="INVALID_TOKEN")
-        
-        exists = db.query(User).filter(User.userAppId == user_app_id).first()
-        if not exists:
-            return EmailErrorResponse(message="USER_NOT_FOUND")
-        
-        new_access = create_token(
-            db=db,
-            subject=user_app_id,
-            token_type="access",
-            client_id=client_id
-        )
-        new_refresh = create_token(
-            db=db,
-            subject=user_app_id,
-            token_type="refresh",
-            client_id=client_id
+    """Validate refresh token only; mint a new token pair (PR37 + PR38).
+
+    Raises HTTPException with hard statuses (no soft-200 auth errors).
+    Does not require or validate an access JWT.
+    Valid PR37 phone-sub refresh converts to a version-2 pair when minting v2.
+    """
+    if not refresh_token or not str(refresh_token).strip():
+        _raise_refresh(
+            status.HTTP_401_UNAUTHORIZED, "INVALID_REFRESH_TOKEN"
         )
 
-        return TokenPair(
-            access_token=new_access,
-            refresh_token=new_refresh,
-            token_type="bearer",
-            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES*60,
+    token_str = str(refresh_token).strip()
+    ip_bucket = client_ip or "unknown"
+    fp = _refresh_fingerprint(token_str)
+
+    def _invalid_rate_limit() -> None:
+        limited = enforce_rate_limit(
+            db,
+            bucket_key=f"refresh:invalid:fp:{fp}",
+            max_hits=int(
+                os.getenv("RATE_LIMIT_REFRESH_INVALID_PER_BUCKET", "10")
+            ),
+            window_seconds=int(
+                os.getenv("RATE_LIMIT_REFRESH_INVALID_WINDOW_SECONDS", "900")
+            ),
+            fail_closed=True,
+        )
+        if limited is not None:
+            _raise_refresh(
+                status.HTTP_429_TOO_MANY_REQUESTS, "REFRESH_RATE_LIMITED"
+            )
+        limited_ip = enforce_rate_limit(
+            db,
+            bucket_key=f"refresh:invalid:ip:{ip_bucket}",
+            max_hits=int(
+                os.getenv("RATE_LIMIT_REFRESH_INVALID_PER_BUCKET", "10")
+            ),
+            window_seconds=int(
+                os.getenv("RATE_LIMIT_REFRESH_INVALID_WINDOW_SECONDS", "900")
+            ),
+            fail_closed=True,
+        )
+        if limited_ip is not None:
+            _raise_refresh(
+                status.HTTP_429_TOO_MANY_REQUESTS, "REFRESH_RATE_LIMITED"
+            )
+
+    try:
+        try:
+            payload = decode_token(
+                db=db, token=token_str, client_id=client_id
+            )
+        except ValueError as exc:
+            _invalid_rate_limit()
+            msg = str(exc).lower()
+            if "expired" in msg:
+                _raise_refresh(
+                    status.HTTP_401_UNAUTHORIZED, "REFRESH_TOKEN_EXPIRED"
+                )
+            _raise_refresh(
+                status.HTTP_401_UNAUTHORIZED, "INVALID_REFRESH_TOKEN"
+            )
+
+        if payload.get("type") != "refresh":
+            _invalid_rate_limit()
+            _raise_refresh(
+                status.HTTP_401_UNAUTHORIZED, "INVALID_REFRESH_TOKEN"
+            )
+
+        # Pre-PR37 claimless / missing subject → reject before identity resolve
+        if (
+            not payload.get("sub")
+            or payload.get("session_version") is None
+            or not payload.get("session_id")
+        ):
+            _invalid_rate_limit()
+            _raise_refresh(
+                status.HTTP_401_UNAUTHORIZED, "INVALID_REFRESH_TOKEN"
+            )
+
+        # Reject identity-version downgrade attempts (v2 token claiming v1)
+        raw_iv = payload.get("identity_version")
+        if raw_iv is not None:
+            try:
+                claimed_iv = int(raw_iv)
+            except (TypeError, ValueError):
+                _invalid_rate_limit()
+                _raise_refresh(status.HTTP_401_UNAUTHORIZED, "SESSION_INVALID")
+            if claimed_iv not in (
+                IDENTITY_VERSION_LEGACY_PHONE,
+                IDENTITY_VERSION_IMMUTABLE,
+            ):
+                _invalid_rate_limit()
+                _raise_refresh(status.HTTP_401_UNAUTHORIZED, "SESSION_INVALID")
+
+        try:
+            authenticated = resolve_token_user(
+                db,
+                payload,
+                expected_type="refresh",
+                allow_legacy=None,
+                raise_session_invalid=True,
+            )
+        except HTTPException as exc:
+            detail = str(getattr(exc, "detail", "") or "")
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                _invalid_rate_limit()
+                if detail == "SESSION_INVALID":
+                    _raise_refresh(
+                        status.HTTP_401_UNAUTHORIZED, "SESSION_INVALID"
+                    )
+                _raise_refresh(
+                    status.HTTP_401_UNAUTHORIZED, "SESSION_INVALID"
+                )
+            raise
+
+        user = db.query(User).filter(User.UID == authenticated.uid).first()
+        if user is None or _is_tombstone_app_id(user.userAppId):
+            _invalid_rate_limit()
+            _raise_refresh(status.HTTP_401_UNAUTHORIZED, "SESSION_INVALID")
+
+        # lockApp: allowed for live users (PR37)
+        limited = enforce_rate_limit(
+            db,
+            bucket_key=f"refresh:valid:sid:{user.accountSessionId}",
+            max_hits=int(
+                os.getenv("RATE_LIMIT_REFRESH_VALID_PER_SESSION", "20")
+            ),
+            window_seconds=int(
+                os.getenv("RATE_LIMIT_REFRESH_VALID_WINDOW_SECONDS", "3600")
+            ),
+            fail_closed=True,
+        )
+        if limited is not None:
+            _raise_refresh(
+                status.HTTP_429_TOO_MANY_REQUESTS, "REFRESH_RATE_LIMITED"
+            )
+
+        ensure_auth_subject_id(user)
+        db.flush()
+
+        if authenticated.identity_version == IDENTITY_VERSION_LEGACY_PHONE:
+            record_legacy_refresh_converted()
+
+        return _mint_token_pair(db, user, client_id=client_id)
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        _raise_refresh(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "REFRESH_FAILED"
         )
     except Exception:
         db.rollback()
-        return EmailErrorResponse(message="INVALID_REFRESH_TOKEN")
-    finally:
-        db.close()
+        _raise_refresh(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "REFRESH_FAILED"
+        )
 
-def insert_user(db : Session, user_data : UserCreate):
+
+def insert_user(db: Session, user_data: UserCreate):
     try:
         with db.begin():
-            # Check for Existing User
-            existing_user = db.query(User).filter(User.userAppId == user_data.userAppId).first()
+            existing_user = (
+                db.query(User)
+                .filter(User.userAppId == user_data.userAppId)
+                .first()
+            )
             if existing_user:
                 return EmailErrorResponse(message="USER ALREADY PRESENT")
-            
-            #Set Defaults
+
             dob = user_data.dob if user_data.dob else date.today()
-            gender = user_data.gender if user_data.gender and user_data.gender.strip() != "" else "Male"
+            gender = (
+                user_data.gender
+                if user_data.gender and user_data.gender.strip() != ""
+                else "Male"
+            )
             joining_date = date.today()
             new_user = User(
-                userAppId = user_data.userAppId,
-                password = user_data.password,
+                userAppId=user_data.userAppId,
+                password=user_data.password,
                 alternateNumber=user_data.alternateNumber,
                 fullName=user_data.fullName,
                 dob=dob,
@@ -218,7 +397,10 @@ def insert_user(db : Session, user_data : UserCreate):
                 alsoVendor=False,
                 vendorApproved=False,
                 lockApp=False,
-                tableTimestamp=datetime.now()
+                sessionVersion=1,
+                accountSessionId=_new_account_session_id(),
+                authSubjectId=_new_auth_subject_id(),
+                tableTimestamp=datetime.now(),
             )
 
             db.add(new_user)
@@ -233,16 +415,14 @@ def insert_user(db : Session, user_data : UserCreate):
     finally:
         db.close()
 
+
 def update_password(
-        db: Session,
-        user_app_id: str,
-        password: str,
-        reset_token: str,
+    db: Session,
+    user_app_id: str,
+    password: str,
+    reset_token: str,
 ):
-    """
-    Update password only when a valid one-time reset_token (from POST /verifyotp)
-    is presented. Direct callers without OTP proof are rejected.
-    """
+    """Update password + increment sessionVersion in the same transaction."""
     from ..utils.otp import consume_reset_token
 
     try:
@@ -258,12 +438,19 @@ def update_password(
         if token_error is not None:
             return EmailErrorResponse(message=token_error)
 
-        update = db.query(User).filter(User.userAppId == user_app_id).update({
-            User.password: password
-        })
-        db.commit()
-        if update == 0:
+        user = (
+            db.query(User)
+            .filter(User.userAppId == user_app_id)
+            .with_for_update()
+            .first()
+        )
+        if user is None or _is_tombstone_app_id(user.userAppId):
             return EmailErrorResponse(message="FAILED")
+
+        current_sv = int(user.sessionVersion or 1)
+        user.password = password
+        user.sessionVersion = current_sv + 1
+        db.commit()
         return EmailErrorResponse(message="UPDATED")
     except SQLAlchemyError:
         db.rollback()

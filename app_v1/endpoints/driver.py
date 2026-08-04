@@ -30,7 +30,7 @@ from ..crud.driver_manage import (
     delete_driver_for_vendor,
 )
 from ..crud.vendor_bid import require_active_vendor
-from ..auth.deps import get_current_user_id
+from ..auth.deps import AuthenticatedUser, get_current_user
 from ..models.driver_details import DriverDetail
 from ..utils.driver_otp import (
     PURPOSE_CHANGE_DRIVER_PHONE,
@@ -78,9 +78,10 @@ def _raise_from_error_response(result: ErrorResponse) -> None:
 )
 def driver_details_update(
     driver_data: UpdateDriverDetail,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    user_id = current_user.user_app_id
     return update_driver_for_vendor(db, driver_data, user_id)
 
 
@@ -90,18 +91,20 @@ def driver_details_update(
 )
 def delete_driver(
     driver_data: DeleteDriverDetail,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    user_id = current_user.user_app_id
     return delete_driver_for_vendor(db, driver_data, user_id)
 
 
 @router.post("/insertnewdriver", response_model=Union[EmailErrorResponse, ErrorResponse])
 def create_new_driver(
     driver_data: CreateDriverDetail,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    user_id = current_user.user_app_id
     return insert_driver_for_vendor(db, driver_data, user_id)
 
 
@@ -111,7 +114,7 @@ def create_new_driver(
 )
 def read_all_drivers_for_vendors(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     userAppId: Optional[str] = Query(None),
 ):
     """
@@ -120,6 +123,7 @@ def read_all_drivers_for_vendors(
     JWT sub is authoritative. Optional userAppId must equal JWT sub when supplied.
     Empty ownership → []. Does not apply admin/KYC/availability filters.
     """
+    user_id = current_user.user_app_id
     return get_all_driver_for_vendor(
         db,
         user_id=user_id,
@@ -133,7 +137,7 @@ def read_all_drivers_for_vendors(
 )
 def read_managed_drivers_for_vendor(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
     """
     Management-safe driver list for Manage Drivers UI (PR14).
@@ -141,6 +145,7 @@ def read_managed_drivers_for_vendor(
     JWT sub is authoritative. Soft-deleted excluded via ownership.
     Omits USERAPPID, LICENSE_URL, DOCUMENT_URL, FCM.
     """
+    user_id = current_user.user_app_id
     return get_managed_drivers_for_vendor(db, user_id=user_id)
 
 
@@ -148,9 +153,10 @@ def read_managed_drivers_for_vendor(
 def driver_otp_send(
     body: DriverOtpSendRequest,
     request: Request,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    user_id = current_user.user_app_id
     require_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
 
@@ -218,9 +224,10 @@ def driver_otp_send(
 def driver_otp_verify(
     body: DriverOtpVerifyRequest,
     request: Request,
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    user_id = current_user.user_app_id
     require_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
     purpose = body.purpose.value
@@ -290,8 +297,9 @@ def driver_otp_verify(
 @router.get("/getalldrivers", response_model=Union[GetAllDriversResponse, ErrorResponse])
 def get_all_drivers_endpoint(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
+    user_id = current_user.user_app_id
     return get_all_drivers(db)
 
 
@@ -302,6 +310,7 @@ def get_all_drivers_endpoint(
 def upload_driver_document_endpoint(
     request: UploadDriverDocumentRequest,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id),
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ):
+    user_id = current_user.user_app_id
     return upload_driver_document_backend(db, request)
