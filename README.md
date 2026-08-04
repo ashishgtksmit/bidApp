@@ -2,6 +2,24 @@
 
 Python FastAPI backend for the OpenBid marketplace.
 
+## Flutter client transport (PR33 / PR34 notes)
+
+Current OpenBid Flutter **does not** call PHP `entryApi.php`. Production mobile networking uses:
+
+* FastAPI HTTPS (`OpenBidEnvironment.apiBaseUrl` + `OpenBidApiClient`)
+* Authenticated WSS (`OpenBidEnvironment.webSocketUrl` + `OpenBidRealtimeService`)
+* Firebase RTDB (chat) and FCM (push)
+
+**PR34 (Flutter-only):** shared authenticated request executor for pilot services. **No FastAPI production changes** in PR34. No backend auth-retry was added.
+
+### Client assumption — `POST /refresh`
+
+Flutter clients assume `/refresh` still requires a **still-valid access JWT** (endpoint depends on authenticated current user). The Flutter `tokenRefreshBuffer` (120 seconds) is therefore the primary expiry protection. A hard-expired access token may be unable to refresh under the current contract. PR34 does not change this backend behavior.
+
+PHP handlers in sibling `bidApp` trees **remain deployed** for old app versions or separate products. **PR33 did not delete PHP handlers** and made **no backend contract change**. Production telemetry is required before any PHP server retirement. PR10/PR11 bid routes remain active FastAPI sources for customer/vendor bidding.
+
+---
+
 ## PR5 — Public pre-login auth / OTP / password reset
 
 | Endpoint | Auth | Notes |
@@ -101,7 +119,7 @@ python -m pytest tests/test_pr9_update_delete_request.py -q
 
 Accept winner notification: `notify_vendor_bid_accepted` background task opens its own `SessionLocal()`; failures logged and do not undo commit.
 
-Vendor Flutter call sites for GET bids / insert/update/delete bid / accept/reject handshake remain on PHP.
+Flutter customer call sites use FastAPI (`OpenBidCustomerBidService`). Vendor bidding/handshake was migrated in PR11 (`OpenBidVendorBidService`). PHP handlers may remain for old clients; current Flutter does not call them (PR33).
 
 ```bash
 python -m pytest tests/test_pr10_customer_bids.py -q
@@ -133,7 +151,7 @@ python -m pytest tests/test_pr11_vendor_bidding.py -q
 | `PUT /reopenbooking?RID=` | No body; JWT owner; source `BOOKING - CANCELLED BY USER` + not reopened; future pickup + future `bidEndTime`; atomic clone new `BID - OPEN` RID (same pickup/`bidEndTime`/`specialRequest`); original `requestReopened=1`; response `{message, newRequestId}`; already reopened → 409; notify eligible vendors after commit like create |
 | `GET /getvendordetailsbyrid?RID=` | JWT owner; `requestWonBy` + confirmed bid relation; customer-safe `CustomerBookingVendorDetail` (includes `GENDER`; no FCM/KYC/docs/bank); empty → `[]` |
 
-Flutter: `OpenBidCustomerBookingService` — no PHP fallback on migrated call sites. Lists remain WSS-primary. Worker unchanged (already emits `REQUESTSTATUS` / `REJECTIONREASON` / `REOPENBOOKING` / `REQUESTWONBY` / `FINALAMOUNT`). `RateTheVenor` remains PHP.
+Flutter: `OpenBidCustomerBookingService` — no PHP fallback on migrated call sites. Lists remain WSS-primary. Worker unchanged (already emits `REQUESTSTATUS` / `REJECTIONREASON` / `REOPENBOOKING` / `REQUESTWONBY` / `FINALAMOUNT`). `RateTheVenor` uses FastAPI PR12/PR19 services (not PHP).
 
 ```bash
 python -m pytest tests/test_pr12_customer_booking_cancellation.py -q
