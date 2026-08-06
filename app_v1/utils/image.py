@@ -10,7 +10,8 @@ import hashlib
 import uuid
 from PIL import Image
 from typing import Any, List, Optional, Set, Dict, Tuple
-from datetime import datetime, time, timedelta, timezone
+import time as time_module
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlencode
 
 import httpx
@@ -587,7 +588,7 @@ def upload_support_docs_to_azure(files: List[str]) -> Dict[str, object]:
     uploaded_urls: List[str] = []
 
     for base64_file in files:
-        unique_name = f"{int(time.time())}_{uuid.uuid4().hex}"
+        unique_name = f"{int(time_module.time())}_{uuid.uuid4().hex}"
 
         success, result, _mime = azure_blob_upload_base64_file(
             blob_name_without_ext=unique_name,

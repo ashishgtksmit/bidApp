@@ -1,6 +1,8 @@
 # PR19 Reviews & Ratings — Database Migration
 
-**Status:** Scripts ready (not applied to production by this PR implementation)  
+**Status:** Scripts ready. Azure `bidapp` apply **blocked 2026-08-04** by
+duplicate `vendorreviews.RID` groups (RID 34, 44) — see
+`migrations/AZURE_DB_MIGRATION_APPLY_REPORT_2026-08-04.md`.  
 **Directory:** `migrations/pr19_reviews_ratings_decimal_unique_rid/`
 
 ## Purpose

@@ -9,7 +9,7 @@ from ..utils.common import (
     SendNotificationResponse,
     InternalEmailSendRequest,
 )
-from ..utils.image import generate_azure_blob_sas,upload_support_docs_to_azure
+from ..utils.image import generate_vendor_document_sas,upload_support_docs_to_azure
 from ..services.notifications import (send_notification_to_user,send_notification_to_selected_users,
                                       send_notification_to_all_drivers,send_marketing_notification_to_numbers,
                                       send_marketing_notification_to_all_users)
@@ -147,7 +147,8 @@ def generate_azure_blob_sas_endpoint(data: GenerateBlobSasRequest,
                                         db: Session = Depends(get_db)):
         user_id = current_user.user_app_id
         try:
-            sas_url = generate_azure_blob_sas(blob_path=data.blobPath)
+            # Uses AZURE_ACCOUNT_NAME / AZURE_ACCOUNT_KEY / AZURE_CONTAINER from env.
+            sas_url = generate_vendor_document_sas(blob_path=data.blobPath)
             return GenerateBlobSasResponse(message="SAS URL generated successfully", sasUrl=sas_url)
         except Exception as e:
             return ErrorResponse(message=str(e))
@@ -157,7 +158,13 @@ def upload_chat_support_docs(data: UploadSupportDocsRequest,
                             current_user: AuthenticatedUser = Depends(get_current_user),  # ⬅️ now protected
                             db: Session = Depends(get_db)):
     user_id = current_user.user_app_id
-    files = data.file if isinstance(data.file, list) else []
+    raw = data.file
+    if isinstance(raw, list):
+        files = raw
+    elif raw:
+        files = [raw]
+    else:
+        files = []
 
     if not files:
          return UploadSupportDocsErrorResponse(status="error", message="No files provided for upload")

@@ -1,7 +1,7 @@
 # PR38 — Immutable auth subject (`authSubjectId`)
 
-**Status:** Migration package implemented. Production apply is **not** claimed
-unless operators run and record apply/audit outputs.
+**Status:** Migration package implemented. Production apply on Azure `bidapp`
+(**2026-08-04**) — see `migrations/AZURE_DB_MIGRATION_APPLY_REPORT_2026-08-04.md`.
 
 ## Purpose
 

@@ -2589,13 +2589,13 @@ def upload_vendor_document_backend(
 ):
     try:
         vendor_id = data.vendorid
-        doc_type = data.doctype
+        doc_type = data.docType
         upload_raw = data.uploadFile if isinstance(data.uploadFile, str) else ""
 
         if not vendor_id or not doc_type or not upload_raw:
             return EmailErrorResponse(message="MISSING_PARAMETERS", error="ERROR_INVALID_INPUT")
         
-        user = db.query(User).filter(User.UID == vendor_id).first()
+        user = db.query(User).filter(User.userAppId == vendor_id).first()
 
         if not user:
             return EmailErrorResponse(message="ERROR", error="VENDOR_NOT_FOUND")
@@ -2625,7 +2625,7 @@ def upload_vendor_document_backend(
             
             return UploadVendorDocumentResponse(
                 status="SUCCESS",
-                doc_type=doc_type,
+                docType=doc_type,
                 column="profilePicture",
                 vendor=vendor_id,
                 url=new_url
@@ -2667,7 +2667,7 @@ def upload_vendor_document_backend(
                 pass
         return UploadVendorDocumentResponse(
             status="SUCCESS",
-            doc_type=doc_type,
+            docType=doc_type,
             column=column_name,
             vendor=vendor_id,
             url=new_url

@@ -672,28 +672,29 @@ def insert_car_details(db: Session, create_car: CarDetailsCreate):
 
 def get_all_cars(db: Session):
     try:
-        cars = db.query(CarTypeDetail).all()
+        cars = db.query(CarDetail).all()
 
         if not cars:
             return NoCarDetailsResponse(message="NO CARS FOUND")
         
         result = []
-        for car in cars :
+        for car in cars:
             result.append({
                 "CARID": car.CARID,
-                "USERAPPID" :car.userAppId,
-                "CARREGNO" : car.carRegNo,
-                "MODELYEAR" : car.modelYear,
-                "CARCOLOR" : car.carColor,
-                "OWNERNAME" : car.ownerName,
-                "REGISTRATIONDOC" : car.registrationDoc,
-                "POWEROFATTORNEYDOC" : car.powerOfAttorneyDoc,
-                "REGISTEREDON" : car.registeredOn.strftime('%Y-%m-%d %H:%M:%S') if car.registeredOn else None,
-                "ADMINAPPROVED" : bool(car.adminApproved),
-                "CAROWNEDBYSAMEVENDOR" : bool(car.carOwnedBySameVendor),                
-                "CTD" : car.CTD,
-                "IMAGEVEHICLEFRONT" : car.imageVehicleFront,
-                "IMAGEVEHICLESIDE" : car.imageVehicleSide
+                "USERAPPID": car.userAppId,
+                "CARREGNO": car.carRegNo,
+                "CARMODEL": car.carModel,
+                "MODELYEAR": car.modelYear,
+                "CARCOLOR": car.carColor,
+                "OWNERNAME": car.ownerName,
+                "REGISTRATIONDOC": car.registrationDoc,
+                "POWEROFFATTORNEYDOC": car.powerOfAttorneyDoc,
+                "REGISTEREDON": car.registeredOn.strftime('%Y-%m-%d %H:%M:%S') if car.registeredOn else None,
+                "ADMINAPPROVED": bool(car.adminApproved),
+                "CAROWNEDBYSAMEVENDOR": bool(car.carOwnedBySameVendor),
+                "CTD": car.CTD,
+                "IMAGEVEHICLEFRONT": car.imageVehicleFront,
+                "IMAGEVEHICLESIDE": car.imageVehicleSide,
             })
 
         return result
@@ -723,16 +724,19 @@ def update_car_approval_status(db: Session, data : UpdateCarApprovalStatusReques
 
 
 def upload_car_document_backend(
-        db:Session,
-        data : UploadCarDocumentRequest
+        db: Session,
+        data: UploadCarDocumentRequest,
+        user_id: str,
 ):
     try:
         car = db.query(CarDetail).filter(CarDetail.CARID == data.carId).first()
         if not car:
             return ErrorResponse(message="NO ROW UPDATED")
-        
-        if not car:
-            return ErrorResponse(message="ERROR", error="CAR_NOT_FOUND")
+
+        owner_id = str(getattr(car, "userAppId", "") or "").strip()
+        jwt_sub = str(user_id or "").strip()
+        if not jwt_sub or owner_id != jwt_sub:
+            return ErrorResponse(message="ERROR", error="NOT_AUTHORIZED")
 
         doc_meta = {
             "REGISTRATIONDOC": {
@@ -763,7 +767,7 @@ def upload_car_document_backend(
         car_reg_no_raw = car.carRegNo or ""
         old_url = getattr(car, column_name, None)
 
-        # 🔴 Same sanitization as PHP
+        # Same sanitization as PHP
         car_reg_no_sanitized = (
             str(car_reg_no_raw).replace(" ", "").upper()
         )
@@ -776,9 +780,13 @@ def upload_car_document_backend(
             "IMAGEVEHICLESIDE",
         )
 
+        upload_raw = data.uploadFile if isinstance(data.uploadFile, str) else ""
+        if not upload_raw:
+            return ErrorResponse(message="ERROR", error="ERROR_MISSING_UPLOADFILE")
+
         ok, new_url = azure_blob_upload(
             blob_name=blob_name,
-            base64_data=data.uploadFile,
+            base64_data=upload_raw,
             make_public=make_public,
         )
 

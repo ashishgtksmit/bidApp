@@ -32,8 +32,9 @@ python migrations/pr24_user_tombstone_identifier_length/apply_migration.py
 
 ## Notes
 
-* Production preflight/apply must be run by operators — unit tests do not apply
-  this migration to production.
+* Production preflight/apply on Azure `bidapp` completed **2026-08-04** — see
+  `migrations/AZURE_DB_MIGRATION_APPLY_REPORT_2026-08-04.md`. Unit tests do not
+  apply this migration to production.
 * Do not silently truncate tombstones.
 * Related historical tables (`requesttable.customerAppId`, etc.) are **not**
   widened in PR24; they retain original phone strings after tombstone rename.

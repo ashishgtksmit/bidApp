@@ -452,7 +452,7 @@ FIREBASE_DATABASE_URL=https://opnbd-a23e1-default-rtdb.asia-southeast1.firebased
 
 **Cleanup:** Re-authorize; require RTDB message **absent**; delete deterministic blob only; missing blob → **DELETED**; message present → **409** `CHAT_MEDIA_ALREADY_COMMITTED`. Not a user deletion API. Best-effort orphans only.
 
-**Legacy:** `POST /uploadchatdoc` remains deployed/unhardened and is **not** the mobile contract. PHP `uploadchatdoc` retained unused by migrated Flutter. No worker changes. No DB migration.
+**Legacy:** `POST /uploadchatdoc` remains deployed and is **not** the mobile contract (prefer `POST /chat/media`). Hotfix (2026-08-06): fixed `time.time` shadow (`datetime.time` import) and single-file body handling so Azure chat-docs uploads work when `AZURE_CHAT_DOCS_*` is configured. PHP `uploadchatdoc` retained unused by migrated Flutter. No worker changes. No DB migration.
 
 Env:
 
