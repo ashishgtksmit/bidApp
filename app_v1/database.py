@@ -6,7 +6,9 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 
-load_dotenv()
+# Azure App Settings / process environment are authoritative in production.
+# Never override already-set process env (including DOMAIN_EVENT_* flags).
+load_dotenv(override=False)
 
 # Read variables
 DB_USERNAME = os.getenv("DB_USERNAME")

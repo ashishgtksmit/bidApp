@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +19,7 @@ from .endpoints.reporting import router as reporting_router
 from .endpoints.chat import router as chat_router
 from .database import Base, engine
 from .auth.deps import get_current_user_id
+from .events.outbox import log_domain_event_flag_snapshot
 # Ensure PR5 OTP / reset-token / rate-limit tables are registered before create_all.
 from .models import otp_challenge as _otp_challenge_models  # noqa: F401
 # Ensure PR14 driver OTP challenge / token tables are registered before create_all.
@@ -24,9 +27,18 @@ from .models import driver_otp as _driver_otp_models  # noqa: F401
 import traceback
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Safe boolean flag snapshot only — proves App Setting recycle to operators.
+    try:
+        log_domain_event_flag_snapshot(reason="startup")
+    except Exception:
+        # Never block API boot on diagnostics.
+        pass
+    yield
 
 
-app = FastAPI(title="OpenBid")
+app = FastAPI(title="OpenBid", lifespan=_lifespan)
 
 # -------- CORS (for Angular at http://localhost:4200) --------
 origins = [

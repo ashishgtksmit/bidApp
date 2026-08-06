@@ -22,7 +22,7 @@ from ..models.driver_otp import DriverOtpChallenge, DriverOtpToken
 from ..utils.common import ErrorResponse
 from ..utils.otp import hash_otp, send_exotel_sms
 
-load_dotenv()
+load_dotenv(override=False)
 
 DRIVER_OTP_EXPIRY_MINUTES = int(os.getenv("DRIVER_OTP_EXPIRY_MINUTES", "5"))
 DRIVER_OTP_MAX_ATTEMPTS = int(os.getenv("DRIVER_OTP_MAX_ATTEMPTS", "5"))

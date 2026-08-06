@@ -137,7 +137,7 @@ from pydantic import EmailStr
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-load_dotenv()
+load_dotenv(override=False)
 
 def send_email(
     message: str,

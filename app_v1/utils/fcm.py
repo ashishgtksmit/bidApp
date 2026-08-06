@@ -215,7 +215,7 @@ import httpx
 import jwt
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)
 
 
 DEFAULT_NOTIFICATION_TYPE = "passengernotification"

@@ -17,7 +17,7 @@ from ..models.otp_challenge import OtpChallenge, PasswordResetToken
 from ..schemas.user_table import OtpVerifyResponse
 from ..utils.common import ErrorResponse
 
-load_dotenv()
+load_dotenv(override=False)
 
 OTP_EXPIRY_MINUTES = int(os.getenv("OTP_EXPIRY_MINUTES", "5"))
 OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))

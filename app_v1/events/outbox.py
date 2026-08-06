@@ -29,30 +29,74 @@ from .schemas import DomainEventEnvelopeV1
 _logger = logging.getLogger("openbid.events.outbox")
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY_EXPLICIT = frozenset({"0", "false", "no", "off", ""})
 
 # Metrics hooks (in-process counters; safe for unit tests / App Insights later).
 _METRIC_OUTBOX_APPENDED: Dict[str, int] = defaultdict(int)
 _METRIC_OUTBOX_SKIPPED_DISABLED: Dict[str, int] = defaultdict(int)
 _METRIC_OUTBOX_APPEND_FAILED: Dict[str, int] = defaultdict(int)
+_METRIC_FLAG_MALFORMED: Dict[str, int] = defaultdict(int)
 
 # Backward-compatible PR39 aliases.
 _METRIC_BID_CREATED_EMITTED = 0
 _METRIC_BID_CREATED_SKIPPED_DISABLED = 0
+
+# Configuration source categories (sanitized; never dump env values).
+CONFIG_SOURCE_PROCESS_ENV = "azure_or_process_environment"
+CONFIG_SOURCE_DEFAULT = "default"
+CONFIG_SOURCE_TEST_OVERRIDE = "test_override"
+
+
+def env_flag_raw(name: str) -> Optional[str]:
+    """Return raw env string or None when unset."""
+    return os.environ.get(name)
 
 
 def env_flag_enabled(name: str, *, default: str = "false") -> bool:
     """
     Centralized env flag parser.
 
-    Defaults false. Never raises on malformed env. Accepts 1/true/yes/on only.
+    Accepted true (case-insensitive, trimmed): 1, true, yes, on.
+    Everything else fails closed (false), including unset, empty, and malformed.
+    Never raises. Malformed values increment a safe warning metric.
     """
     try:
-        raw = os.getenv(name, default)
+        if name not in os.environ:
+            raw = default
+            present = False
+        else:
+            raw = os.environ.get(name)
+            present = True
         if raw is None:
             return False
-        return str(raw).strip().lower() in _TRUTHY
+        normalized = str(raw).strip().lower()
+        if normalized in _TRUTHY:
+            return True
+        if present and normalized not in _FALSY_EXPLICIT:
+            _METRIC_FLAG_MALFORMED[name] += 1
+            _logger.warning(
+                "domain_event_flag_malformed flag=%s fail_closed=true "
+                "metric_flag_malformed=%s",
+                name,
+                _METRIC_FLAG_MALFORMED[name],
+            )
+        return False
     except Exception:
         return False
+
+
+def env_flag_source_category(name: str) -> str:
+    """
+    Classify where the effective flag value comes from.
+
+    Does not report raw values. Packaged dotenv must not override process env
+    (load_dotenv override=False); when the key is present in os.environ it is
+    treated as Azure/process environment (or a test monkeypatch).
+    """
+    if name in os.environ:
+        # Tests commonly monkeypatch os.environ; production App Settings land here.
+        return CONFIG_SOURCE_PROCESS_ENV
+    return CONFIG_SOURCE_DEFAULT
 
 
 def domain_events_enabled() -> bool:
@@ -77,11 +121,121 @@ def event_emission_enabled(event_type: str) -> bool:
     """
     Emission gate: DOMAIN_EVENTS_ENABLED AND the relevant per-event flag.
 
-    Both default false. Unknown event types are never enabled via flags.
+    Both default false. Master alone never enables an event.
+    Unknown event types are never enabled via flags.
     """
     if not domain_events_enabled():
         return False
     return event_type_enabled(event_type)
+
+
+def deployment_revision_hint() -> str:
+    """Best-effort sanitized revision identity (no secrets)."""
+    for key in (
+        "OPENBID_DEPLOY_REVISION",
+        "GITHUB_SHA",
+        "WEBSITE_DEPLOYMENT_ID",
+        "SCM_COMMIT_ID",
+    ):
+        val = os.environ.get(key)
+        if val:
+            return str(val).strip()[:40]
+    return "unknown"
+
+
+def instance_id_hash() -> str:
+    """Short hash of instance id for multi-instance correlation (not raw id)."""
+    raw = (
+        os.environ.get("WEBSITE_INSTANCE_ID")
+        or os.environ.get("HOSTNAME")
+        or "local"
+    )
+    return hashlib.sha256(str(raw).encode("utf-8")).hexdigest()[:12]
+
+
+def flag_snapshot_booleans() -> Dict[str, Any]:
+    """Sanitized boolean snapshot of master + registered per-event flags."""
+    per_event = {
+        event_type: bool(env_flag_enabled(flag_name))
+        for event_type, flag_name in EVENT_TYPE_FLAG_ENV.items()
+    }
+    return {
+        "DOMAIN_EVENTS_ENABLED": bool(domain_events_enabled()),
+        "per_event": per_event,
+        "DOMAIN_EVENTS_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENTS_ENABLED"
+        ),
+        "DOMAIN_EVENT_BID_CREATED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_BID_CREATED_ENABLED"
+        ),
+    }
+
+
+def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
+    """
+    Safe structured log of interpreted domain-event flags.
+
+    Never logs secrets, raw account ids, or full environ dumps.
+    """
+    snap = flag_snapshot_booleans()
+    per = snap["per_event"]
+    _logger.info(
+        "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
+        "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
+        "master_source=%s bid_created_source=%s "
+        "pr40_any_enabled=%s",
+        reason,
+        deployment_revision_hint(),
+        instance_id_hash(),
+        snap["DOMAIN_EVENTS_ENABLED"],
+        per.get(EVENT_BID_CREATED, False),
+        snap["DOMAIN_EVENTS_ENABLED_source"],
+        snap["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
+        any(
+            enabled
+            for et, enabled in per.items()
+            if et != EVENT_BID_CREATED
+        ),
+    )
+
+
+def describe_emission_decision(event_type: str) -> Dict[str, Any]:
+    """Return sanitized emission decision details for diagnostics/tests."""
+    master = domain_events_enabled()
+    per_event = event_type_enabled(event_type)
+    enabled = bool(master and per_event)
+    flag_name = EVENT_TYPE_FLAG_ENV.get(event_type)
+    return {
+        "event_type": event_type,
+        "emission_enabled": enabled,
+        "master_enabled": bool(master),
+        "per_event_enabled": bool(per_event),
+        "per_event_flag": flag_name,
+        "master_source": env_flag_source_category("DOMAIN_EVENTS_ENABLED"),
+        "per_event_source": (
+            env_flag_source_category(flag_name) if flag_name else CONFIG_SOURCE_DEFAULT
+        ),
+        "revision": deployment_revision_hint(),
+        "instance_hash": instance_id_hash(),
+    }
+
+
+def log_emission_decision(event_type: str, *, decision: Optional[Dict[str, Any]] = None) -> None:
+    """Log emission gate decision (boolean flags only)."""
+    d = decision or describe_emission_decision(event_type)
+    _logger.info(
+        "domain_event_emission_decision eventType=%s enabled=%s "
+        "master=%s per_event=%s master_source=%s per_event_source=%s "
+        "revision=%s instance_hash=%s",
+        d["event_type"],
+        d["emission_enabled"],
+        d["master_enabled"],
+        d["per_event_enabled"],
+        d["master_source"],
+        d["per_event_source"],
+        d["revision"],
+        d["instance_hash"],
+    )
 
 
 def hash_actor_auth_subject(actor_auth_subject: Optional[str]) -> Optional[str]:
@@ -198,11 +352,19 @@ def record_event_skipped_disabled(event_type: str) -> None:
     global _METRIC_BID_CREATED_SKIPPED_DISABLED
     if event_type == EVENT_BID_CREATED:
         _METRIC_BID_CREATED_SKIPPED_DISABLED += 1
-    # Default flags are off — avoid info-level spam on every mutation.
-    _logger.debug(
-        "outbox_skipped_disabled eventType=%s metric_outbox_skipped_disabled=%s",
+    # INFO when master is on (rollback / per-event off) so ops can prove suppression.
+    # DEBUG when master is off to avoid spam on every mutation with flags default-off.
+    decision = describe_emission_decision(event_type)
+    log_fn = _logger.info if decision["master_enabled"] else _logger.debug
+    log_fn(
+        "outbox_skipped_disabled eventType=%s metric_outbox_skipped_disabled=%s "
+        "master=%s per_event=%s revision=%s instance_hash=%s",
         event_type,
         _METRIC_OUTBOX_SKIPPED_DISABLED[event_type],
+        decision["master_enabled"],
+        decision["per_event_enabled"],
+        decision["revision"],
+        decision["instance_hash"],
     )
 
 
@@ -225,9 +387,12 @@ def maybe_append_domain_event(
     Returns the row when appended, None when skipped (flags off).
     Raises on append/flush failure so the caller can roll back.
     """
-    if not event_emission_enabled(event_type):
+    decision = describe_emission_decision(event_type)
+    if not decision["emission_enabled"]:
         record_event_skipped_disabled(event_type)
         return None
+    # Log affirmative gate once per append path (pairs with outbox_event_appended).
+    log_emission_decision(event_type, decision=decision)
     return append_outbox_event(
         db,
         event_type=event_type,
@@ -245,4 +410,16 @@ def get_metrics() -> Dict[str, Any]:
         "outbox_appended": dict(_METRIC_OUTBOX_APPENDED),
         "outbox_skipped_disabled": dict(_METRIC_OUTBOX_SKIPPED_DISABLED),
         "outbox_append_failed": dict(_METRIC_OUTBOX_APPEND_FAILED),
+        "flag_malformed": dict(_METRIC_FLAG_MALFORMED),
     }
+
+
+def _reset_metrics_for_tests() -> None:
+    """Test helper: clear in-process counters between cases."""
+    global _METRIC_BID_CREATED_EMITTED, _METRIC_BID_CREATED_SKIPPED_DISABLED
+    _METRIC_OUTBOX_APPENDED.clear()
+    _METRIC_OUTBOX_SKIPPED_DISABLED.clear()
+    _METRIC_OUTBOX_APPEND_FAILED.clear()
+    _METRIC_FLAG_MALFORMED.clear()
+    _METRIC_BID_CREATED_EMITTED = 0
+    _METRIC_BID_CREATED_SKIPPED_DISABLED = 0
