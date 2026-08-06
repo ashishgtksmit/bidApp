@@ -38,6 +38,13 @@ from ..services.notifications import (
     notify_customer_vendor_rejected,
     notify_vendors_bidding_reopened,
 )
+from ..events.outbox import (
+    append_outbox_event,
+    bid_created_events_enabled,
+    domain_events_enabled,
+    record_bid_created_skipped_disabled,
+)
+from ..events.registry import AGGREGATE_REQUEST, EVENT_BID_CREATED
 from ..utils.common import ErrorResponse
 
 _SELECTABLE_BID_STATUSES = frozenset({"BID - OPEN"})
@@ -341,6 +348,7 @@ def insert_vendor_bid(
     bid_data: VendorBidInsert,
     user_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     POST /insertbid — JWT vendor, RID/CARID/bidAmount only.
@@ -348,6 +356,10 @@ def insert_vendor_bid(
     Duplicate RID+vendor+CARID → BID ALREADY PRESENT (200), no notify, no count change.
     noOfBids recomputed (not +1). Notifications after commit via BackgroundTasks.
     Does not enforce bidEndTime.
+
+    PR39 canary: when DOMAIN_EVENTS_ENABLED and DOMAIN_EVENT_BID_CREATED_ENABLED
+    are both true, a bid.created outbox row is inserted in the same transaction.
+    Does not call request_snapshot_refresh or /build_snapshot.
     """
     should_notify = False
     customer_app_id = None
@@ -431,7 +443,7 @@ def insert_vendor_bid(
 
         # Raw insert avoids ORM FK name mismatches (requestTable vs requesttable)
         # across MySQL/SQLite while preserving production behaviour.
-        db.execute(
+        insert_result = db.execute(
             text(
                 """
                 INSERT INTO biddetails
@@ -450,6 +462,21 @@ def insert_vendor_bid(
             },
         )
 
+        bid_id = int(getattr(insert_result, "lastrowid", None) or 0)
+        if bid_id <= 0:
+            bind = db.get_bind()
+            dialect = getattr(getattr(bind, "dialect", None), "name", "") or ""
+            if dialect == "sqlite":
+                bid_id = int(
+                    db.execute(text("SELECT last_insert_rowid()")).scalar() or 0
+                )
+            else:
+                bid_id = int(
+                    db.execute(text("SELECT LAST_INSERT_ID()")).scalar() or 0
+                )
+        if bid_id <= 0:
+            raise RuntimeError("bid insert did not yield BID id")
+
         new_count = _recompute_no_of_bids(db, bid_data.RID)
         db.query(Request).filter(Request.RID == bid_data.RID).update(
             {
@@ -458,6 +485,22 @@ def insert_vendor_bid(
             },
             synchronize_session=False,
         )
+
+        # PR39 canary: bid.created outbox in the same transaction (both flags required).
+        if domain_events_enabled() and bid_created_events_enabled():
+            append_outbox_event(
+                db,
+                event_type=EVENT_BID_CREATED,
+                aggregate_type=AGGREGATE_REQUEST,
+                aggregate_id=str(bid_data.RID),
+                payload={
+                    "requestId": int(bid_data.RID),
+                    "bidId": int(bid_id),
+                },
+                actor_auth_subject=actor_auth_subject,
+            )
+        else:
+            record_bid_created_skipped_disabled()
 
         customer_app_id = request_row.customerAppId
         should_notify = True

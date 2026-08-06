@@ -169,6 +169,7 @@ def bid_insert(
         bid_data=bidData,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 
