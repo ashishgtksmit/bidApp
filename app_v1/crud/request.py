@@ -45,6 +45,12 @@ from ..services.notifications import (
     send_notification_to_user,
 )
 from ..services.vendor_filtering import get_other_vendors_who_bid_on_request, get_vendors_for_request,get_vendors_who_bid_on_request
+from ..events.outbox import maybe_append_domain_event
+from ..events.registry import (
+    EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
+    EVENT_DRIVER_ASSIGNMENT_CHANGED,
+    EVENT_HANDSHAKE_CANCELLED,
+)
 
 # MySQL TEXT max for rejectionReason — do not expose column name in errors.
 _REJECTION_REASON_MAX_LEN = 65535
@@ -1094,6 +1100,7 @@ def cancel_handshake(
     db: Session,
     rid: int,
     user_id: Optional[str] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     Customer cancel handshake (PR10).
@@ -1102,6 +1109,9 @@ def cancel_handshake(
     BID - OPEN → idempotent CANCELLED (repair bids to BID - OPEN if needed).
     Other statuses → 409. No FCM in PR10.
     Does not modify requestWonBy / finalAmount (typically unset at handshake).
+
+    PR40: emit handshake.cancelled only on real BID - CONFIRMED → BID - OPEN.
+    Already-open repair may still commit but creates no event.
     """
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -1130,6 +1140,7 @@ def cancel_handshake(
 
         if request_row.requestStatus == "BID - OPEN":
             # Idempotent: already reopened. Repair bid statuses if needed.
+            # No domain event (D8) — preserve repair business behaviour.
             db.query(BidDetail).filter(BidDetail.rID == rid).update(
                 {
                     BidDetail.bidStatus: "BID - OPEN",
@@ -1170,6 +1181,14 @@ def cancel_handshake(
                 BidDetail.tableTimestamp: now,
             },
             synchronize_session=False,
+        )
+
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_HANDSHAKE_CANCELLED,
+            aggregate_id=str(rid),
+            payload={"requestId": int(rid)},
+            actor_auth_subject=actor_auth_subject,
         )
 
         db.commit()
@@ -1243,6 +1262,7 @@ def booking_cancelled_by_user(
     rejection_reason: str,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     Customer confirmed-booking cancellation (PR12).
@@ -1250,6 +1270,8 @@ def booking_cancelled_by_user(
     REQUEST - CONFIRMED → BOOKING - CANCELLED BY USER.
     JWT sub is authoritative owner. Vendor notify recipient = request.requestWonBy.
     Preserves requestWonBy, finalAmount, bids, driver, and payment fields.
+
+    PR40: emit booking.cancelled_by_customer only on real status transition.
     """
     try:
         request_row = (
@@ -1271,7 +1293,7 @@ def booking_cancelled_by_user(
                 detail="Not authorized to cancel this booking",
             )
 
-        # Idempotent replay: already cancelled by user → 200 UPDATED, no re-notify.
+        # Idempotent replay: already cancelled by user → 200 UPDATED, no re-notify, no event.
         if request_row.requestStatus == STATUS_BOOKING_CANCELLED_BY_USER:
             db.commit()
             return ErrorResponse(message="UPDATED")
@@ -1315,6 +1337,15 @@ def booking_cancelled_by_user(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Request not found",
             )
+
+        # Never put rejectionReason in the event payload.
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
+            aggregate_id=str(rid),
+            payload={"requestId": int(rid)},
+            actor_auth_subject=actor_auth_subject,
+        )
 
         db.commit()
 
@@ -1869,6 +1900,7 @@ def assign_driver_to_request(
     request_data: AssignDriverRequest,
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     Vendor assigns (or replaces) a driver on a confirmed request (PR13).
@@ -1878,6 +1910,8 @@ def assign_driver_to_request(
     Same-driver replay → UPDATED without timestamp/notify churn.
     Different-driver replacement updates assignment + notifies customer once.
     Notification after commit via BackgroundTasks (own SessionLocal).
+
+    PR40: emit driver.assignment_changed only when driverAssignedID changes.
     """
     try:
         if user_id is None or not str(user_id).strip():
@@ -1948,7 +1982,7 @@ def assign_driver_to_request(
 
         existing_assigned = request_row.driverAssignedID
         if existing_assigned is not None and int(existing_assigned) == driver_id:
-            # Same-driver idempotent replay: success, no timestamp churn, no notify.
+            # Same-driver idempotent replay: success, no timestamp churn, no notify, no event.
             db.commit()
             return EmailErrorResponse(message="UPDATED")
 
@@ -1956,6 +1990,18 @@ def assign_driver_to_request(
         now = _now_ist_naive()
         request_row.driverAssignedID = driver_id
         request_row.tableTimestamp = now
+
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_DRIVER_ASSIGNMENT_CHANGED,
+            aggregate_id=str(rid),
+            payload={
+                "requestId": int(rid),
+                "driverId": int(driver_id),
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
+
         db.commit()
 
         if background_tasks is not None and customer_app_id:

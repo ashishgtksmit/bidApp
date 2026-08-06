@@ -1,6 +1,7 @@
 # PR39 — Domain event transactional outbox (`openbid_domain_outbox`)
 
-**Status:** Migration package implemented. Production apply **not** claimed.
+**Status:** Migration package implemented. Production apply on Azure `bidapp`
+(**2026-08-06**) — see `migrations/AZURE_DB_MIGRATION_APPLY_REPORT_2026-08-06_PR39.md`.
 
 ## Purpose
 
@@ -58,6 +59,7 @@ python migrations/pr39_domain_event_outbox/audit_domain_event_outbox.py
 
 - Idempotent where practical (`CREATE TABLE IF NOT EXISTS`, index presence checks).
 - Does **not** drop or rewrite unrelated tables.
-- Production apply is **not** claimed by this package alone.
+- Production apply is recorded in
+  `migrations/AZURE_DB_MIGRATION_APPLY_REPORT_2026-08-06_PR39.md`.
 - Feature flags default off: `DOMAIN_EVENTS_ENABLED=false`,
   `DOMAIN_EVENT_BID_CREATED_ENABLED=false`.

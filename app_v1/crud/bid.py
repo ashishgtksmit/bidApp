@@ -27,6 +27,9 @@ from ..services.notifications import (
 )
 from zoneinfo import ZoneInfo
 
+from ..events.outbox import maybe_append_domain_event
+from ..events.registry import EVENT_BID_ACCEPTED
+
 
 # Customer GET /getallbidsforrequest — only BID - OPEN requests (active review UI).
 _CUSTOMER_BID_REVIEW_STATUSES = frozenset({"BID - OPEN"})
@@ -282,6 +285,7 @@ def accept_bid(
     user_id: Optional[str] = None,
     background_tasks: Optional[BackgroundTasks] = None,
     notification_type: str = "default",
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     Customer accept bid (PR10) — identity is RID + BIDID only.
@@ -290,6 +294,8 @@ def accept_bid(
     nested maps. Does not enforce bidEndTime (intentional PHP compatibility).
     Does not set requestWonBy / finalAmount (vendor handshake still owns those).
     Competing bids are left unchanged.
+
+    PR40: emits bid.accepted only on real BID - OPEN → BID - CONFIRMED transition.
     """
 
     should_notify = False
@@ -348,7 +354,7 @@ def accept_bid(
                     detail="Conflicting confirmed bids",
                 )
             if len(confirmed_bids) == 1 and confirmed_bids[0].BID == bid_id:
-                # No mutation, no duplicate notification.
+                # No mutation, no duplicate notification, no event.
                 db.rollback()
                 return ErrorResponse(message="UPDATED")
             raise HTTPException(
@@ -419,6 +425,17 @@ def accept_bid(
             )
 
         # requestWonBy / finalAmount intentionally unchanged.
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_BID_ACCEPTED,
+            aggregate_id=str(rid),
+            payload={
+                "requestId": int(rid),
+                "bidId": int(bid_id),
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
+
         should_notify = True
 
         db.commit()

@@ -152,6 +152,7 @@ def update_accept_request_by_vendor(
         bid_id=BIDID,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 
@@ -176,6 +177,7 @@ def reject_by_vendor(
         body=body,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 @router.put("/cancelhandshakerequest", response_model=ErrorResponse)
@@ -186,7 +188,12 @@ def cancel_handshake_of_request(
 ):
     """Customer cancel handshake. Ownership + status gate. No FCM in PR10."""
     user_id = current_user.user_app_id
-    return cancel_handshake(db, rid=RID, user_id=user_id)
+    return cancel_handshake(
+        db,
+        rid=RID,
+        user_id=user_id,
+        actor_auth_subject=current_user.auth_subject,
+    )
 
 @router.put("/bookingcancelledbyuser", response_model=ErrorResponse)
 def cancel_by_user(
@@ -209,6 +216,7 @@ def cancel_by_user(
         rejection_reason=body.rejectionReason,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 @router.get("/getallconfirmedrequestsforuser",response_model=Union[List[RequestConfirmedForUserResponse],EmailErrorResponse])
@@ -291,6 +299,7 @@ def driver_assign_to_request(
         request_data,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 @router.get(

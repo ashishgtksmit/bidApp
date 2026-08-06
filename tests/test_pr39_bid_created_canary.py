@@ -165,7 +165,7 @@ def test_outbox_failure_rolls_back_bid(seeded_db, bg, events_on):
     car_id = _seed_car(seeded_db, user_app_id=VENDOR_A)
     session = _reopen(seeded_db)
     with patch(
-        "app_v1.crud.vendor_bid.append_outbox_event",
+        "app_v1.crud.vendor_bid.maybe_append_domain_event",
         side_effect=RuntimeError("outbox insert failed"),
     ):
         result = vendor_bid_mod.insert_vendor_bid(

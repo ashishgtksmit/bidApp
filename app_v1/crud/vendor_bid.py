@@ -38,13 +38,14 @@ from ..services.notifications import (
     notify_customer_vendor_rejected,
     notify_vendors_bidding_reopened,
 )
-from ..events.outbox import (
-    append_outbox_event,
-    bid_created_events_enabled,
-    domain_events_enabled,
-    record_bid_created_skipped_disabled,
+from ..events.outbox import maybe_append_domain_event
+from ..events.registry import (
+    EVENT_BID_CREATED,
+    EVENT_BID_DELETED,
+    EVENT_BID_UPDATED,
+    EVENT_HANDSHAKE_ACCEPTED,
+    EVENT_HANDSHAKE_REJECTED,
 )
-from ..events.registry import AGGREGATE_REQUEST, EVENT_BID_CREATED
 from ..utils.common import ErrorResponse
 
 _SELECTABLE_BID_STATUSES = frozenset({"BID - OPEN"})
@@ -487,20 +488,16 @@ def insert_vendor_bid(
         )
 
         # PR39 canary: bid.created outbox in the same transaction (both flags required).
-        if domain_events_enabled() and bid_created_events_enabled():
-            append_outbox_event(
-                db,
-                event_type=EVENT_BID_CREATED,
-                aggregate_type=AGGREGATE_REQUEST,
-                aggregate_id=str(bid_data.RID),
-                payload={
-                    "requestId": int(bid_data.RID),
-                    "bidId": int(bid_id),
-                },
-                actor_auth_subject=actor_auth_subject,
-            )
-        else:
-            record_bid_created_skipped_disabled()
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_BID_CREATED,
+            aggregate_id=str(bid_data.RID),
+            payload={
+                "requestId": int(bid_data.RID),
+                "bidId": int(bid_id),
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
 
         customer_app_id = request_row.customerAppId
         should_notify = True
@@ -540,9 +537,13 @@ def update_vendor_bid(
     bid_id: int,
     body: BidAmountUpdate,
     user_id: str,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     PUT /updatebid?BIDID= — amount only. No FCM. No vehicle change.
+
+    PR40: when flags enabled, appends bid.updated in the same transaction.
+    Same-value amount still UPDATEs tableTimestamp and emits the event.
     """
     try:
         require_active_vendor(db, user_id)
@@ -610,6 +611,18 @@ def update_vendor_bid(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Bid not found",
             )
+
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_BID_UPDATED,
+            aggregate_id=str(bid_rid),
+            payload={
+                "requestId": int(bid_rid),
+                "bidId": int(bid_id),
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
+
         db.commit()
         return ErrorResponse(message="UPDATED")
 
@@ -628,10 +641,17 @@ def update_vendor_bid(
         db.close()
 
 
-def delete_vendor_bid(db: Session, bid_id: int, user_id: str):
+def delete_vendor_bid(
+    db: Session,
+    bid_id: int,
+    user_id: str,
+    actor_auth_subject: Optional[str] = None,
+):
     """
     DELETE /deletebid?BIDID= — hard delete, recompute noOfBids. No FCM.
     Missing bid → 404 (not idempotent success).
+
+    PR40: captures bidderId before hard delete for bid.deleted payload.
     """
     try:
         require_active_vendor(db, user_id)
@@ -656,6 +676,8 @@ def delete_vendor_bid(db: Session, bid_id: int, user_id: str):
 
         rid = bid_row.rID
         bid_status = bid_row.bidStatus
+        # Capture before hard delete (candidate identifier only; worker revalidates).
+        deleting_bidder_id = str(bid_row.bidderID).strip()
         db.expunge(bid_row)
 
         request_row = (
@@ -702,6 +724,19 @@ def delete_vendor_bid(db: Session, bid_id: int, user_id: str):
             },
             synchronize_session=False,
         )
+
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_BID_DELETED,
+            aggregate_id=str(rid),
+            payload={
+                "requestId": int(rid),
+                "bidId": int(bid_id),
+                "bidderId": deleting_bidder_id,
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
+
         db.commit()
         return ErrorResponse(message="DELETED")
 
@@ -726,6 +761,7 @@ def accept_request_by_vendor(
     bid_id: int,
     user_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     PUT /acceptrequestbyvendor?RID=&BIDID=
@@ -876,6 +912,17 @@ def accept_request_by_vendor(
                 detail="Bid update failed",
             )
 
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_HANDSHAKE_ACCEPTED,
+            aggregate_id=str(rid),
+            payload={
+                "requestId": int(rid),
+                "bidId": int(bid_id),
+            },
+            actor_auth_subject=actor_auth_subject,
+        )
+
         should_notify = True
         db.commit()
 
@@ -915,12 +962,16 @@ def reject_request_by_vendor_pr11(
     body: VendorRejectBody,
     user_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    actor_auth_subject: Optional[str] = None,
 ):
     """
     PUT /rejectrequestbyvendor?RID=&BIDID= + {rejectionReason}
 
     BID - CONFIRMED → BID - OPEN, hard-delete selected bid, recompute noOfBids.
     Default already-reopened → 409. No rejector self-notify.
+
+    PR40: one handshake.rejected event (bidderId captured before delete).
+    Does not emit a separate bid.deleted.
     """
     should_notify = False
     customer_app_id = None
@@ -995,6 +1046,8 @@ def reject_request_by_vendor_pr11(
             )
 
         customer_app_id = request_row.customerAppId
+        # Capture before hard delete (candidate identifier only; worker revalidates).
+        rejecting_bidder_id = str(bid_row.bidderID).strip()
         now = _ist_now_naive()
 
         db.query(Request).filter(Request.RID == rid).update(
@@ -1024,6 +1077,19 @@ def reject_request_by_vendor_pr11(
                 Request.tableTimestamp: now,
             },
             synchronize_session=False,
+        )
+
+        # One event only — do not emit bid.deleted. Never put rejectionReason in payload.
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_HANDSHAKE_REJECTED,
+            aggregate_id=str(rid),
+            payload={
+                "requestId": int(rid),
+                "bidId": int(bid_id),
+                "bidderId": rejecting_bidder_id,
+            },
+            actor_auth_subject=actor_auth_subject,
         )
 
         # requestWonBy / finalAmount remain unset (unchanged)

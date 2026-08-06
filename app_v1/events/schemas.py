@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Type
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .registry import (
     AGGREGATE_REQUEST,
+    EVENT_BID_ACCEPTED,
     EVENT_BID_CREATED,
+    EVENT_BID_DELETED,
+    EVENT_BID_UPDATED,
+    EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
+    EVENT_DRIVER_ASSIGNMENT_CHANGED,
+    EVENT_HANDSHAKE_ACCEPTED,
+    EVENT_HANDSHAKE_CANCELLED,
+    EVENT_HANDSHAKE_REJECTED,
     SCHEMA_VERSION_V1,
     validate_event_type,
 )
@@ -20,6 +28,75 @@ class BidCreatedPayloadV1(BaseModel):
 
     requestId: int = Field(..., gt=0)
     bidId: int = Field(..., gt=0)
+
+
+class BidUpdatedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    bidId: int = Field(..., gt=0)
+
+
+class BidDeletedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    bidId: int = Field(..., gt=0)
+    bidderId: str = Field(..., min_length=1, max_length=64)
+
+
+class BidAcceptedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    bidId: int = Field(..., gt=0)
+
+
+class HandshakeCancelledPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+
+
+class HandshakeAcceptedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    bidId: int = Field(..., gt=0)
+
+
+class HandshakeRejectedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    bidId: int = Field(..., gt=0)
+    bidderId: str = Field(..., min_length=1, max_length=64)
+
+
+class BookingCancelledByCustomerPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+
+
+class DriverAssignmentChangedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+    driverId: int = Field(..., gt=0)
+
+
+PAYLOAD_MODELS: Dict[str, Type[BaseModel]] = {
+    EVENT_BID_CREATED: BidCreatedPayloadV1,
+    EVENT_BID_UPDATED: BidUpdatedPayloadV1,
+    EVENT_BID_DELETED: BidDeletedPayloadV1,
+    EVENT_BID_ACCEPTED: BidAcceptedPayloadV1,
+    EVENT_HANDSHAKE_CANCELLED: HandshakeCancelledPayloadV1,
+    EVENT_HANDSHAKE_ACCEPTED: HandshakeAcceptedPayloadV1,
+    EVENT_HANDSHAKE_REJECTED: HandshakeRejectedPayloadV1,
+    EVENT_BOOKING_CANCELLED_BY_CUSTOMER: BookingCancelledByCustomerPayloadV1,
+    EVENT_DRIVER_ASSIGNMENT_CHANGED: DriverAssignmentChangedPayloadV1,
+}
 
 
 class DomainEventEnvelopeV1(BaseModel):
@@ -60,9 +137,10 @@ class DomainEventEnvelopeV1(BaseModel):
     @classmethod
     def _payload_for_type(cls, value: Dict[str, Any], info) -> Dict[str, Any]:
         event_type = (info.data or {}).get("eventType")
-        if event_type == EVENT_BID_CREATED:
-            return BidCreatedPayloadV1.model_validate(value).model_dump()
-        raise ValueError(f"unsupported eventType for payload: {event_type}")
+        model = PAYLOAD_MODELS.get(event_type) if event_type else None
+        if model is None:
+            raise ValueError(f"unsupported eventType for payload: {event_type}")
+        return model.model_validate(value).model_dump()
 
     def to_stream_fields(self) -> Dict[str, str]:
         """Serialize for Redis Stream XADD (string fields only)."""

@@ -71,7 +71,12 @@ def delete_bid_endpoint(
 ):
     """Hard-delete own BID - OPEN bid. RID derived from bid row. No FCM."""
     user_id = current_user.user_app_id
-    return delete_vendor_bid(db, bid_id=BIDID, user_id=user_id)
+    return delete_vendor_bid(
+        db,
+        bid_id=BIDID,
+        user_id=user_id,
+        actor_auth_subject=current_user.auth_subject,
+    )
 
 
 @router.delete("/deletebidwithbid", response_model=ErrorResponse, deprecated=True)
@@ -92,7 +97,12 @@ def delete_bids_legacy(
             status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="BIDID is required",
         )
-    return delete_vendor_bid(db, bid_id=bid_id, user_id=user_id)
+    return delete_vendor_bid(
+        db,
+        bid_id=bid_id,
+        user_id=user_id,
+        actor_auth_subject=current_user.auth_subject,
+    )
 
 
 @router.put("/updatebid", response_model=ErrorResponse)
@@ -104,7 +114,13 @@ def update_bid_endpoint(
 ):
     """Update own BID - OPEN bid amount. No FCM. No vehicle change."""
     user_id = current_user.user_app_id
-    return update_vendor_bid(db, bid_id=BIDID, body=body, user_id=user_id)
+    return update_vendor_bid(
+        db,
+        bid_id=BIDID,
+        body=body,
+        user_id=user_id,
+        actor_auth_subject=current_user.auth_subject,
+    )
 
 
 @router.put("/updatebidwithbid", response_model=ErrorResponse, deprecated=True)
@@ -130,6 +146,7 @@ def update_bid_legacy(
         bid_id=BIDID,
         body=BidAmountUpdate(bidAmount=amount),
         user_id=user_id,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 
@@ -149,6 +166,7 @@ def accept_bid_by_customer(
         bid_id=BIDID,
         user_id=user_id,
         background_tasks=background_tasks,
+        actor_auth_subject=current_user.auth_subject,
     )
 
 

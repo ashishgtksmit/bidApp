@@ -88,10 +88,17 @@ def main() -> int:
             print(f"BLOCKING: cannot read MySQL version: {exc}")
             return 1
 
-        # JSON support probe
+        # JSON support probe (avoid `:digit` in literal — SQLAlchemy bind syntax)
         try:
-            conn.execute(text("SELECT CAST('{\"a\":1}' AS JSON)"))
-            print("OK: MySQL JSON support present")
+            ok = conn.execute(
+                text("SELECT JSON_VALID(:payload)"),
+                {"payload": '{"a":1}'},
+            ).scalar()
+            if not ok:
+                print("BLOCKING: MySQL JSON_VALID returned false")
+                blocking = True
+            else:
+                print("OK: MySQL JSON support present")
         except Exception as exc:
             print(f"BLOCKING: MySQL JSON unsupported: {exc}")
             blocking = True
