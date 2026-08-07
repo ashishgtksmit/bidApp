@@ -906,6 +906,58 @@ def test_62_login_regression(db_session):
     assert "access_token" in resp.json()
 
 
+def test_62b_login_omitted_fcm_does_not_clear_existing_token(db_session):
+    _add_user(
+        db_session,
+        password=hash_password(PASSWORD),
+        fcmToken="keep-existing-fcm",
+    )
+    resp = _client(db_session).post(
+        "/login",
+        json={"userAppId": PHONE, "password": PASSWORD},
+    )
+    assert resp.status_code == 200
+    row = db_session.query(User).filter(User.userAppId == PHONE).first()
+    assert row is not None
+    assert row.fcmToken == "keep-existing-fcm"
+
+
+def test_62c_login_blank_fcm_does_not_clear_existing_token(db_session):
+    _add_user(
+        db_session,
+        password=hash_password(PASSWORD),
+        fcmToken="keep-existing-fcm",
+    )
+    resp = _client(db_session).post(
+        "/login",
+        json={"userAppId": PHONE, "password": PASSWORD, "fcmToken": "   "},
+    )
+    assert resp.status_code == 200
+    row = db_session.query(User).filter(User.userAppId == PHONE).first()
+    assert row is not None
+    assert row.fcmToken == "keep-existing-fcm"
+
+
+def test_62d_login_nonempty_fcm_updates_token(db_session):
+    _add_user(
+        db_session,
+        password=hash_password(PASSWORD),
+        fcmToken="old-fcm",
+    )
+    resp = _client(db_session).post(
+        "/login",
+        json={
+            "userAppId": PHONE,
+            "password": PASSWORD,
+            "fcmToken": "new-fcm-from-login",
+        },
+    )
+    assert resp.status_code == 200
+    row = db_session.query(User).filter(User.userAppId == PHONE).first()
+    assert row is not None
+    assert row.fcmToken == "new-fcm-from-login"
+
+
 def test_63_ws_validate_regression(db_session):
     user = _add_user(db_session)
     access, _ = _mint_pair(db_session, user)

@@ -174,7 +174,12 @@ def login_user_auth(
         )
 
         user.user_login_status = login_status
-        user.fcmToken = login_data.fcmToken
+        # Only persist a non-empty FCM token from login. Omitting/null/blank
+        # must not clear a previously synced token (Flutter often omits the
+        # field when getToken has not returned yet).
+        incoming_fcm = (login_data.fcmToken or "").strip()
+        if incoming_fcm:
+            user.fcmToken = incoming_fcm
         ensure_auth_subject_id(user)
         user.tableTimestamp = func.current_timestamp()
         db.commit()
