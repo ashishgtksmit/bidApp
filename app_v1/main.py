@@ -19,7 +19,10 @@ from .endpoints.reporting import router as reporting_router
 from .endpoints.chat import router as chat_router
 from .database import Base, engine
 from .auth.deps import get_current_user_id
-from .events.outbox import log_domain_event_flag_snapshot
+from .events.outbox import (
+    configure_domain_event_logging,
+    log_domain_event_flag_snapshot,
+)
 # Ensure PR5 OTP / reset-token / rate-limit tables are registered before create_all.
 from .models import otp_challenge as _otp_challenge_models  # noqa: F401
 # Ensure PR14 driver OTP challenge / token tables are registered before create_all.
@@ -31,6 +34,7 @@ import traceback
 async def _lifespan(_app: FastAPI):
     # Safe boolean flag snapshot only — proves App Setting recycle to operators.
     try:
+        configure_domain_event_logging()
         log_domain_event_flag_snapshot(reason="startup")
     except Exception:
         # Never block API boot on diagnostics.

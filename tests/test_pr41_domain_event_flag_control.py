@@ -184,3 +184,42 @@ def test_master_does_not_imply_all_events(monkeypatch):
     assert event_emission_enabled(EVENT_BID_CREATED) is False
     for event_type in EVENT_TYPE_FLAG_ENV:
         assert event_emission_enabled(event_type) is False
+
+
+def test_process_bound_flag_snapshot_includes_handshake_cancelled(monkeypatch):
+    """B2 binding proof payload must expose handshake.cancelled gate explicitly."""
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_HANDSHAKE_CANCELLED
+
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED", "true")
+    monkeypatch.setenv("OPENBID_DEPLOY_REVISION", "testrev1")
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert snap["DOMAIN_EVENTS_ENABLED"] is True
+    assert snap["perEvent"][EVENT_HANDSHAKE_CANCELLED] is True
+    assert snap["handshakeCancelled"]["eventType"] == "handshake.cancelled"
+    assert snap["handshakeCancelled"]["envFlag"] == (
+        "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED"
+    )
+    assert snap["handshakeCancelled"]["perEventEnabled"] is True
+    assert snap["handshakeCancelled"]["emissionEnabled"] is True
+    assert snap["deployRevision"] == "testrev1"
+    assert "instanceHash" in snap
+    # No PII keys
+    blob = str(snap).lower()
+    assert "rid" not in blob
+    assert "phone" not in blob
+    assert "password" not in blob
+
+
+def test_handshake_cancelled_flag_env_mapping():
+    from app_v1.events.registry import (
+        EVENT_HANDSHAKE_CANCELLED,
+        EVENT_TYPE_FLAG_ENV,
+    )
+
+    assert EVENT_HANDSHAKE_CANCELLED == "handshake.cancelled"
+    assert (
+        EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_CANCELLED]
+        == "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED"
+    )

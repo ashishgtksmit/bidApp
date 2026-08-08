@@ -27,6 +27,7 @@ from ..auth.internal import (
     require_internal_notification_access,
     require_internal_email_access,
 )
+from ..events.outbox import process_bound_flag_snapshot
 
 
 router = APIRouter()
@@ -322,3 +323,21 @@ def send_notification_to_selected_drivers_api(
         raise
     except Exception:
         _raise_notification_dispatch_failed()
+
+
+@router.get(
+    "/domain-event-flag-snapshot",
+    include_in_schema=False,
+)
+def domain_event_flag_snapshot(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    _: None = Depends(require_internal_notification_access),
+):
+    """
+    Process-bound domain-event flag proof (PR40/PR41 ops).
+
+    Requires JWT + X-OpenBid-Internal-Key. Returns booleans / revision /
+    instance hash only — no secrets, RID, or account identifiers.
+    """
+    _ = current_user  # auth gate only
+    return process_bound_flag_snapshot(reason="http")

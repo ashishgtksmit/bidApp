@@ -421,6 +421,58 @@ def test_bid_deleted_outbox_failure_rolls_back(seeded_db, monkeypatch):
     assert _reopen(seeded_db).query(DomainOutboxEvent).count() == 0
 
 
+def test_bid_deleted_auth_failure_403_no_event(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "bid.deleted")
+    req = _seed_request(seeded_db, no_of_bids=1)
+    bid = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.delete_vendor_bid(session, bid_id=bid.BID, user_id=VENDOR_B)
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert _reopen(seeded_db).query(BidDetail).count() == 1
+
+
+def test_bid_deleted_missing_404_no_event(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "bid.deleted")
+    _seed_request(seeded_db, no_of_bids=0)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.delete_vendor_bid(session, bid_id=999999, user_id=VENDOR_A)
+    assert exc.value.status_code == 404
+    assert _outbox(seeded_db) == []
+
+
+def test_bid_deleted_flag_off_mutates_without_event(seeded_db, monkeypatch):
+    _disable_all(monkeypatch)
+    req = _seed_request(seeded_db, no_of_bids=1)
+    bid = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000)
+    session = _reopen(seeded_db)
+    result = vendor_bid_mod.delete_vendor_bid(session, bid_id=bid.BID, user_id=VENDOR_A)
+    assert result.message == "DELETED"
+    assert _outbox(seeded_db) == []
+    assert _reopen(seeded_db).query(BidDetail).count() == 0
+
+
+def test_bid_deleted_no_fcm_scheduled(seeded_db, bg, monkeypatch):
+    """Delete path must not schedule FCM (parity: mutation has no notify)."""
+    _enable_event(monkeypatch, "bid.deleted")
+    req = _seed_request(seeded_db, no_of_bids=1)
+    bid = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000)
+    session = _reopen(seeded_db)
+    # delete_vendor_bid does not accept background_tasks — no FCM hook.
+    result = vendor_bid_mod.delete_vendor_bid(session, bid_id=bid.BID, user_id=VENDOR_A)
+    assert result.message == "DELETED"
+    assert bg.tasks == []
+    src = Path(vendor_bid_mod.__file__).read_text()
+    # Within delete_vendor_bid body, no notify_* calls.
+    start = src.index("def delete_vendor_bid")
+    end = src.index("\ndef ", start + 1)
+    body = src[start:end]
+    assert "notify_" not in body
+    assert "BackgroundTasks" not in body
+
+
 # --- bid.accepted ---
 
 
@@ -486,16 +538,78 @@ def test_bid_accepted_outbox_failure_rolls_back(seeded_db, bg, monkeypatch):
     assert bg.tasks == []
 
 
+def test_bid_accepted_flag_off_mutates_without_event(seeded_db, bg, monkeypatch):
+    """Master/event flag off: accept still mutates + FCM; no outbox row."""
+    _disable_all(monkeypatch)
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_BID_ACCEPTED_ENABLED", "false")
+    req = _seed_request(seeded_db, no_of_bids=1)
+    bid = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000)
+    session = _reopen(seeded_db)
+    result = bid_mod.accept_bid(
+        session,
+        rid=req.RID,
+        bid_id=bid.BID,
+        user_id=CUSTOMER_ID,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - CONFIRMED"
+    assert (
+        _reopen(seeded_db).query(BidDetail).one().bidStatus == "BID - CONFIRMED"
+    )
+    assert _outbox(seeded_db) == []
+    assert any(t.func is notifications_mod.notify_vendor_bid_accepted for t in bg.tasks)
+
+
+def test_bid_accepted_losing_bidders_unchanged_and_no_winner_fields(seeded_db, bg, monkeypatch):
+    """requestWonBy/finalAmount stay unset; losing bid rows remain BID - OPEN."""
+    _enable_event(monkeypatch, "bid.accepted")
+    req = _seed_request(seeded_db, no_of_bids=2)
+    selected = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000)
+    loser = _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102)
+    session = _reopen(seeded_db)
+    result = bid_mod.accept_bid(
+        session,
+        rid=req.RID,
+        bid_id=selected.BID,
+        user_id=CUSTOMER_ID,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    db = _reopen(seeded_db)
+    request_row = db.query(Request).one()
+    assert request_row.requestStatus == "BID - CONFIRMED"
+    assert request_row.requestWonBy is None
+    # Column default is 0; accept must not write the winning amount here.
+    assert request_row.finalAmount == 0
+    loser_row = db.query(BidDetail).filter(BidDetail.BID == loser.BID).one()
+    assert loser_row.bidStatus == "BID - OPEN"
+    selected_row = db.query(BidDetail).filter(BidDetail.BID == selected.BID).one()
+    assert selected_row.bidStatus == "BID - CONFIRMED"
+    notify_args = [t.args[0] for t in bg.tasks if t.func is notifications_mod.notify_vendor_bid_accepted]
+    assert notify_args == [VENDOR_A]
+
+
 # --- handshake.cancelled ---
 
 
 def test_handshake_cancelled_emits_on_transition(seeded_db, monkeypatch):
+    """CONFIRMED→OPEN: exactly one event; payload {requestId}; fields preserved."""
     _enable_event(monkeypatch, "handshake.cancelled")
-    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    req = _seed_request(
+        seeded_db,
+        status="BID - CONFIRMED",
+        no_of_bids=2,
+        request_won_by=None,
+        final_amount=0,
+    )
     _seed_bid(
         seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
     )
-    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102, status="BID - OPEN"
+    )
     session = _reopen(seeded_db)
     result = request_mod.cancel_handshake(
         session, rid=req.RID, user_id=CUSTOMER_ID, actor_auth_subject="cust"
@@ -503,12 +617,59 @@ def test_handshake_cancelled_emits_on_transition(seeded_db, monkeypatch):
     assert result.message == "CANCELLED"
     rows = _outbox(seeded_db)
     assert len(rows) == 1
-    assert rows[0].eventType == "handshake.cancelled"
-    assert rows[0].payload == {"requestId": req.RID}
+    ev = rows[0]
+    assert ev.eventType == "handshake.cancelled"
+    assert ev.schemaVersion == 1
+    assert ev.aggregateType == "request"
+    assert ev.aggregateId == str(req.RID)
+    assert ev.payload == {"requestId": req.RID}
+    assert set(ev.payload.keys()) == {"requestId"}
+    _assert_forbidden_absent(
+        ev.payload, "bidid", "bidderid", "amount", "requestwonby", "recipient"
+    )
+    db2 = _reopen(seeded_db)
+    request_row = db2.query(Request).one()
+    assert request_row.requestStatus == "BID - OPEN"
+    assert request_row.noOfBids == 2
+    assert request_row.requestWonBy is None
+    assert request_row.finalAmount == 0
+    statuses = {b.bidStatus for b in db2.query(BidDetail).all()}
+    assert statuses == {"BID - OPEN"}
+
+
+def test_handshake_cancelled_master_off_event_on_no_event(seeded_db, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "false")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED", "true")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    result = request_mod.cancel_handshake(session, rid=req.RID, user_id=CUSTOMER_ID)
+    assert result.message == "CANCELLED"
+    assert _outbox(seeded_db) == []
+    assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - OPEN"
+
+
+def test_handshake_cancelled_master_on_event_off_no_event(seeded_db, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED", "false")
+    for name in PR40_EVENT_FLAGS:
+        if name != "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED":
+            monkeypatch.setenv(name, "false")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    result = request_mod.cancel_handshake(session, rid=req.RID, user_id=CUSTOMER_ID)
+    assert result.message == "CANCELLED"
+    assert _outbox(seeded_db) == []
     assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - OPEN"
 
 
 def test_handshake_cancelled_already_open_repair_no_event(seeded_db, monkeypatch):
+    """D8: already BID - OPEN may repair bids but must emit zero events."""
     _enable_event(monkeypatch, "handshake.cancelled")
     req = _seed_request(seeded_db, status="BID - OPEN", no_of_bids=1)
     _seed_bid(
@@ -519,6 +680,122 @@ def test_handshake_cancelled_already_open_repair_no_event(seeded_db, monkeypatch
     assert result.message == "CANCELLED"
     assert _outbox(seeded_db) == []
     assert _reopen(seeded_db).query(BidDetail).one().bidStatus == "BID - OPEN"
+    assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - OPEN"
+    assert _reopen(seeded_db).query(Request).one().noOfBids == 1
+
+
+def test_handshake_cancelled_outbox_failure_rolls_back(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "handshake.cancelled")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102, status="BID - OPEN"
+    )
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.request.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = request_mod.cancel_handshake(session, rid=req.RID, user_id=CUSTOMER_ID)
+    assert result.message == "ERROR"
+    db2 = _reopen(seeded_db)
+    assert db2.query(Request).one().requestStatus == "BID - CONFIRMED"
+    statuses = {b.bidStatus for b in db2.query(BidDetail).all()}
+    assert "BID - CONFIRMED" in statuses
+    assert db2.query(DomainOutboxEvent).count() == 0
+
+
+def test_handshake_cancelled_ownership_403_no_event(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "handshake.cancelled")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.cancel_handshake(session, rid=req.RID, user_id=VENDOR_A)
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - CONFIRMED"
+
+
+def test_handshake_cancelled_missing_rid_404_no_event(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "handshake.cancelled")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.cancel_handshake(session, rid=999999, user_id=CUSTOMER_ID)
+    assert exc.value.status_code == 404
+    assert _outbox(seeded_db) == []
+
+
+def test_handshake_cancelled_invalid_status_409_no_event(seeded_db, monkeypatch):
+    _enable_event(monkeypatch, "handshake.cancelled")
+    req = _seed_request(seeded_db, status="REQUEST - CONFIRMED", no_of_bids=1)
+    _seed_bid(
+        seeded_db,
+        rid=req.RID,
+        bidder_id=VENDOR_A,
+        amount=1000,
+        status="REQUEST - CONFIRMED",
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.cancel_handshake(session, rid=req.RID, user_id=CUSTOMER_ID)
+    assert exc.value.status_code == 409
+    assert _outbox(seeded_db) == []
+
+
+def test_handshake_cancelled_no_fcm_scheduled(seeded_db, bg, monkeypatch):
+    """Cancel handshake remains silent — no FCM BackgroundTasks."""
+    _enable_event(monkeypatch, "handshake.cancelled")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    result = request_mod.cancel_handshake(session, rid=req.RID, user_id=CUSTOMER_ID)
+    assert result.message == "CANCELLED"
+    assert bg.tasks == []
+    assert len(_outbox(seeded_db)) == 1
+    src = Path(request_mod.__file__).read_text()
+    start = src.index("def cancel_handshake")
+    end = src.index("\ndef ", start + 1)
+    body = src[start:end]
+    assert "notify_" not in body
+    assert "BackgroundTasks" not in body
+    assert "maybe_append_domain_event" in body
+    assert "build_snapshot" not in body
+    assert "redis" not in body.lower()
+
+
+def test_handshake_cancelled_endpoint_source_contract():
+    """Endpoint has no FCM; CRUD owns outbox append before commit on transition."""
+    ep = (ROOT / "app_v1" / "endpoints" / "request.py").read_text()
+    start = ep.index("def cancel_handshake_of_request")
+    end = ep.index("\n@router.", start + 1)
+    block = ep[start:end]
+    assert "BackgroundTasks" not in block
+    assert "notify_" not in block
+    assert "cancel_handshake(" in block
+    crud = Path(request_mod.__file__).read_text()
+    fn_start = crud.index("def cancel_handshake")
+    fn_end = crud.index("\ndef ", fn_start + 1)
+    fn = crud[fn_start:fn_end]
+    assert "maybe_append_domain_event" in fn
+    # Event only on CONFIRMED→OPEN path; repair path commits without append.
+    repair = fn[
+        fn.index('requestStatus == "BID - OPEN"') : fn.index(
+            'requestStatus != "BID - CONFIRMED"'
+        )
+    ]
+    assert "maybe_append_domain_event" not in repair
+    assert "db.commit()" in repair
+    transition = fn[fn.index('requestStatus != "BID - CONFIRMED"') :]
+    append_at = transition.index("maybe_append_domain_event")
+    commit_at = transition.index("db.commit()")
+    assert append_at < commit_at
 
 
 # --- handshake.accepted ---

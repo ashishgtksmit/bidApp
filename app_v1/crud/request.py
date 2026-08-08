@@ -45,7 +45,10 @@ from ..services.notifications import (
     send_notification_to_user,
 )
 from ..services.vendor_filtering import get_other_vendors_who_bid_on_request, get_vendors_for_request,get_vendors_who_bid_on_request
-from ..events.outbox import maybe_append_domain_event
+from ..events.outbox import (
+    log_handshake_cancelled_emission_decision,
+    maybe_append_domain_event,
+)
 from ..events.registry import (
     EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
     EVENT_DRIVER_ASSIGNMENT_CHANGED,
@@ -1183,12 +1186,20 @@ def cancel_handshake(
             synchronize_session=False,
         )
 
-        maybe_append_domain_event(
+        # B2 decision marker (no RID). Prove gate + transition around append.
+        previous_status = "BID - CONFIRMED"
+        appended = maybe_append_domain_event(
             db,
             event_type=EVENT_HANDSHAKE_CANCELLED,
             aggregate_id=str(rid),
             payload={"requestId": int(rid)},
             actor_auth_subject=actor_auth_subject,
+        )
+        log_handshake_cancelled_emission_decision(
+            previous_status=previous_status,
+            transition_eligible=True,
+            append_attempted=True,
+            append_succeeded=appended is not None,
         )
 
         db.commit()

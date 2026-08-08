@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session
 from .models import DomainOutboxEvent
 from .registry import (
     EVENT_BID_CREATED,
+    EVENT_HANDSHAKE_CANCELLED,
     EVENT_TYPE_FLAG_ENV,
     OUTBOX_STATUS_PENDING,
     SCHEMA_VERSION_V1,
@@ -168,7 +170,70 @@ def flag_snapshot_booleans() -> Dict[str, Any]:
         "DOMAIN_EVENT_BID_CREATED_ENABLED_source": env_flag_source_category(
             "DOMAIN_EVENT_BID_CREATED_ENABLED"
         ),
+        "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED"
+        ),
     }
+
+
+def process_bound_flag_snapshot(*, reason: str = "http") -> Dict[str, Any]:
+    """
+    Process-bound flag proof payload (no secrets, no account/RID identifiers).
+
+    Used by startup logs and authenticated ops GET /domain-event-flag-snapshot.
+    """
+    snap = flag_snapshot_booleans()
+    per = snap["per_event"]
+    return {
+        "reason": reason,
+        "deployRevision": deployment_revision_hint(),
+        "instanceHash": instance_id_hash(),
+        "DOMAIN_EVENTS_ENABLED": snap["DOMAIN_EVENTS_ENABLED"],
+        "DOMAIN_EVENTS_ENABLED_source": snap["DOMAIN_EVENTS_ENABLED_source"],
+        "perEvent": dict(per),
+        "eventFlagEnv": dict(EVENT_TYPE_FLAG_ENV),
+        "handshakeCancelled": {
+            "eventType": EVENT_HANDSHAKE_CANCELLED,
+            "envFlag": "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED",
+            "perEventEnabled": bool(per.get(EVENT_HANDSHAKE_CANCELLED, False)),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_HANDSHAKE_CANCELLED, False)
+            ),
+            "source": snap["DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED_source"],
+        },
+    }
+
+
+def configure_domain_event_logging() -> None:
+    """
+    Ensure openbid.events.* INFO logs reach process stdout.
+
+    Azure App Service captures stdout; without a handler, stdlib logging
+    discards INFO (lastResort is WARNING+), so domain_event_flag_snapshot
+    and emission decisions were invisible to ops downloads.
+    """
+    try:
+        root_name = "openbid.events"
+        logger = logging.getLogger(root_name)
+        if any(
+            isinstance(h, logging.StreamHandler) and getattr(h, "_openbid_events", False)
+            for h in logger.handlers
+        ):
+            return
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter("%(levelname)s %(name)s %(message)s")
+        )
+        handler._openbid_events = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        # Avoid duplicate emission through root if root later gains handlers.
+        logger.propagate = False
+    except Exception:
+        # Never block API boot on logging setup.
+        pass
 
 
 def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
@@ -176,27 +241,85 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     Safe structured log of interpreted domain-event flags.
 
     Never logs secrets, raw account ids, or full environ dumps.
+    Includes every registered per-event boolean so Wave B2 binding is provable.
     """
-    snap = flag_snapshot_booleans()
-    per = snap["per_event"]
-    _logger.info(
+    payload = process_bound_flag_snapshot(reason=reason)
+    per = payload["perEvent"]
+    # Compact eventType=bool pairs for log search (includes handshake.cancelled).
+    per_pairs = " ".join(
+        f"{et}={str(bool(enabled)).lower()}" for et, enabled in sorted(per.items())
+    )
+    hc = payload["handshakeCancelled"]
+    msg = (
         "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
         "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
-        "master_source=%s bid_created_source=%s "
-        "pr40_any_enabled=%s",
-        reason,
-        deployment_revision_hint(),
-        instance_id_hash(),
-        snap["DOMAIN_EVENTS_ENABLED"],
-        per.get(EVENT_BID_CREATED, False),
-        snap["DOMAIN_EVENTS_ENABLED_source"],
-        snap["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
-        any(
-            enabled
-            for et, enabled in per.items()
-            if et != EVENT_BID_CREATED
-        ),
+        "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED=%s "
+        "handshake.cancelled=%s handshake_cancelled_emission=%s "
+        "master_source=%s bid_created_source=%s handshake_cancelled_source=%s "
+        "pr40_any_enabled=%s per_event=%s"
     )
+    args = (
+        reason,
+        payload["deployRevision"],
+        payload["instanceHash"],
+        payload["DOMAIN_EVENTS_ENABLED"],
+        per.get(EVENT_BID_CREATED, False),
+        per.get(EVENT_HANDSHAKE_CANCELLED, False),
+        hc["perEventEnabled"],
+        hc["emissionEnabled"],
+        payload["DOMAIN_EVENTS_ENABLED_source"],
+        flag_snapshot_booleans()["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
+        hc["source"],
+        any(enabled for et, enabled in per.items() if et != EVENT_BID_CREATED),
+        per_pairs,
+    )
+    _logger.info(msg, *args)
+    # Belt-and-suspenders: print mirrors logger so filesystem/logstream capture
+    # works even if an upstream logging config clears handlers later.
+    try:
+        print(msg % args, flush=True)
+    except Exception:
+        pass
+
+
+def log_handshake_cancelled_emission_decision(
+    *,
+    previous_status: str,
+    transition_eligible: bool,
+    append_attempted: bool,
+    append_succeeded: bool,
+) -> None:
+    """
+    B2 cancel-path decision marker (no RID / account identifiers).
+
+    Emitted on the CONFIRMED→OPEN business path around maybe_append.
+    """
+    decision = describe_emission_decision(EVENT_HANDSHAKE_CANCELLED)
+    msg = (
+        "handshake_cancelled_emission_decision eventType=%s masterEnabled=%s "
+        "perEventEnabled=%s previousStatus=%s transitionEligible=%s "
+        "appendAttempted=%s appendSucceeded=%s deployRevision=%s "
+        "instanceHash=%s emissionEnabled=%s"
+    )
+    # Sanitize status enum to a short token (no free text).
+    status_token = str(previous_status or "").strip()[:40]
+    args = (
+        EVENT_HANDSHAKE_CANCELLED,
+        decision["master_enabled"],
+        decision["per_event_enabled"],
+        status_token,
+        transition_eligible,
+        append_attempted,
+        append_succeeded,
+        decision["revision"],
+        decision["instance_hash"],
+        decision["emission_enabled"],
+    )
+    _logger.info(msg, *args)
+    try:
+        print(msg % args, flush=True)
+    except Exception:
+        pass
 
 
 def describe_emission_decision(event_type: str) -> Dict[str, Any]:
