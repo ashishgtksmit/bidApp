@@ -859,6 +859,120 @@ def test_handshake_accepted_replay_no_event(seeded_db, bg, monkeypatch):
     assert bg.tasks == []
 
 
+def test_handshake_accepted_outbox_failure_rolls_back(seeded_db, bg, monkeypatch):
+    """Outbox append failure rolls back request/bid/wonBy/finalAmount; no FCM."""
+    _enable_event(monkeypatch, "handshake.accepted")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1750, status="BID - CONFIRMED"
+    )
+    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102)
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.vendor_bid.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = vendor_bid_mod.accept_request_by_vendor(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert result.message == "ERROR"
+    db = _reopen(seeded_db)
+    request_row = db.query(Request).one()
+    assert request_row.requestStatus == "BID - CONFIRMED"
+    assert request_row.requestWonBy is None
+    assert request_row.finalAmount == 0
+    assert (
+        db.query(BidDetail).filter(BidDetail.BID == bid.BID).one().bidStatus
+        == "BID - CONFIRMED"
+    )
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_accepted_flag_off_mutates_with_fcm_no_event(seeded_db, bg, monkeypatch):
+    """Master on / B3 off: business + mutation FCM succeed; zero outbox rows."""
+    _disable_all(monkeypatch)
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED", "false")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1750, status="BID - CONFIRMED"
+    )
+    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102)
+    session = _reopen(seeded_db)
+    result = vendor_bid_mod.accept_request_by_vendor(
+        session,
+        rid=req.RID,
+        bid_id=bid.BID,
+        user_id=VENDOR_A,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    db = _reopen(seeded_db)
+    request_row = db.query(Request).one()
+    assert request_row.requestStatus == "REQUEST - CONFIRMED"
+    assert request_row.requestWonBy == VENDOR_A
+    assert request_row.finalAmount == 1750
+    assert (
+        db.query(BidDetail).filter(BidDetail.BID == bid.BID).one().bidStatus
+        == "REQUEST - CONFIRMED"
+    )
+    assert _outbox(seeded_db) == []
+    assert any(
+        t.func is notifications_mod.notify_customer_vendor_accepted for t in bg.tasks
+    )
+    assert any(
+        t.func is notifications_mod.notify_losing_vendors_trip_won for t in bg.tasks
+    )
+    loser_args = [
+        t.args[0]
+        for t in bg.tasks
+        if t.func is notifications_mod.notify_losing_vendors_trip_won
+    ]
+    assert loser_args == [[VENDOR_B]]
+
+
+def test_handshake_accepted_rid_bid_mismatch_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.accepted")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    other = _seed_request(seeded_db, status="BID - OPEN", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=other.RID, bidder_id=VENDOR_A, amount=1000, status="BID - OPEN"
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.accept_request_by_vendor(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert "does not belong" in str(exc.value.detail).lower()
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_accepted_fcm_only_after_commit_ordering():
+    """Mutation schedules FCM only after successful commit (source order proof)."""
+    src = Path(vendor_bid_mod.__file__).read_text()
+    fn = src[src.index("def accept_request_by_vendor") :]
+    fn = fn[: fn.index("\ndef reject_request_by_vendor_pr11")]
+    append_at = fn.index("maybe_append_domain_event")
+    commit_at = fn.index("db.commit()")
+    notify_customer_at = fn.index("notify_customer_vendor_accepted")
+    notify_losers_at = fn.index("notify_losing_vendors_trip_won")
+    assert append_at < commit_at < notify_customer_at < notify_losers_at
+    assert "background_tasks.add_task" in fn[commit_at:]
+    assert "request_snapshot_refresh(" not in fn
+    assert '"/build_snapshot"' not in fn and "'/build_snapshot'" not in fn
+
+
 # --- handshake.rejected ---
 
 

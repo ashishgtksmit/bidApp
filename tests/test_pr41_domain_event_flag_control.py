@@ -212,6 +212,34 @@ def test_process_bound_flag_snapshot_includes_handshake_cancelled(monkeypatch):
     assert "password" not in blob
 
 
+def test_process_bound_flag_snapshot_includes_handshake_accepted(monkeypatch):
+    """B3 binding proof payload must expose handshake.accepted gate explicitly."""
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_HANDSHAKE_ACCEPTED
+
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED", "true")
+    monkeypatch.setenv("OPENBID_DEPLOY_REVISION", "testrev-b3")
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert snap["DOMAIN_EVENTS_ENABLED"] is True
+    assert snap["perEvent"][EVENT_HANDSHAKE_ACCEPTED] is True
+    assert snap["handshakeAccepted"]["eventType"] == "handshake.accepted"
+    assert snap["handshakeAccepted"]["envFlag"] == (
+        "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED"
+    )
+    assert snap["handshakeAccepted"]["perEventEnabled"] is True
+    assert snap["handshakeAccepted"]["emissionEnabled"] is True
+    assert snap["deployRevision"] == "testrev-b3"
+    # Default / master-only: B3 emission remains false
+    monkeypatch.delenv("DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED", raising=False)
+    snap_off = process_bound_flag_snapshot(reason="unit")
+    assert snap_off["handshakeAccepted"]["perEventEnabled"] is False
+    assert snap_off["handshakeAccepted"]["emissionEnabled"] is False
+    blob = str(snap).lower()
+    assert "password" not in blob
+    assert "fcm" not in blob
+
+
 def test_handshake_cancelled_flag_env_mapping():
     from app_v1.events.registry import (
         EVENT_HANDSHAKE_CANCELLED,
@@ -222,4 +250,17 @@ def test_handshake_cancelled_flag_env_mapping():
     assert (
         EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_CANCELLED]
         == "DOMAIN_EVENT_HANDSHAKE_CANCELLED_ENABLED"
+    )
+
+
+def test_handshake_accepted_flag_env_mapping():
+    from app_v1.events.registry import (
+        EVENT_HANDSHAKE_ACCEPTED,
+        EVENT_TYPE_FLAG_ENV,
+    )
+
+    assert EVENT_HANDSHAKE_ACCEPTED == "handshake.accepted"
+    assert (
+        EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_ACCEPTED]
+        == "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED"
     )
