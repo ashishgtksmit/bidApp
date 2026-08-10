@@ -21,6 +21,7 @@ from .registry import (
     EVENT_BID_CREATED,
     EVENT_HANDSHAKE_ACCEPTED,
     EVENT_HANDSHAKE_CANCELLED,
+    EVENT_HANDSHAKE_REJECTED,
     EVENT_TYPE_FLAG_ENV,
     OUTBOX_STATUS_PENDING,
     SCHEMA_VERSION_V1,
@@ -177,6 +178,9 @@ def flag_snapshot_booleans() -> Dict[str, Any]:
         "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED_source": env_flag_source_category(
             "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED"
         ),
+        "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED"
+        ),
     }
 
 
@@ -215,6 +219,16 @@ def process_bound_flag_snapshot(*, reason: str = "http") -> Dict[str, Any]:
                 and per.get(EVENT_HANDSHAKE_ACCEPTED, False)
             ),
             "source": snap["DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED_source"],
+        },
+        "handshakeRejected": {
+            "eventType": EVENT_HANDSHAKE_REJECTED,
+            "envFlag": "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED",
+            "perEventEnabled": bool(per.get(EVENT_HANDSHAKE_REJECTED, False)),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_HANDSHAKE_REJECTED, False)
+            ),
+            "source": snap["DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED_source"],
         },
     }
 
@@ -255,16 +269,17 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     Safe structured log of interpreted domain-event flags.
 
     Never logs secrets, raw account ids, or full environ dumps.
-    Includes every registered per-event boolean so Wave B2/B3 binding is provable.
+    Includes every registered per-event boolean so Wave B2/B3/B4 binding is provable.
     """
     payload = process_bound_flag_snapshot(reason=reason)
     per = payload["perEvent"]
-    # Compact eventType=bool pairs for log search (includes handshake.cancelled/accepted).
+    # Compact eventType=bool pairs for log search (includes handshake.cancelled/accepted/rejected).
     per_pairs = " ".join(
         f"{et}={str(bool(enabled)).lower()}" for et, enabled in sorted(per.items())
     )
     hc = payload["handshakeCancelled"]
     ha = payload["handshakeAccepted"]
+    hr = payload["handshakeRejected"]
     msg = (
         "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
         "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
@@ -272,8 +287,10 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         "handshake.cancelled=%s handshake_cancelled_emission=%s "
         "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED=%s "
         "handshake.accepted=%s handshake_accepted_emission=%s "
+        "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED=%s "
+        "handshake.rejected=%s handshake_rejected_emission=%s "
         "master_source=%s bid_created_source=%s handshake_cancelled_source=%s "
-        "handshake_accepted_source=%s "
+        "handshake_accepted_source=%s handshake_rejected_source=%s "
         "pr40_any_enabled=%s per_event=%s"
     )
     args = (
@@ -288,10 +305,14 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         per.get(EVENT_HANDSHAKE_ACCEPTED, False),
         ha["perEventEnabled"],
         ha["emissionEnabled"],
+        per.get(EVENT_HANDSHAKE_REJECTED, False),
+        hr["perEventEnabled"],
+        hr["emissionEnabled"],
         payload["DOMAIN_EVENTS_ENABLED_source"],
         flag_snapshot_booleans()["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
         hc["source"],
         ha["source"],
+        hr["source"],
         any(enabled for et, enabled in per.items() if et != EVENT_BID_CREATED),
         per_pairs,
     )

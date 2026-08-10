@@ -978,11 +978,19 @@ def test_handshake_accepted_fcm_only_after_commit_ordering():
 
 def test_handshake_rejected_emits_once_with_bidder_id(seeded_db, bg, monkeypatch):
     _enable_event(monkeypatch, "handshake.rejected")
-    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    req = _seed_request(
+        seeded_db,
+        status="BID - CONFIRMED",
+        no_of_bids=2,
+        request_won_by=None,
+        final_amount=0,
+    )
     bid = _seed_bid(
         seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
     )
-    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102)
+    remaining = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102, status="BID - OPEN"
+    )
     session = _reopen(seeded_db)
     result = vendor_bid_mod.reject_request_by_vendor_pr11(
         session,
@@ -997,11 +1005,92 @@ def test_handshake_rejected_emits_once_with_bidder_id(seeded_db, bg, monkeypatch
     assert len(rows) == 1
     ev = rows[0]
     assert ev.eventType == "handshake.rejected"
-    assert ev.payload["bidderId"] == VENDOR_A
-    assert "rejectionReason" not in ev.payload
-    assert "Cannot honour" not in json.dumps(ev.payload)
+    assert ev.schemaVersion == 1
+    assert ev.aggregateType == "request"
+    assert ev.aggregateId == str(req.RID)
+    assert ev.payload == {
+        "requestId": req.RID,
+        "bidId": bid.BID,
+        "bidderId": VENDOR_A,
+    }
+    assert set(ev.payload.keys()) == {"requestId", "bidId", "bidderId"}
+    _assert_forbidden_absent(
+        ev.payload,
+        "customerappid",
+        "requestwonby",
+        "recipient",
+        "rejectionreason",
+    )
     dumped = json.dumps([r.eventType for r in rows])
     assert "bid.deleted" not in dumped
+    db2 = _reopen(seeded_db)
+    request_row = db2.query(Request).one()
+    assert request_row.requestStatus == "BID - OPEN"
+    assert request_row.rejectionReason == "Cannot honour"
+    assert request_row.requestWonBy is None
+    assert request_row.finalAmount == 0
+    assert request_row.noOfBids == 1
+    assert db2.query(BidDetail).filter(BidDetail.BID == bid.BID).first() is None
+    assert (
+        db2.query(BidDetail).filter(BidDetail.BID == remaining.BID).one().bidStatus
+        == "BID - OPEN"
+    )
+    assert any(
+        t.func is notifications_mod.notify_customer_vendor_rejected for t in bg.tasks
+    )
+    reopen_tasks = [
+        t for t in bg.tasks if t.func is notifications_mod.notify_vendors_bidding_reopened
+    ]
+    assert len(reopen_tasks) == 1
+    assert reopen_tasks[0].args[0] == req.RID
+    assert reopen_tasks[0].args[1] == VENDOR_A  # rejector excluded by helper
+
+
+def test_handshake_rejected_master_off_event_on_no_event(seeded_db, bg, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "false")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED", "true")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    result = vendor_bid_mod.reject_request_by_vendor_pr11(
+        session,
+        rid=req.RID,
+        bid_id=bid.BID,
+        body=VendorRejectBody(rejectionReason="x"),
+        user_id=VENDOR_A,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    assert _outbox(seeded_db) == []
+    assert _reopen(seeded_db).query(Request).one().requestStatus == "BID - OPEN"
+    assert any(
+        t.func is notifications_mod.notify_customer_vendor_rejected for t in bg.tasks
+    )
+
+
+def test_handshake_rejected_master_on_event_off_no_event(seeded_db, bg, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED", "false")
+    for name in PR40_EVENT_FLAGS:
+        if name != "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED":
+            monkeypatch.setenv(name, "false")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    result = vendor_bid_mod.reject_request_by_vendor_pr11(
+        session,
+        rid=req.RID,
+        bid_id=bid.BID,
+        body=VendorRejectBody(rejectionReason="x"),
+        user_id=VENDOR_A,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    assert _outbox(seeded_db) == []
     assert any(
         t.func is notifications_mod.notify_customer_vendor_rejected for t in bg.tasks
     )
@@ -1022,8 +1111,203 @@ def test_handshake_rejected_already_open_409_no_event(seeded_db, bg, monkeypatch
             background_tasks=bg,
         )
     assert exc.value.status_code == 409
+    assert "already reopened" in str(exc.value.detail).lower()
     assert _outbox(seeded_db) == []
     assert bg.tasks == []
+
+
+def test_handshake_rejected_wrong_vendor_403_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            body=VendorRejectBody(rejectionReason="stolen"),
+            user_id=VENDOR_B,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).one().requestStatus == "BID - CONFIRMED"
+    )
+
+
+def test_handshake_rejected_missing_request_404_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=999999,
+            bid_id=1,
+            body=VendorRejectBody(rejectionReason="x"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 404
+    assert "request not found" in str(exc.value.detail).lower()
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_rejected_missing_bid_404_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=req.RID,
+            bid_id=999999,
+            body=VendorRejectBody(rejectionReason="x"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 404
+    assert "bid not found" in str(exc.value.detail).lower()
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_rejected_cross_rid_409_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    other = _seed_request(seeded_db, status="BID - OPEN", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=other.RID, bidder_id=VENDOR_A, amount=1000, status="BID - OPEN"
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            body=VendorRejectBody(rejectionReason="x"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert "does not belong" in str(exc.value.detail).lower()
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_rejected_invalid_lifecycle_409_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="REQUEST - CONFIRMED", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db,
+        rid=req.RID,
+        bidder_id=VENDOR_A,
+        amount=1000,
+        status="REQUEST - CONFIRMED",
+    )
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            body=VendorRejectBody(rejectionReason="late"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert "INVALID_REQUEST_STATUS" in str(exc.value.detail)
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_handshake_rejected_outbox_failure_rolls_back(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=2)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=900, car_id=102, status="BID - OPEN"
+    )
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.vendor_bid.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = vendor_bid_mod.reject_request_by_vendor_pr11(
+            session,
+            rid=req.RID,
+            bid_id=bid.BID,
+            body=VendorRejectBody(rejectionReason="x"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert result.message == "ERROR"
+    db2 = _reopen(seeded_db)
+    assert db2.query(Request).one().requestStatus == "BID - CONFIRMED"
+    assert db2.query(BidDetail).filter(BidDetail.BID == bid.BID).one() is not None
+    assert db2.query(Request).one().noOfBids == 2
+    assert db2.query(DomainOutboxEvent).count() == 0
+    assert bg.tasks == []
+
+
+def test_handshake_rejected_replay_after_success_409_no_second_event(
+    seeded_db, bg, monkeypatch
+):
+    _enable_event(monkeypatch, "handshake.rejected")
+    req = _seed_request(seeded_db, status="BID - CONFIRMED", no_of_bids=1)
+    bid = _seed_bid(
+        seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1000, status="BID - CONFIRMED"
+    )
+    session = _reopen(seeded_db)
+    first = vendor_bid_mod.reject_request_by_vendor_pr11(
+        session,
+        rid=req.RID,
+        bid_id=bid.BID,
+        body=VendorRejectBody(rejectionReason="first"),
+        user_id=VENDOR_A,
+        background_tasks=bg,
+    )
+    assert first.message == "UPDATED"
+    assert len(_outbox(seeded_db)) == 1
+    first_fcm = len(bg.tasks)
+    session2 = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        vendor_bid_mod.reject_request_by_vendor_pr11(
+            session2,
+            rid=req.RID,
+            bid_id=bid.BID,
+            body=VendorRejectBody(rejectionReason="again"),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert len(_outbox(seeded_db)) == 1
+    assert len(bg.tasks) == first_fcm
+
+
+def test_handshake_rejected_fcm_only_after_commit_ordering():
+    """Mutation schedules FCM only after successful commit (source order proof)."""
+    src = Path(vendor_bid_mod.__file__).read_text()
+    fn = src[src.index("def reject_request_by_vendor_pr11") :]
+    append_at = fn.index("maybe_append_domain_event")
+    commit_at = fn.index("db.commit()")
+    notify_customer_at = fn.index("notify_customer_vendor_rejected")
+    notify_reopen_at = fn.index("notify_vendors_bidding_reopened")
+    assert append_at < commit_at < notify_customer_at < notify_reopen_at
+    assert "background_tasks.add_task" in fn[commit_at:]
+    assert "request_snapshot_refresh(" not in fn
+    assert '"/build_snapshot"' not in fn and "'/build_snapshot'" not in fn
+    # Capture bidderId before hard delete.
+    capture_at = fn.index("rejecting_bidder_id")
+    delete_at = fn.index(".delete(")
+    assert capture_at < delete_at < append_at
 
 
 # --- booking.cancelled_by_customer ---

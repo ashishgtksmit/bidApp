@@ -264,3 +264,43 @@ def test_handshake_accepted_flag_env_mapping():
         EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_ACCEPTED]
         == "DOMAIN_EVENT_HANDSHAKE_ACCEPTED_ENABLED"
     )
+
+
+def test_process_bound_flag_snapshot_includes_handshake_rejected(monkeypatch):
+    """B4 binding proof payload must expose handshake.rejected gate explicitly."""
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_HANDSHAKE_REJECTED
+
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED", "true")
+    monkeypatch.setenv("OPENBID_DEPLOY_REVISION", "testrev-b4")
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert snap["DOMAIN_EVENTS_ENABLED"] is True
+    assert snap["perEvent"][EVENT_HANDSHAKE_REJECTED] is True
+    assert snap["handshakeRejected"]["eventType"] == "handshake.rejected"
+    assert snap["handshakeRejected"]["envFlag"] == (
+        "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED"
+    )
+    assert snap["handshakeRejected"]["perEventEnabled"] is True
+    assert snap["handshakeRejected"]["emissionEnabled"] is True
+    assert snap["deployRevision"] == "testrev-b4"
+    monkeypatch.delenv("DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED", raising=False)
+    snap_off = process_bound_flag_snapshot(reason="unit")
+    assert snap_off["handshakeRejected"]["perEventEnabled"] is False
+    assert snap_off["handshakeRejected"]["emissionEnabled"] is False
+    blob = str(snap).lower()
+    assert "password" not in blob
+    assert "fcm" not in blob
+
+
+def test_handshake_rejected_flag_env_mapping():
+    from app_v1.events.registry import (
+        EVENT_HANDSHAKE_REJECTED,
+        EVENT_TYPE_FLAG_ENV,
+    )
+
+    assert EVENT_HANDSHAKE_REJECTED == "handshake.rejected"
+    assert (
+        EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_REJECTED]
+        == "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED"
+    )
