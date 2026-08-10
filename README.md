@@ -633,3 +633,10 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
 - Process-bound flag snapshot exposes `bookingCancelledByCustomer` (deploy rev `fbd8fd1`).
 - Dedicated emission/rollback/FCM tests in `tests/test_pr40_known_party_event_emission.py`.
 - Production `DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED` remains unset/false.
+
+## PR40 Wave C2 readiness (2026-08-10)
+
+- Process-bound flag snapshot exposes `driverAssignmentChanged` (deploy rev `47ff010`).
+- Dedicated emission/rollback/FCM tests in `tests/test_pr40_known_party_event_emission.py`.
+- Production `DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED` remains unset/false.
+
