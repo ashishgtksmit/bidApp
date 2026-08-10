@@ -1310,29 +1310,117 @@ def test_handshake_rejected_fcm_only_after_commit_ordering():
     assert capture_at < delete_at < append_at
 
 
-# --- booking.cancelled_by_customer ---
+# --- booking.cancelled_by_customer (C1 dedicated matrix) ---
+
+
+def _seed_c1_confirmed_booking(
+    db,
+    *,
+    payment_status: str | None = "UNPAID",
+    with_driver: bool = True,
+    with_losing_bid: bool = True,
+    rejection_reason: str | None = None,
+):
+    """REQUEST - CONFIRMED topology: V1 winner + optional V2 loser + future pickup."""
+    pickup = datetime.now() + timedelta(days=10)
+    req = _seed_request(
+        db,
+        status="REQUEST - CONFIRMED",
+        request_won_by=VENDOR_A,
+        final_amount=3700,
+        no_of_bids=2 if with_losing_bid else 1,
+    )
+    winner = _seed_bid(
+        db,
+        rid=req.RID,
+        bidder_id=VENDOR_A,
+        amount=3700,
+        status="REQUEST - CONFIRMED",
+    )
+    loser = None
+    if with_losing_bid:
+        loser = _seed_bid(
+            db, rid=req.RID, bidder_id=VENDOR_B, amount=3800, car_id=102, status="BID - OPEN"
+        )
+    driver = None
+    if with_driver:
+        driver = _seed_driver(db, user_app_id=VENDOR_A, number="9800000c11")
+    session = _reopen(db)
+    updates = {
+        Request.pickUpDate: pickup.date(),
+        Request.pickUpTime: time(11, 0),
+        Request.paymentStatus: payment_status,
+        Request.rejectionReason: rejection_reason,
+    }
+    if driver is not None:
+        updates[Request.driverAssignedID] = driver.DDID
+    session.query(Request).filter(Request.RID == req.RID).update(
+        updates, synchronize_session=False
+    )
+    session.commit()
+    return _reopen(db).query(Request).filter(Request.RID == req.RID).one(), winner, loser, driver
+
+
+def test_booking_cancelled_master_false_mutates_no_event(seeded_db, bg, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "false")
+    monkeypatch.setenv("DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED", "true")
+    req, _, _, _ = _seed_c1_confirmed_booking(seeded_db)
+    session = _reopen(seeded_db)
+    result = request_mod.booking_cancelled_by_user(
+        session,
+        rid=req.RID,
+        rejection_reason="Change of Travel Plans",
+        user_id=CUSTOMER_ID,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    assert _reopen(seeded_db).query(Request).one().requestStatus == (
+        "BOOKING - CANCELLED BY USER"
+    )
+    assert _outbox(seeded_db) == []
+    assert any(
+        t.func is notifications_mod.notify_vendor_booking_cancelled_by_customer
+        for t in bg.tasks
+    )
+
+
+def test_booking_cancelled_master_on_flag_off_mutates_no_event(seeded_db, bg, monkeypatch):
+    _disable_all(monkeypatch)
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED", "false")
+    req, _, _, _ = _seed_c1_confirmed_booking(seeded_db)
+    session = _reopen(seeded_db)
+    result = request_mod.booking_cancelled_by_user(
+        session,
+        rid=req.RID,
+        rejection_reason="Change of Travel Plans",
+        user_id=CUSTOMER_ID,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    assert _reopen(seeded_db).query(Request).one().requestStatus == (
+        "BOOKING - CANCELLED BY USER"
+    )
+    assert _outbox(seeded_db) == []
+    assert any(
+        t.func is notifications_mod.notify_vendor_booking_cancelled_by_customer
+        for t in bg.tasks
+    )
 
 
 def test_booking_cancelled_emits_on_transition(seeded_db, bg, monkeypatch):
+    """C1 happy path: transition + exact envelope + preserve fields + FCM once."""
     _enable_event(monkeypatch, "booking.cancelled_by_customer")
-    pickup = datetime.now() + timedelta(days=5)
-    req = _seed_request(
-        seeded_db,
-        status="REQUEST - CONFIRMED",
-        request_won_by=VENDOR_A,
-        final_amount=1500,
-        no_of_bids=1,
-    )
-    # Force future pickup via direct update (PR11 seed uses fixed past-ish dates).
-    session = _reopen(seeded_db)
-    session.query(Request).filter(Request.RID == req.RID).update(
-        {
-            Request.pickUpDate: pickup.date(),
-            Request.pickUpTime: time(10, 0),
-        },
-        synchronize_session=False,
-    )
-    session.commit()
+    req, winner, loser, driver = _seed_c1_confirmed_booking(seeded_db)
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    won_by = before.requestWonBy
+    final_amount = before.finalAmount
+    payment = before.paymentStatus
+    driver_id = before.driverAssignedID
+    bid_rows = {
+        (b.BID, b.bidderID, b.bidStatus, float(b.bidAmount))
+        for b in _reopen(seeded_db).query(BidDetail).filter(BidDetail.rID == req.RID).all()
+    }
     session = _reopen(seeded_db)
     result = request_mod.booking_cancelled_by_user(
         session,
@@ -1344,11 +1432,54 @@ def test_booking_cancelled_emits_on_transition(seeded_db, bg, monkeypatch):
     assert result.message == "UPDATED"
     rows = _outbox(seeded_db)
     assert len(rows) == 1
-    assert rows[0].eventType == "booking.cancelled_by_customer"
-    assert rows[0].payload == {"requestId": req.RID}
-    assert "Plans changed" not in json.dumps(rows[0].payload)
-    assert any(
-        t.func is notifications_mod.notify_vendor_booking_cancelled_by_customer
+    ev = rows[0]
+    assert ev.eventType == "booking.cancelled_by_customer"
+    assert ev.schemaVersion == 1
+    assert ev.aggregateType == "request"
+    assert ev.aggregateId == str(req.RID)
+    assert ev.payload == {"requestId": req.RID}
+    assert set(ev.payload.keys()) == {"requestId"}
+    _assert_forbidden_absent(
+        ev.payload,
+        "customerappid",
+        "requestwonby",
+        "driverassignedid",
+        "finalamount",
+        "rejectionreason",
+        "bidderid",
+        "bidid",
+        "vendor",
+        "notification",
+    )
+    assert "Plans changed" not in json.dumps(ev.payload)
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.requestStatus == "BOOKING - CANCELLED BY USER"
+    assert after.requestWonBy == won_by == VENDOR_A
+    assert after.finalAmount == final_amount == 3700
+    assert after.paymentStatus == payment
+    assert after.driverAssignedID == driver_id
+    assert after.rejectionReason == "Plans changed"
+    after_bids = {
+        (b.BID, b.bidderID, b.bidStatus, float(b.bidAmount))
+        for b in _reopen(seeded_db).query(BidDetail).filter(BidDetail.rID == req.RID).all()
+    }
+    assert after_bids == bid_rows
+    assert winner.BID in {b[0] for b in after_bids}
+    if loser is not None:
+        assert loser.BID in {b[0] for b in after_bids}
+    if driver is not None:
+        assert after.driverAssignedID == driver.DDID
+    fcm = [
+        t
+        for t in bg.tasks
+        if t.func is notifications_mod.notify_vendor_booking_cancelled_by_customer
+    ]
+    assert len(fcm) == 1
+    assert fcm[0].args[0] == VENDOR_A
+    # Worker owns zero business FCM — FastAPI schedules the vendor notify only.
+    assert all(
+        "event_pipeline" not in getattr(t.func, "__module__", "")
+        and "domain_event" not in getattr(t.func, "__module__", "")
         for t in bg.tasks
     )
 
@@ -1359,6 +1490,7 @@ def test_booking_cancelled_replay_no_event(seeded_db, bg, monkeypatch):
         seeded_db,
         status="BOOKING - CANCELLED BY USER",
         request_won_by=VENDOR_A,
+        final_amount=3700,
     )
     session = _reopen(seeded_db)
     result = request_mod.booking_cancelled_by_user(
@@ -1371,6 +1503,179 @@ def test_booking_cancelled_replay_no_event(seeded_db, bg, monkeypatch):
     assert result.message == "UPDATED"
     assert _outbox(seeded_db) == []
     assert bg.tasks == []
+
+
+def test_booking_cancelled_wrong_customer_403_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    req, _, _, _ = _seed_c1_confirmed_booking(seeded_db)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.booking_cancelled_by_user(
+            session,
+            rid=req.RID,
+            rejection_reason="Change of Travel Plans",
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).one().requestStatus == "REQUEST - CONFIRMED"
+    )
+
+
+def test_booking_cancelled_missing_rid_404_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.booking_cancelled_by_user(
+            session,
+            rid=999999,
+            rejection_reason="Change of Travel Plans",
+            user_id=CUSTOMER_ID,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 404
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_booking_cancelled_invalid_lifecycle_409_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    req = _seed_request(seeded_db, status="BID - OPEN", request_won_by=None)
+    pickup = datetime.now() + timedelta(days=5)
+    session = _reopen(seeded_db)
+    session.query(Request).filter(Request.RID == req.RID).update(
+        {Request.pickUpDate: pickup.date(), Request.pickUpTime: time(10, 0)},
+        synchronize_session=False,
+    )
+    session.commit()
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.booking_cancelled_by_user(
+            session,
+            rid=req.RID,
+            rejection_reason="Change of Travel Plans",
+            user_id=CUSTOMER_ID,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_booking_cancelled_past_pickup_409_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    req = _seed_request(
+        seeded_db,
+        status="REQUEST - CONFIRMED",
+        request_won_by=VENDOR_A,
+        final_amount=1000,
+    )
+    past = datetime.now() - timedelta(days=1)
+    session = _reopen(seeded_db)
+    session.query(Request).filter(Request.RID == req.RID).update(
+        {Request.pickUpDate: past.date(), Request.pickUpTime: time(10, 0)},
+        synchronize_session=False,
+    )
+    session.commit()
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.booking_cancelled_by_user(
+            session,
+            rid=req.RID,
+            rejection_reason="Change of Travel Plans",
+            user_id=CUSTOMER_ID,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "CANCELLATION_NOT_ALLOWED"
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+@pytest.mark.parametrize("reason", ["", "   ", None])
+def test_booking_cancelled_invalid_reason_422_no_event(seeded_db, bg, monkeypatch, reason):
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    req, _, _, _ = _seed_c1_confirmed_booking(seeded_db)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.booking_cancelled_by_user(
+            session,
+            rid=req.RID,
+            rejection_reason=reason,
+            user_id=CUSTOMER_ID,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 422
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).one().requestStatus == "REQUEST - CONFIRMED"
+    )
+
+
+def test_booking_cancelled_outbox_failure_rolls_back(seeded_db, bg, monkeypatch):
+    """Outbox append/flush failure rolls back cancel; no FCM; status stays CONFIRMED."""
+    _enable_event(monkeypatch, "booking.cancelled_by_customer")
+    req, _, _, driver = _seed_c1_confirmed_booking(
+        seeded_db, payment_status="UNPAID", rejection_reason=None
+    )
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.request.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = request_mod.booking_cancelled_by_user(
+            session,
+            rid=req.RID,
+            rejection_reason="Change of Travel Plans",
+            user_id=CUSTOMER_ID,
+            background_tasks=bg,
+        )
+    assert result.message == "ERROR"
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.requestStatus == "REQUEST - CONFIRMED"
+    assert after.rejectionReason is None
+    assert after.requestWonBy == before.requestWonBy == VENDOR_A
+    assert after.finalAmount == before.finalAmount == 3700
+    assert after.paymentStatus == before.paymentStatus
+    assert after.driverAssignedID == before.driverAssignedID
+    if driver is not None:
+        assert after.driverAssignedID == driver.DDID
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_booking_cancelled_fcm_only_after_commit_ordering():
+    """Mutation schedules vendor FCM only after successful commit (source order proof)."""
+    src = Path(request_mod.__file__).read_text()
+    fn = src[src.index("def booking_cancelled_by_user") :]
+    append_at = fn.index("maybe_append_domain_event")
+    # Idempotent replay also calls db.commit(); bind to the post-append commit.
+    commit_at = fn.index("db.commit()", append_at)
+    notify_at = fn.index("notify_vendor_booking_cancelled_by_customer", commit_at)
+    assert append_at < commit_at < notify_at
+    assert "background_tasks.add_task" in fn[commit_at:]
+    assert "request_snapshot_refresh(" not in fn
+    assert '"/build_snapshot"' not in fn and "'/build_snapshot'" not in fn
+    assert "redis" not in fn.lower()
+    # Helper must not commit / open a second session / publish Redis from mutation body.
+    assert "SessionLocal" not in fn[append_at:commit_at]
+
+
+def test_booking_cancelled_endpoint_response_contract():
+    """Endpoint remains ErrorResponse UPDATED; RID query + rejectionReason body only."""
+    ep = (ROOT / "app_v1" / "endpoints" / "request.py").read_text()
+    start = ep.index("def cancel_by_user")
+    end = ep.index("\n@router.", start + 1)
+    block = ep[start:end]
+    assert "CancelBookingBody" in block
+    assert "BackgroundTasks" in block
+    assert "booking_cancelled_by_user" in block
+    assert "body.rejectionReason" in block
 
 
 # --- driver.assignment_changed ---

@@ -304,3 +304,48 @@ def test_handshake_rejected_flag_env_mapping():
         EVENT_TYPE_FLAG_ENV[EVENT_HANDSHAKE_REJECTED]
         == "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED"
     )
+
+
+def test_process_bound_flag_snapshot_includes_booking_cancelled_by_customer(monkeypatch):
+    """C1 binding proof payload must expose booking.cancelled_by_customer gate explicitly."""
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_BOOKING_CANCELLED_BY_CUSTOMER
+
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED", "true")
+    monkeypatch.setenv("OPENBID_DEPLOY_REVISION", "testrev-c1")
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert snap["DOMAIN_EVENTS_ENABLED"] is True
+    assert snap["perEvent"][EVENT_BOOKING_CANCELLED_BY_CUSTOMER] is True
+    assert snap["bookingCancelledByCustomer"]["eventType"] == (
+        "booking.cancelled_by_customer"
+    )
+    assert snap["bookingCancelledByCustomer"]["envFlag"] == (
+        "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED"
+    )
+    assert snap["bookingCancelledByCustomer"]["perEventEnabled"] is True
+    assert snap["bookingCancelledByCustomer"]["emissionEnabled"] is True
+    assert snap["deployRevision"] == "testrev-c1"
+    monkeypatch.delenv(
+        "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED", raising=False
+    )
+    snap_off = process_bound_flag_snapshot(reason="unit")
+    assert snap_off["bookingCancelledByCustomer"]["perEventEnabled"] is False
+    assert snap_off["bookingCancelledByCustomer"]["emissionEnabled"] is False
+    blob = str(snap).lower()
+    assert "password" not in blob
+    assert "fcm" not in blob
+    assert "jwt" not in blob
+
+
+def test_booking_cancelled_by_customer_flag_env_mapping():
+    from app_v1.events.registry import (
+        EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
+        EVENT_TYPE_FLAG_ENV,
+    )
+
+    assert EVENT_BOOKING_CANCELLED_BY_CUSTOMER == "booking.cancelled_by_customer"
+    assert (
+        EVENT_TYPE_FLAG_ENV[EVENT_BOOKING_CANCELLED_BY_CUSTOMER]
+        == "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED"
+    )
