@@ -338,6 +338,37 @@ def test_process_bound_flag_snapshot_includes_booking_cancelled_by_customer(monk
     assert "jwt" not in blob
 
 
+def test_process_bound_flag_snapshot_includes_driver_assignment_changed(monkeypatch):
+    """C2 binding proof payload must expose driver.assignment_changed gate explicitly."""
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_DRIVER_ASSIGNMENT_CHANGED
+
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED", "true")
+    monkeypatch.setenv("OPENBID_DEPLOY_REVISION", "testrev-c2")
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert snap["DOMAIN_EVENTS_ENABLED"] is True
+    assert snap["perEvent"][EVENT_DRIVER_ASSIGNMENT_CHANGED] is True
+    assert snap["driverAssignmentChanged"]["eventType"] == "driver.assignment_changed"
+    assert snap["driverAssignmentChanged"]["envFlag"] == (
+        "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED"
+    )
+    assert snap["driverAssignmentChanged"]["perEventEnabled"] is True
+    assert snap["driverAssignmentChanged"]["emissionEnabled"] is True
+    assert snap["deployRevision"] == "testrev-c2"
+    monkeypatch.delenv(
+        "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED", raising=False
+    )
+    snap_off = process_bound_flag_snapshot(reason="unit")
+    assert snap_off["driverAssignmentChanged"]["perEventEnabled"] is False
+    assert snap_off["driverAssignmentChanged"]["emissionEnabled"] is False
+    blob = str(snap).lower()
+    assert "password" not in blob
+    assert "fcm" not in blob
+    assert "jwt" not in blob
+    assert "driverphone" not in blob.replace("_", "")
+
+
 def test_booking_cancelled_by_customer_flag_env_mapping():
     from app_v1.events.registry import (
         EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
@@ -348,4 +379,17 @@ def test_booking_cancelled_by_customer_flag_env_mapping():
     assert (
         EVENT_TYPE_FLAG_ENV[EVENT_BOOKING_CANCELLED_BY_CUSTOMER]
         == "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED"
+    )
+
+
+def test_driver_assignment_changed_flag_env_mapping():
+    from app_v1.events.registry import (
+        EVENT_DRIVER_ASSIGNMENT_CHANGED,
+        EVENT_TYPE_FLAG_ENV,
+    )
+
+    assert EVENT_DRIVER_ASSIGNMENT_CHANGED == "driver.assignment_changed"
+    assert (
+        EVENT_TYPE_FLAG_ENV[EVENT_DRIVER_ASSIGNMENT_CHANGED]
+        == "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED"
     )

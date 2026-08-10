@@ -1678,18 +1678,60 @@ def test_booking_cancelled_endpoint_response_contract():
     assert "body.rejectionReason" in block
 
 
-# --- driver.assignment_changed ---
+# --- driver.assignment_changed (C2 dedicated matrix) ---
 
 
-def test_driver_assignment_emits_on_change(seeded_db, bg, monkeypatch):
-    _enable_event(monkeypatch, "driver.assignment_changed")
+def _seed_c2_confirmed_booking(
+    db,
+    *,
+    payment_status: str | None = "UNPAID",
+    with_losing_bid: bool = True,
+    assigned_driver: DriverDetail | None = None,
+):
+    """REQUEST - CONFIRMED topology for C2: V1 winner + optional V2 loser + future pickup."""
+    pickup = datetime.now() + timedelta(days=12)
     req = _seed_request(
-        seeded_db,
+        db,
         status="REQUEST - CONFIRMED",
         request_won_by=VENDOR_A,
-        final_amount=1000,
+        final_amount=3700,
+        no_of_bids=2 if with_losing_bid else 1,
     )
-    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000101")
+    winner = _seed_bid(
+        db,
+        rid=req.RID,
+        bidder_id=VENDOR_A,
+        amount=3700,
+        status="REQUEST - CONFIRMED",
+    )
+    loser = None
+    if with_losing_bid:
+        loser = _seed_bid(
+            db, rid=req.RID, bidder_id=VENDOR_B, amount=3800, car_id=102, status="BID - OPEN"
+        )
+    session = _reopen(db)
+    updates = {
+        Request.pickUpDate: pickup.date(),
+        Request.pickUpTime: time(11, 30),
+        Request.paymentStatus: payment_status,
+        Request.driverAssignedID: assigned_driver.DDID if assigned_driver else None,
+    }
+    session.query(Request).filter(Request.RID == req.RID).update(
+        updates, synchronize_session=False
+    )
+    session.commit()
+    return (
+        _reopen(db).query(Request).filter(Request.RID == req.RID).one(),
+        winner,
+        loser,
+    )
+
+
+def test_driver_assignment_master_false_mutates_no_event(seeded_db, bg, monkeypatch):
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "false")
+    monkeypatch.setenv("DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED", "true")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c21")
     session = _reopen(seeded_db)
     result = request_mod.assign_driver_to_request(
         session,
@@ -1698,29 +1740,22 @@ def test_driver_assignment_emits_on_change(seeded_db, bg, monkeypatch):
         background_tasks=bg,
     )
     assert result.message == "UPDATED"
-    rows = _outbox(seeded_db)
-    assert len(rows) == 1
-    assert rows[0].eventType == "driver.assignment_changed"
-    assert rows[0].payload == {"requestId": req.RID, "driverId": driver.DDID}
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.driverAssignedID == driver.DDID
+    assert after.requestStatus == "REQUEST - CONFIRMED"
+    assert _outbox(seeded_db) == []
     assert any(
         t.func is notifications_mod.notify_driver_assigned_to_customer_background
         for t in bg.tasks
     )
 
 
-def test_driver_same_assignment_no_event(seeded_db, bg, monkeypatch):
-    _enable_event(monkeypatch, "driver.assignment_changed")
-    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000102")
-    req = _seed_request(
-        seeded_db,
-        status="REQUEST - CONFIRMED",
-        request_won_by=VENDOR_A,
-    )
-    session = _reopen(seeded_db)
-    session.query(Request).filter(Request.RID == req.RID).update(
-        {Request.driverAssignedID: driver.DDID}, synchronize_session=False
-    )
-    session.commit()
+def test_driver_assignment_master_on_flag_off_mutates_no_event(seeded_db, bg, monkeypatch):
+    _disable_all(monkeypatch)
+    monkeypatch.setenv("DOMAIN_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED", "false")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c22")
     session = _reopen(seeded_db)
     result = request_mod.assign_driver_to_request(
         session,
@@ -1729,24 +1764,94 @@ def test_driver_same_assignment_no_event(seeded_db, bg, monkeypatch):
         background_tasks=bg,
     )
     assert result.message == "UPDATED"
+    assert (
+        _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one().driverAssignedID
+        == driver.DDID
+    )
     assert _outbox(seeded_db) == []
-    assert bg.tasks == []
+    assert any(
+        t.func is notifications_mod.notify_driver_assigned_to_customer_background
+        for t in bg.tasks
+    )
 
 
-def test_driver_replacement_emits_once(seeded_db, bg, monkeypatch):
+def test_driver_assignment_first_emits_exactly_one(seeded_db, bg, monkeypatch):
     _enable_event(monkeypatch, "driver.assignment_changed")
-    d1 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000201")
-    d2 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000202")
-    req = _seed_request(
-        seeded_db,
-        status="REQUEST - CONFIRMED",
-        request_won_by=VENDOR_A,
-    )
+    req, winner, loser = _seed_c2_confirmed_booking(seeded_db, payment_status="UNPAID")
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c23")
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert before.driverAssignedID is None
+    bid_before = {
+        b.BID: (b.bidStatus, b.bidAmount, b.bidderID)
+        for b in _reopen(seeded_db).query(BidDetail).filter(BidDetail.rID == req.RID).all()
+    }
     session = _reopen(seeded_db)
-    session.query(Request).filter(Request.RID == req.RID).update(
-        {Request.driverAssignedID: d1.DDID}, synchronize_session=False
+    result = request_mod.assign_driver_to_request(
+        session,
+        AssignDriverRequest(RID=req.RID, DRIVERID=driver.DDID),
+        user_id=VENDOR_A,
+        background_tasks=bg,
+        actor_auth_subject="vendor-subj-c2",
     )
-    session.commit()
+    assert result.message == "UPDATED"
+    rows = _outbox(seeded_db)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev.eventType == "driver.assignment_changed"
+    assert ev.schemaVersion == 1
+    assert ev.aggregateType == "request"
+    assert ev.aggregateId == str(req.RID)
+    assert set(ev.payload.keys()) == {"requestId", "driverId"}
+    assert ev.payload == {"requestId": req.RID, "driverId": driver.DDID}
+    _assert_forbidden_absent(
+        ev.payload,
+        "customerappid",
+        "requestwonby",
+        "drivername",
+        "drivernumber",
+        "driverlicense",
+        "driverdocument",
+        "driverphoto",
+        "phone",
+        "fcm",
+        "token",
+        "jwt",
+        "authsubject",
+        "bank",
+        "kyc",
+        "vehicle",
+    )
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.requestStatus == "REQUEST - CONFIRMED"
+    assert after.requestWonBy == VENDOR_A == before.requestWonBy
+    assert after.finalAmount == before.finalAmount == 3700
+    assert after.paymentStatus == before.paymentStatus == "UNPAID"
+    assert after.driverAssignedID == driver.DDID
+    bid_after = {
+        b.BID: (b.bidStatus, b.bidAmount, b.bidderID)
+        for b in _reopen(seeded_db).query(BidDetail).filter(BidDetail.rID == req.RID).all()
+    }
+    assert bid_after == bid_before
+    assert winner.BID in bid_after and loser.BID in bid_after
+    fcm = [
+        t
+        for t in bg.tasks
+        if t.func is notifications_mod.notify_driver_assigned_to_customer_background
+    ]
+    assert len(fcm) == 1
+    assert fcm[0].args[0] == CUSTOMER_ID
+    assert fcm[0].args[1] == req.RID
+    assert fcm[0].args[2] == driver.DDID
+
+
+def test_driver_replacement_emits_exactly_one(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    d1 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c24")
+    d2 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c25")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db, assigned_driver=d1)
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert before.driverAssignedID == d1.DDID
+    ts_before = before.tableTimestamp
     session = _reopen(seeded_db)
     result = request_mod.assign_driver_to_request(
         session,
@@ -1757,7 +1862,230 @@ def test_driver_replacement_emits_once(seeded_db, bg, monkeypatch):
     assert result.message == "UPDATED"
     rows = _outbox(seeded_db)
     assert len(rows) == 1
-    assert rows[0].payload["driverId"] == d2.DDID
+    assert rows[0].eventType == "driver.assignment_changed"
+    assert rows[0].payload == {"requestId": req.RID, "driverId": d2.DDID}
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.driverAssignedID == d2.DDID
+    assert after.requestStatus == "REQUEST - CONFIRMED"
+    assert after.requestWonBy == VENDOR_A
+    assert after.finalAmount == 3700
+    assert after.tableTimestamp != ts_before
+    fcm = [
+        t
+        for t in bg.tasks
+        if t.func is notifications_mod.notify_driver_assigned_to_customer_background
+    ]
+    assert len(fcm) == 1
+    assert fcm[0].args[2] == d2.DDID
+
+
+def test_driver_same_assignment_replay_no_event_no_fcm(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c26")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db, assigned_driver=driver)
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    ts_before = before.tableTimestamp
+    session = _reopen(seeded_db)
+    result = request_mod.assign_driver_to_request(
+        session,
+        AssignDriverRequest(RID=req.RID, DRIVERID=driver.DDID),
+        user_id=VENDOR_A,
+        background_tasks=bg,
+    )
+    assert result.message == "UPDATED"
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.driverAssignedID == driver.DDID
+    assert after.tableTimestamp == ts_before
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_driver_assignment_wrong_vendor_403_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c27")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=driver.DDID),
+            user_id=VENDOR_B,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one().driverAssignedID
+        is None
+    )
+
+
+def test_driver_assignment_foreign_owned_driver_403_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    foreign = _seed_driver(seeded_db, user_app_id=VENDOR_B, number="9800000c28")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=foreign.DDID),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 403
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one().driverAssignedID
+        is None
+    )
+
+
+def test_driver_assignment_missing_rid_404_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c29")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=999999, DRIVERID=driver.DDID),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 404
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_driver_assignment_missing_driver_404_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=999999),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 404
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+    assert (
+        _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one().driverAssignedID
+        is None
+    )
+
+
+def test_driver_assignment_invalid_lifecycle_409_no_event(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    req = _seed_request(seeded_db, status="BID - OPEN", request_won_by=VENDOR_A)
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c30")
+    session = _reopen(seeded_db)
+    with pytest.raises(HTTPException) as exc:
+        request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=driver.DDID),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "INVALID_REQUEST_STATUS"
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_driver_assignment_outbox_failure_rolls_back(seeded_db, bg, monkeypatch):
+    """Outbox append failure rolls back assignment; previous driver preserved; no FCM."""
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    d1 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c31")
+    d2 = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c32")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db, assigned_driver=d1)
+    before = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    ts_before = before.tableTimestamp
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.request.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=d2.DDID),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert result.message == "ERROR"
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.driverAssignedID == d1.DDID
+    assert after.tableTimestamp == ts_before
+    assert after.requestStatus == "REQUEST - CONFIRMED"
+    assert after.requestWonBy == VENDOR_A
+    assert after.finalAmount == 3700
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_driver_assignment_outbox_failure_first_assign_stays_null(seeded_db, bg, monkeypatch):
+    _enable_event(monkeypatch, "driver.assignment_changed")
+    req, _, _ = _seed_c2_confirmed_booking(seeded_db)
+    driver = _seed_driver(seeded_db, user_app_id=VENDOR_A, number="9800000c33")
+    session = _reopen(seeded_db)
+    with patch(
+        "app_v1.crud.request.maybe_append_domain_event",
+        side_effect=RuntimeError("outbox failed"),
+    ):
+        result = request_mod.assign_driver_to_request(
+            session,
+            AssignDriverRequest(RID=req.RID, DRIVERID=driver.DDID),
+            user_id=VENDOR_A,
+            background_tasks=bg,
+        )
+    assert result.message == "ERROR"
+    after = _reopen(seeded_db).query(Request).filter(Request.RID == req.RID).one()
+    assert after.driverAssignedID is None
+    assert _outbox(seeded_db) == []
+    assert bg.tasks == []
+
+
+def test_driver_assignment_fcm_only_after_commit_ordering():
+    """Mutation schedules customer FCM only after successful commit (source order proof)."""
+    src = Path(request_mod.__file__).read_text()
+    fn = src[src.index("def assign_driver_to_request") :]
+    append_at = fn.index("maybe_append_domain_event")
+    commit_at = fn.index("db.commit()", append_at)
+    notify_at = fn.index("notify_driver_assigned_to_customer_background", commit_at)
+    assert append_at < commit_at < notify_at
+    assert "background_tasks.add_task" in fn[commit_at:]
+    assert "request_snapshot_refresh(" not in fn
+    assert '"/build_snapshot"' not in fn and "'/build_snapshot'" not in fn
+    assert "redis" not in fn.lower()
+    assert "SessionLocal" not in fn[append_at:commit_at]
+    # Same-driver replay path must not notify / append.
+    replay = fn[:append_at]
+    assert "Same-driver" in replay or "same-driver" in replay.lower() or "idempotent" in replay.lower()
+
+
+def test_driver_assignment_endpoint_response_contract():
+    """Endpoint remains EmailErrorResponse UPDATED; body RID+DRIVERID only."""
+    ep = (ROOT / "app_v1" / "endpoints" / "request.py").read_text()
+    start = ep.index("def driver_assign_to_request")
+    end = ep.index("\n@router.", start + 1)
+    block = ep[start:end]
+    assert "AssignDriverRequest" in block
+    assert "BackgroundTasks" in block
+    assert "assign_driver_to_request" in block
+    assert "actor_auth_subject" in block
+
+
+def test_driver_assignment_fcm_copy_unchanged():
+    """Existing customer notification title/body/url/sound remain PR13 canonical."""
+    src = Path(notifications_mod.__file__).read_text()
+    fn = src[src.index("def notify_driver_assigned_to_customer") :]
+    assert 'title="🚖 Driver Assigned"' in fn
+    assert 'url="///My Trips"' in fn
+    assert 'sound_file="alarm_notification"' in fn
+    assert 'notification_type="passengernotification"' in fn
 
 
 def test_no_build_snapshot_in_pr40_mutation_sources():

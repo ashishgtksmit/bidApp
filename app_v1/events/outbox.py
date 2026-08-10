@@ -20,6 +20,7 @@ from .models import DomainOutboxEvent
 from .registry import (
     EVENT_BID_CREATED,
     EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
+    EVENT_DRIVER_ASSIGNMENT_CHANGED,
     EVENT_HANDSHAKE_ACCEPTED,
     EVENT_HANDSHAKE_CANCELLED,
     EVENT_HANDSHAKE_REJECTED,
@@ -185,6 +186,9 @@ def flag_snapshot_booleans() -> Dict[str, Any]:
         "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED_source": env_flag_source_category(
             "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED"
         ),
+        "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED"
+        ),
     }
 
 
@@ -248,6 +252,20 @@ def process_bound_flag_snapshot(*, reason: str = "http") -> Dict[str, Any]:
                 "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED_source"
             ],
         },
+        "driverAssignmentChanged": {
+            "eventType": EVENT_DRIVER_ASSIGNMENT_CHANGED,
+            "envFlag": "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED",
+            "perEventEnabled": bool(
+                per.get(EVENT_DRIVER_ASSIGNMENT_CHANGED, False)
+            ),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_DRIVER_ASSIGNMENT_CHANGED, False)
+            ),
+            "source": snap[
+                "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED_source"
+            ],
+        },
     }
 
 
@@ -287,11 +305,11 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     Safe structured log of interpreted domain-event flags.
 
     Never logs secrets, raw account ids, or full environ dumps.
-    Includes every registered per-event boolean so Wave B2/B3/B4/C1 binding is provable.
+    Includes every registered per-event boolean so Wave B2/B3/B4/C1/C2 binding is provable.
     """
     payload = process_bound_flag_snapshot(reason=reason)
     per = payload["perEvent"]
-    # Compact eventType=bool pairs for log search (includes handshake.* + booking.cancel).
+    # Compact eventType=bool pairs for log search (includes handshake.* + booking/driver).
     per_pairs = " ".join(
         f"{et}={str(bool(enabled)).lower()}" for et, enabled in sorted(per.items())
     )
@@ -299,6 +317,7 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     ha = payload["handshakeAccepted"]
     hr = payload["handshakeRejected"]
     bc = payload["bookingCancelledByCustomer"]
+    da = payload["driverAssignmentChanged"]
     msg = (
         "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
         "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
@@ -310,9 +329,12 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         "handshake.rejected=%s handshake_rejected_emission=%s "
         "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED=%s "
         "booking.cancelled_by_customer=%s booking_cancelled_by_customer_emission=%s "
+        "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED=%s "
+        "driver.assignment_changed=%s driver_assignment_changed_emission=%s "
         "master_source=%s bid_created_source=%s handshake_cancelled_source=%s "
         "handshake_accepted_source=%s handshake_rejected_source=%s "
         "booking_cancelled_by_customer_source=%s "
+        "driver_assignment_changed_source=%s "
         "pr40_any_enabled=%s per_event=%s"
     )
     args = (
@@ -333,12 +355,16 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         per.get(EVENT_BOOKING_CANCELLED_BY_CUSTOMER, False),
         bc["perEventEnabled"],
         bc["emissionEnabled"],
+        per.get(EVENT_DRIVER_ASSIGNMENT_CHANGED, False),
+        da["perEventEnabled"],
+        da["emissionEnabled"],
         payload["DOMAIN_EVENTS_ENABLED_source"],
         flag_snapshot_booleans()["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
         hc["source"],
         ha["source"],
         hr["source"],
         bc["source"],
+        da["source"],
         any(enabled for et, enabled in per.items() if et != EVENT_BID_CREATED),
         per_pairs,
     )
