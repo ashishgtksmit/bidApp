@@ -53,6 +53,7 @@ from ..events.registry import (
     EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
     EVENT_DRIVER_ASSIGNMENT_CHANGED,
     EVENT_HANDSHAKE_CANCELLED,
+    EVENT_REQUEST_CREATED,
 )
 
 # MySQL TEXT max for rejectionReason — do not expose column name in errors.
@@ -1791,7 +1792,19 @@ def insert_request_row(
         db.flush()
 
         if not commit:
+            # Reopen / nested txn path: caller owns commit; do not emit
+            # request.created here (separate contract from request.reopened).
             return new_request
+
+        # PR43: request.created outbox in the SAME transaction (both flags).
+        # When emit=False or flags off, maybe_append is a no-op / skipped.
+        if emit:
+            maybe_append_domain_event(
+                db,
+                event_type=EVENT_REQUEST_CREATED,
+                aggregate_id=str(new_request.RID),
+                payload={"requestId": int(new_request.RID)},
+            )
 
         db.commit()
         db.refresh(new_request)
@@ -1813,12 +1826,18 @@ def insert_request_row(
 
     except HTTPException:
         if commit:
+            db.rollback()
             raise
         raise
     except SQLAlchemyError as e:
         if commit:
             db.rollback()
         print(f"[insert_request_row] ERROR_INSERT: {e}")
+        return EmailErrorResponse(message="ERROR_INSERT")
+    except Exception as e:
+        if commit:
+            db.rollback()
+        print(f"[insert_request_row] ERROR_EXCEPTION: {e}")
         return EmailErrorResponse(message="ERROR_INSERT")
     finally:
         if close_session:

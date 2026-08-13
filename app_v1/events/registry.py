@@ -1,4 +1,4 @@
-"""Event type registry for PR39/PR40 domain events."""
+"""Event type registry for PR39/PR40/PR43 domain events."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ EVENT_HANDSHAKE_ACCEPTED = "handshake.accepted"
 EVENT_HANDSHAKE_REJECTED = "handshake.rejected"
 EVENT_BOOKING_CANCELLED_BY_CUSTOMER = "booking.cancelled_by_customer"
 EVENT_DRIVER_ASSIGNMENT_CHANGED = "driver.assignment_changed"
+EVENT_REQUEST_CREATED = "request.created"
 
 SCHEMA_VERSION_V1 = 1
 AGGREGATE_REQUEST = "request"
@@ -27,6 +28,7 @@ SUPPORTED_EVENT_TYPES = frozenset(
         EVENT_HANDSHAKE_REJECTED,
         EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
         EVENT_DRIVER_ASSIGNMENT_CHANGED,
+        EVENT_REQUEST_CREATED,
     }
 )
 SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION_V1})
@@ -46,6 +48,7 @@ EVENT_TYPE_FLAG_ENV = {
     EVENT_DRIVER_ASSIGNMENT_CHANGED: (
         "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED"
     ),
+    EVENT_REQUEST_CREATED: "DOMAIN_EVENT_REQUEST_CREATED_ENABLED",
 }
 
 OUTBOX_STATUS_PENDING = "pending"

@@ -24,6 +24,7 @@ from .registry import (
     EVENT_HANDSHAKE_ACCEPTED,
     EVENT_HANDSHAKE_CANCELLED,
     EVENT_HANDSHAKE_REJECTED,
+    EVENT_REQUEST_CREATED,
     EVENT_TYPE_FLAG_ENV,
     OUTBOX_STATUS_PENDING,
     SCHEMA_VERSION_V1,
@@ -189,6 +190,9 @@ def flag_snapshot_booleans() -> Dict[str, Any]:
         "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED_source": env_flag_source_category(
             "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED"
         ),
+        "DOMAIN_EVENT_REQUEST_CREATED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_REQUEST_CREATED_ENABLED"
+        ),
     }
 
 
@@ -266,6 +270,16 @@ def process_bound_flag_snapshot(*, reason: str = "http") -> Dict[str, Any]:
                 "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED_source"
             ],
         },
+        "requestCreated": {
+            "eventType": EVENT_REQUEST_CREATED,
+            "envFlag": "DOMAIN_EVENT_REQUEST_CREATED_ENABLED",
+            "perEventEnabled": bool(per.get(EVENT_REQUEST_CREATED, False)),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_REQUEST_CREATED, False)
+            ),
+            "source": snap["DOMAIN_EVENT_REQUEST_CREATED_ENABLED_source"],
+        },
     }
 
 
@@ -318,6 +332,7 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     hr = payload["handshakeRejected"]
     bc = payload["bookingCancelledByCustomer"]
     da = payload["driverAssignmentChanged"]
+    rc = payload["requestCreated"]
     msg = (
         "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
         "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
@@ -331,10 +346,13 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         "booking.cancelled_by_customer=%s booking_cancelled_by_customer_emission=%s "
         "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED=%s "
         "driver.assignment_changed=%s driver_assignment_changed_emission=%s "
+        "DOMAIN_EVENT_REQUEST_CREATED_ENABLED=%s "
+        "request.created=%s request_created_emission=%s "
         "master_source=%s bid_created_source=%s handshake_cancelled_source=%s "
         "handshake_accepted_source=%s handshake_rejected_source=%s "
         "booking_cancelled_by_customer_source=%s "
         "driver_assignment_changed_source=%s "
+        "request_created_source=%s "
         "pr40_any_enabled=%s per_event=%s"
     )
     args = (
@@ -358,6 +376,9 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         per.get(EVENT_DRIVER_ASSIGNMENT_CHANGED, False),
         da["perEventEnabled"],
         da["emissionEnabled"],
+        per.get(EVENT_REQUEST_CREATED, False),
+        rc["perEventEnabled"],
+        rc["emissionEnabled"],
         payload["DOMAIN_EVENTS_ENABLED_source"],
         flag_snapshot_booleans()["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
         hc["source"],
@@ -365,6 +386,7 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         hr["source"],
         bc["source"],
         da["source"],
+        rc["source"],
         any(enabled for et, enabled in per.items() if et != EVENT_BID_CREATED),
         per_pairs,
     )

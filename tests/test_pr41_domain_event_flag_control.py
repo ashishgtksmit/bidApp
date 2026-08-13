@@ -35,6 +35,7 @@ from app_v1.events.outbox import (  # noqa: E402
 )
 from app_v1.events.registry import (  # noqa: E402
     EVENT_BID_CREATED,
+    EVENT_REQUEST_CREATED,
     EVENT_TYPE_FLAG_ENV,
 )
 
@@ -47,6 +48,10 @@ PR40_FLAGS = [
     "DOMAIN_EVENT_HANDSHAKE_REJECTED_ENABLED",
     "DOMAIN_EVENT_BOOKING_CANCELLED_BY_CUSTOMER_ENABLED",
     "DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED",
+]
+
+PR43_FLAGS = [
+    "DOMAIN_EVENT_REQUEST_CREATED_ENABLED",
 ]
 
 
@@ -137,9 +142,27 @@ def test_13_all_pr40_flags_default_false():
     for event_type, flag in EVENT_TYPE_FLAG_ENV.items():
         if event_type == EVENT_BID_CREATED:
             continue
+        if event_type == EVENT_REQUEST_CREATED:
+            # PR43 marketplace — not part of PR40 known-party flag list.
+            assert flag in PR43_FLAGS
+            assert event_type_enabled(event_type) is False
+            assert event_emission_enabled(event_type) is False
+            continue
         assert flag in PR40_FLAGS
         assert event_type_enabled(event_type) is False
         assert event_emission_enabled(event_type) is False
+
+
+def test_13b_request_created_flag_default_false_and_snapshot():
+    from app_v1.events.outbox import process_bound_flag_snapshot
+
+    assert event_type_enabled(EVENT_REQUEST_CREATED) is False
+    assert event_emission_enabled(EVENT_REQUEST_CREATED) is False
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert "request.created" in snap["perEvent"]
+    assert snap["requestCreated"]["perEventEnabled"] is False
+    assert snap["requestCreated"]["emissionEnabled"] is False
+    assert snap["requestCreated"]["envFlag"] == "DOMAIN_EVENT_REQUEST_CREATED_ENABLED"
 
 
 def test_14_bid_created_defaults_false():

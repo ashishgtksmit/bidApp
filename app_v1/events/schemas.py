@@ -18,6 +18,7 @@ from .registry import (
     EVENT_HANDSHAKE_ACCEPTED,
     EVENT_HANDSHAKE_CANCELLED,
     EVENT_HANDSHAKE_REJECTED,
+    EVENT_REQUEST_CREATED,
     SCHEMA_VERSION_V1,
     validate_event_type,
 )
@@ -86,6 +87,12 @@ class DriverAssignmentChangedPayloadV1(BaseModel):
     driverId: int = Field(..., gt=0)
 
 
+class RequestCreatedPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+
+
 PAYLOAD_MODELS: Dict[str, Type[BaseModel]] = {
     EVENT_BID_CREATED: BidCreatedPayloadV1,
     EVENT_BID_UPDATED: BidUpdatedPayloadV1,
@@ -96,6 +103,7 @@ PAYLOAD_MODELS: Dict[str, Type[BaseModel]] = {
     EVENT_HANDSHAKE_REJECTED: HandshakeRejectedPayloadV1,
     EVENT_BOOKING_CANCELLED_BY_CUSTOMER: BookingCancelledByCustomerPayloadV1,
     EVENT_DRIVER_ASSIGNMENT_CHANGED: DriverAssignmentChangedPayloadV1,
+    EVENT_REQUEST_CREATED: RequestCreatedPayloadV1,
 }
 
 
