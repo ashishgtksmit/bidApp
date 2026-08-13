@@ -28,6 +28,8 @@ Current OpenBid Flutter **does not** call PHP `entryApi.php`. Production mobile 
 
 **PR43 (2026-08-13):** `request.created` Connected-First marketplace runtime **IMPLEMENTED** (outbox emission on `POST /insertrequest`, worker preference+presence resolver, Redis WSS presence leases). Flag `DOMAIN_EVENT_REQUEST_CREATED_ENABLED` default **false** — **do not enable** until M5 PASS + separate canary. Process-bound expected: `requestCreated.perEventEnabled=false`, `requestCreated.emissionEnabled=false`. No Flutter contract change. See `docs/OPENBID_MARKETPLACE_READINESS_PR42_PLAN.md`.
 
+**PR44 (2026-08-13):** `request.updated` Connected-First marketplace runtime **IMPLEMENTED** (outbox emission on `PUT /updaterequest` when master ∧ `DOMAIN_EVENT_REQUEST_UPDATED_ENABLED`). Flag default **false**. Old-match policy **U5** (current-match only; ceased matches via poller). **Not deployed / not Azure-enabled**. Do not deploy before `request.created` canary PASS. Process-bound expected: `requestUpdated.perEventEnabled=false`, `requestUpdated.emissionEnabled=false`. No Flutter contract change.
+
 ### Client assumption — `POST /refresh`
 
 **PR37:** `/refresh` authenticates with the **refresh token body only**. A valid access JWT is **not** required. Older clients may still send `Authorization`; FastAPI ignores it for refresh ownership. Flutter posts `{ "refresh_token": "..." }` on the raw client with no Bearer header. Access lifetime remains minutes; refresh lifetime uses **days** (`REFRESH_TOKEN_EXPIRE_DAYS`). New tokens carry `session_version` + `session_id` (+ `jti`); legacy claimless refresh tokens are rejected (forced re-login). See `docs/OPENBID_REFRESH_TOKEN_LIFECYCLE_PR37_PLAN.md`.

@@ -36,6 +36,7 @@ from app_v1.events.outbox import (  # noqa: E402
 from app_v1.events.registry import (  # noqa: E402
     EVENT_BID_CREATED,
     EVENT_REQUEST_CREATED,
+    EVENT_REQUEST_UPDATED,
     EVENT_TYPE_FLAG_ENV,
 )
 
@@ -54,6 +55,12 @@ PR43_FLAGS = [
     "DOMAIN_EVENT_REQUEST_CREATED_ENABLED",
 ]
 
+PR44_FLAGS = [
+    "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED",
+]
+
+MARKETPLACE_FLAGS = PR43_FLAGS + PR44_FLAGS
+
 
 @pytest.fixture(autouse=True)
 def _isolate_flags(monkeypatch):
@@ -62,6 +69,8 @@ def _isolate_flags(monkeypatch):
     monkeypatch.delenv("DOMAIN_EVENTS_ENABLED", raising=False)
     monkeypatch.delenv("DOMAIN_EVENT_BID_CREATED_ENABLED", raising=False)
     for name in PR40_FLAGS:
+        monkeypatch.delenv(name, raising=False)
+    for name in MARKETPLACE_FLAGS:
         monkeypatch.delenv(name, raising=False)
     yield
     _reset_metrics_for_tests()
@@ -148,6 +157,12 @@ def test_13_all_pr40_flags_default_false():
             assert event_type_enabled(event_type) is False
             assert event_emission_enabled(event_type) is False
             continue
+        if event_type == EVENT_REQUEST_UPDATED:
+            # PR44 marketplace — not part of PR40 known-party flag list.
+            assert flag in PR44_FLAGS
+            assert event_type_enabled(event_type) is False
+            assert event_emission_enabled(event_type) is False
+            continue
         assert flag in PR40_FLAGS
         assert event_type_enabled(event_type) is False
         assert event_emission_enabled(event_type) is False
@@ -163,6 +178,18 @@ def test_13b_request_created_flag_default_false_and_snapshot():
     assert snap["requestCreated"]["perEventEnabled"] is False
     assert snap["requestCreated"]["emissionEnabled"] is False
     assert snap["requestCreated"]["envFlag"] == "DOMAIN_EVENT_REQUEST_CREATED_ENABLED"
+
+
+def test_13c_request_updated_flag_default_false_and_snapshot():
+    from app_v1.events.outbox import process_bound_flag_snapshot
+
+    assert event_type_enabled(EVENT_REQUEST_UPDATED) is False
+    assert event_emission_enabled(EVENT_REQUEST_UPDATED) is False
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert "request.updated" in snap["perEvent"]
+    assert snap["requestUpdated"]["perEventEnabled"] is False
+    assert snap["requestUpdated"]["emissionEnabled"] is False
+    assert snap["requestUpdated"]["envFlag"] == "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED"
 
 
 def test_14_bid_created_defaults_false():

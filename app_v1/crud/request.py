@@ -54,6 +54,7 @@ from ..events.registry import (
     EVENT_DRIVER_ASSIGNMENT_CHANGED,
     EVENT_HANDSHAKE_CANCELLED,
     EVENT_REQUEST_CREATED,
+    EVENT_REQUEST_UPDATED,
 )
 
 # MySQL TEXT max for rejectionReason — do not expose column name in errors.
@@ -718,6 +719,19 @@ def update_request(
                 ZoneInfo("Asia/Kolkata")
             ).replace(tzinfo=None),
         })
+
+        # PR44: request.updated outbox in the SAME transaction (master ∧ per-event).
+        # Same-value updates still bump tableTimestamp and commit (existing PR9
+        # semantics) — emit when the row update succeeded and flags allow.
+        # No FCM on this path (existing contract unchanged).
+        if updated != 0:
+            maybe_append_domain_event(
+                db,
+                event_type=EVENT_REQUEST_UPDATED,
+                aggregate_id=str(request_data.RID),
+                payload={"requestId": int(request_data.RID)},
+            )
+
         db.commit()
 
         if updated == 0:
