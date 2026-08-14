@@ -37,6 +37,8 @@ from app_v1.events.registry import (  # noqa: E402
     EVENT_BID_CREATED,
     EVENT_REQUEST_CREATED,
     EVENT_REQUEST_UPDATED,
+    EVENT_REQUEST_CANCELLED,
+    EVENT_REQUEST_REOPENED,
     EVENT_TYPE_FLAG_ENV,
 )
 
@@ -168,6 +170,18 @@ def test_13_all_pr40_flags_default_false():
         if event_type == EVENT_REQUEST_UPDATED:
             # PR44 marketplace — not part of PR40 known-party flag list.
             assert flag in PR44_FLAGS
+            assert event_type_enabled(event_type) is False
+            assert event_emission_enabled(event_type) is False
+            continue
+        if event_type == EVENT_REQUEST_CANCELLED:
+            # PR45 marketplace — not part of PR40 known-party flag list.
+            assert flag in PR45_FLAGS
+            assert event_type_enabled(event_type) is False
+            assert event_emission_enabled(event_type) is False
+            continue
+        if event_type == EVENT_REQUEST_REOPENED:
+            # PR46 marketplace — not part of PR40 known-party flag list.
+            assert flag in PR46_FLAGS
             assert event_type_enabled(event_type) is False
             assert event_emission_enabled(event_type) is False
             continue
