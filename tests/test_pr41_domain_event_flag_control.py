@@ -59,7 +59,15 @@ PR44_FLAGS = [
     "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED",
 ]
 
-MARKETPLACE_FLAGS = PR43_FLAGS + PR44_FLAGS
+PR45_FLAGS = [
+    "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED",
+]
+
+PR46_FLAGS = [
+    "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED",
+]
+
+MARKETPLACE_FLAGS = PR43_FLAGS + PR44_FLAGS + PR45_FLAGS + PR46_FLAGS
 
 
 @pytest.fixture(autouse=True)
@@ -190,6 +198,32 @@ def test_13c_request_updated_flag_default_false_and_snapshot():
     assert snap["requestUpdated"]["perEventEnabled"] is False
     assert snap["requestUpdated"]["emissionEnabled"] is False
     assert snap["requestUpdated"]["envFlag"] == "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED"
+
+
+def test_13d_request_cancelled_flag_default_false_and_snapshot():
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_REQUEST_CANCELLED
+
+    assert event_type_enabled(EVENT_REQUEST_CANCELLED) is False
+    assert event_emission_enabled(EVENT_REQUEST_CANCELLED) is False
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert "request.cancelled" in snap["perEvent"]
+    assert snap["requestCancelled"]["perEventEnabled"] is False
+    assert snap["requestCancelled"]["emissionEnabled"] is False
+    assert snap["requestCancelled"]["envFlag"] == "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED"
+
+
+def test_13e_request_reopened_flag_default_false_and_snapshot():
+    from app_v1.events.outbox import process_bound_flag_snapshot
+    from app_v1.events.registry import EVENT_REQUEST_REOPENED
+
+    assert event_type_enabled(EVENT_REQUEST_REOPENED) is False
+    assert event_emission_enabled(EVENT_REQUEST_REOPENED) is False
+    snap = process_bound_flag_snapshot(reason="unit")
+    assert "request.reopened" in snap["perEvent"]
+    assert snap["requestReopened"]["perEventEnabled"] is False
+    assert snap["requestReopened"]["emissionEnabled"] is False
+    assert snap["requestReopened"]["envFlag"] == "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED"
 
 
 def test_14_bid_created_defaults_false():

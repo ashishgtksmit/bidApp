@@ -53,7 +53,9 @@ from ..events.registry import (
     EVENT_BOOKING_CANCELLED_BY_CUSTOMER,
     EVENT_DRIVER_ASSIGNMENT_CHANGED,
     EVENT_HANDSHAKE_CANCELLED,
+    EVENT_REQUEST_CANCELLED,
     EVENT_REQUEST_CREATED,
+    EVENT_REQUEST_REOPENED,
     EVENT_REQUEST_UPDATED,
 )
 
@@ -609,6 +611,10 @@ def delete_request(
 
     When ``user_id`` is provided (JWT ``sub`` from DELETE /deleterequest):
     ownership and BID - OPEN status are enforced before mutation.
+
+    PR45: when DOMAIN_EVENTS_ENABLED ∧ DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED,
+    append request.cancelled in the SAME transaction before commit. Outbox
+    failure rolls back the soft-cancel (zero FCM). Flag-off path unchanged.
     """
     try:
         existing = db.query(Request).filter(Request.RID == r_id).first()
@@ -634,13 +640,23 @@ def delete_request(
         updated = db.query(Request).filter(Request.RID == r_id).update(
             {Request.requestStatus: "REQUEST - CANCELLED BY USER"}
         )
-        db.commit()
 
         if updated == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Request not found",
             )
+
+        # PR45: request.cancelled outbox in the SAME transaction (master ∧ per-event).
+        # FCM remains post-commit only (existing PR9 notify_vendors_request_cancelled).
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_REQUEST_CANCELLED,
+            aggregate_id=str(r_id),
+            payload={"requestId": int(r_id)},
+        )
+
+        db.commit()
 
         # Background task opens its own SessionLocal — do not pass request db.
         background_tasks.add_task(
@@ -654,6 +670,10 @@ def delete_request(
     except SQLAlchemyError as e:
         db.rollback()
         print(f"[delete_request] ERROR: {e}")
+        return ErrorResponse(message="DELETED ERROR IN FUNCTION")
+    except Exception as e:
+        db.rollback()
+        print(f"[delete_request] ERROR_EXCEPTION: {e}")
         return ErrorResponse(message="DELETED ERROR IN FUNCTION")
     finally:
         db.close()
@@ -1595,11 +1615,15 @@ def reopen_request(
     user_id: Optional[str] = None,
 ):
     """
-    Reopen a cancelled booking (PR12).
+    Reopen a cancelled booking (PR12 + PR46).
 
     Marks original requestReopened=1 and clones a new BID - OPEN request
     with the same pickup datetime and bidEndTime (must both still be future).
     Does not mutate the original status away from BOOKING - CANCELLED BY USER.
+
+    When DOMAIN_EVENTS_ENABLED ∧ DOMAIN_EVENT_REQUEST_REOPENED_ENABLED,
+    appends request.reopened (aggregateId = NEW RID) in the same transaction
+    as the clone + requestReopened update. Does not emit request.created.
     """
     try:
         original = (
@@ -1686,6 +1710,17 @@ def reopen_request(
 
         original.requestReopened = True
         original.tableTimestamp = now
+
+        # PR46: request.reopened outbox in the SAME transaction as clone +
+        # original.requestReopened=1. aggregateId/payload.requestId = NEW RID.
+        # Nested insert_request_row(commit=False) intentionally skips
+        # request.created — reopen must not emit a duplicate created event.
+        maybe_append_domain_event(
+            db,
+            event_type=EVENT_REQUEST_REOPENED,
+            aggregate_id=str(new_request.RID),
+            payload={"requestId": int(new_request.RID)},
+        )
 
         db.commit()
 

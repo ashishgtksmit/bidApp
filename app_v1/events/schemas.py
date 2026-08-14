@@ -20,6 +20,8 @@ from .registry import (
     EVENT_HANDSHAKE_REJECTED,
     EVENT_REQUEST_CREATED,
     EVENT_REQUEST_UPDATED,
+    EVENT_REQUEST_CANCELLED,
+    EVENT_REQUEST_REOPENED,
     SCHEMA_VERSION_V1,
     validate_event_type,
 )
@@ -100,6 +102,20 @@ class RequestUpdatedPayloadV1(BaseModel):
     requestId: int = Field(..., gt=0)
 
 
+class RequestCancelledPayloadV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+
+
+class RequestReopenedPayloadV1(BaseModel):
+    """PR46 — identifier-only; aggregateId/requestId are the NEW RID."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requestId: int = Field(..., gt=0)
+
+
 PAYLOAD_MODELS: Dict[str, Type[BaseModel]] = {
     EVENT_BID_CREATED: BidCreatedPayloadV1,
     EVENT_BID_UPDATED: BidUpdatedPayloadV1,
@@ -112,6 +128,8 @@ PAYLOAD_MODELS: Dict[str, Type[BaseModel]] = {
     EVENT_DRIVER_ASSIGNMENT_CHANGED: DriverAssignmentChangedPayloadV1,
     EVENT_REQUEST_CREATED: RequestCreatedPayloadV1,
     EVENT_REQUEST_UPDATED: RequestUpdatedPayloadV1,
+    EVENT_REQUEST_CANCELLED: RequestCancelledPayloadV1,
+    EVENT_REQUEST_REOPENED: RequestReopenedPayloadV1,
 }
 
 

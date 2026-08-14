@@ -26,6 +26,8 @@ from .registry import (
     EVENT_HANDSHAKE_REJECTED,
     EVENT_REQUEST_CREATED,
     EVENT_REQUEST_UPDATED,
+    EVENT_REQUEST_CANCELLED,
+    EVENT_REQUEST_REOPENED,
     EVENT_TYPE_FLAG_ENV,
     OUTBOX_STATUS_PENDING,
     SCHEMA_VERSION_V1,
@@ -197,6 +199,12 @@ def flag_snapshot_booleans() -> Dict[str, Any]:
         "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED_source": env_flag_source_category(
             "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED"
         ),
+        "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED"
+        ),
+        "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED_source": env_flag_source_category(
+            "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED"
+        ),
     }
 
 
@@ -294,6 +302,26 @@ def process_bound_flag_snapshot(*, reason: str = "http") -> Dict[str, Any]:
             ),
             "source": snap["DOMAIN_EVENT_REQUEST_UPDATED_ENABLED_source"],
         },
+        "requestCancelled": {
+            "eventType": EVENT_REQUEST_CANCELLED,
+            "envFlag": "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED",
+            "perEventEnabled": bool(per.get(EVENT_REQUEST_CANCELLED, False)),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_REQUEST_CANCELLED, False)
+            ),
+            "source": snap["DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED_source"],
+        },
+        "requestReopened": {
+            "eventType": EVENT_REQUEST_REOPENED,
+            "envFlag": "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED",
+            "perEventEnabled": bool(per.get(EVENT_REQUEST_REOPENED, False)),
+            "emissionEnabled": bool(
+                snap["DOMAIN_EVENTS_ENABLED"]
+                and per.get(EVENT_REQUEST_REOPENED, False)
+            ),
+            "source": snap["DOMAIN_EVENT_REQUEST_REOPENED_ENABLED_source"],
+        },
     }
 
 
@@ -348,6 +376,8 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
     da = payload["driverAssignmentChanged"]
     rc = payload["requestCreated"]
     ru = payload["requestUpdated"]
+    rx = payload["requestCancelled"]
+    rr = payload["requestReopened"]
     msg = (
         "domain_event_flag_snapshot reason=%s revision=%s instance_hash=%s "
         "DOMAIN_EVENTS_ENABLED=%s DOMAIN_EVENT_BID_CREATED_ENABLED=%s "
@@ -365,12 +395,18 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         "request.created=%s request_created_emission=%s "
         "DOMAIN_EVENT_REQUEST_UPDATED_ENABLED=%s "
         "request.updated=%s request_updated_emission=%s "
+        "DOMAIN_EVENT_REQUEST_CANCELLED_ENABLED=%s "
+        "request.cancelled=%s request_cancelled_emission=%s "
+        "DOMAIN_EVENT_REQUEST_REOPENED_ENABLED=%s "
+        "request.reopened=%s request_reopened_emission=%s "
         "master_source=%s bid_created_source=%s handshake_cancelled_source=%s "
         "handshake_accepted_source=%s handshake_rejected_source=%s "
         "booking_cancelled_by_customer_source=%s "
         "driver_assignment_changed_source=%s "
         "request_created_source=%s "
         "request_updated_source=%s "
+        "request_cancelled_source=%s "
+        "request_reopened_source=%s "
         "pr40_any_enabled=%s per_event=%s"
     )
     args = (
@@ -400,6 +436,12 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         per.get(EVENT_REQUEST_UPDATED, False),
         ru["perEventEnabled"],
         ru["emissionEnabled"],
+        per.get(EVENT_REQUEST_CANCELLED, False),
+        rx["perEventEnabled"],
+        rx["emissionEnabled"],
+        per.get(EVENT_REQUEST_REOPENED, False),
+        rr["perEventEnabled"],
+        rr["emissionEnabled"],
         payload["DOMAIN_EVENTS_ENABLED_source"],
         flag_snapshot_booleans()["DOMAIN_EVENT_BID_CREATED_ENABLED_source"],
         hc["source"],
@@ -409,6 +451,8 @@ def log_domain_event_flag_snapshot(*, reason: str = "startup") -> None:
         da["source"],
         rc["source"],
         ru["source"],
+        rx["source"],
+        rr["source"],
         any(enabled for et, enabled in per.items() if et != EVENT_BID_CREATED),
         per_pairs,
     )

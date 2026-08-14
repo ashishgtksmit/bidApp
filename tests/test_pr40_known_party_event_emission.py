@@ -2106,5 +2106,9 @@ def test_supported_event_types_include_pr40():
         "handshake.rejected",
         "booking.cancelled_by_customer",
         "driver.assignment_changed",
+        "request.created",
+        "request.updated",
+        "request.cancelled",
+        "request.reopened",
     }
     assert SUPPORTED_EVENT_TYPES == expected
