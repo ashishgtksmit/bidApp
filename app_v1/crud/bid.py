@@ -1,4 +1,4 @@
-from sqlalchemy import String as SAString, cast, func
+from sqlalchemy import String as SAString, BigInteger, func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from fastapi import BackgroundTasks, HTTPException, status
@@ -15,7 +15,7 @@ from ..schemas.bid_details import (
     UpdateCarIdForBidRequest,
 )
 from ..utils.common import ErrorResponse,EmailErrorResponse
-from datetime import datetime
+from datetime import date, datetime
 from ..utils.common import parse_dob
 from ..services.vendor_filtering import get_vendors_who_bid_on_request
 from ..services.notifications import (
@@ -48,6 +48,67 @@ def _as_float_amount(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _as_int_or_zero(value) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_optional_date(value):
+    """Coerce DB date/datetime/string to date. Zero-dates and junk → None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.startswith("0000-00-00"):
+            return None
+        parsed = parse_dob(text)
+        if parsed is not None:
+            return parsed
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text[:19], fmt).date()
+            except ValueError:
+                continue
+        return None
+    return None
+
+
+def _tag_names_from_csv(db: Session, tags_str) -> list:
+    tag_ids = []
+    if tags_str:
+        for t in str(tags_str).split(","):
+            cleaned = t.strip()
+            if cleaned.isdigit():
+                tag_ids.append(int(cleaned))
+    if not tag_ids:
+        return []
+    tags_rows = db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
+    names = []
+    for row in tags_rows:
+        if row[0] is None:
+            continue
+        names.append(str(row[0]))
+    return names
+
+
+def _bidder_user_join():
+    """Phone business id: biddetails.bidderID is integer, usertable.userAppId is string.
+
+    Compare numerically so MySQL does not CAST(bigint AS CHAR) (collation /
+    zero-pad mismatches → SQLAlchemyError → ERROR_PREPARE). SQLite CAST to
+    BIGINT keeps PR10 in-memory tests matching.
+    """
+    return func.cast(User.userAppId, BigInteger) == BidDetail.bidderID
 
 
 def get_bids_for_request(
@@ -91,7 +152,7 @@ def get_bids_for_request(
                 User.totalNoOfReviews,
                 User.profilePicture,
                 User.dob,
-                User.joiningDate,
+                func.cast(User.joiningDate, SAString),
                 User.city,
                 User.tags,
                 User.noOfTripsCompleted,
@@ -107,7 +168,7 @@ def get_bids_for_request(
                 CarTypeDetail.car_type,
                 CarTypeDetail.car_sub_type,
             )
-            .join(User, User.userAppId == cast(BidDetail.bidderID, SAString))
+            .join(User, _bidder_user_join())
             .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
             .outerjoin(CarTypeDetail, CarTypeDetail.CTD == CarDetail.CTD)
             .filter(
@@ -145,33 +206,13 @@ def get_bids_for_request(
             car_type,
             car_sub_type,
         ) in bids:
-            tag_ids = []
-            if tags_str:
-                for t in tags_str.split(","):
-                    cleaned = t.strip()
-                    if cleaned.isdigit():
-                        tag_ids.append(int(cleaned))
-
-            tag_names = []
-            if tag_ids:
-                tags_rows = (
-                    db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
-                )
-                for r in tags_rows:
-                    tag_names.append(r[0])
-
-            safe_rating = float(rating) if rating is not None else 0.0
-            safe_reviews = int(totalNoOfReviews) if totalNoOfReviews is not None else 0
-            safe_trips = (
-                int(noOfTripsCompleted) if noOfTripsCompleted is not None else 0
-            )
-
             registered_on_str = None
             if registered_on is not None:
                 if hasattr(registered_on, "strftime"):
                     registered_on_str = registered_on.strftime("%Y-%m-%d %H:%M:%S")
                 else:
-                    registered_on_str = str(registered_on)
+                    text = str(registered_on)
+                    registered_on_str = None if text.startswith("0000-00-00") else text
 
             result.append(
                 CustomerBidDetail(
@@ -180,14 +221,14 @@ def get_bids_for_request(
                     BIDAMOUNT=_as_float_amount(bid.bidAmount),
                     BIDSTATUS=bid.bidStatus,
                     BIDDERNAME=fullName,
-                    BIDDERRATING=safe_rating,
-                    TOTALNOOFREVIEWS=safe_reviews,
+                    BIDDERRATING=_as_float_amount(rating),
+                    TOTALNOOFREVIEWS=_as_int_or_zero(totalNoOfReviews),
                     PROFILEPIC=profilePicture,
-                    DOB=parse_dob(dob) if isinstance(dob, str) else dob,
-                    JOININGDATE=joiningDate,
+                    DOB=_as_optional_date(dob),
+                    JOININGDATE=_as_optional_date(joiningDate),
                     BASELOCATION=city,
-                    TAGS=tag_names,
-                    NOOFTRIPSCOMPLETED=safe_trips,
+                    TAGS=_tag_names_from_csv(db, tags_str),
+                    NOOFTRIPSCOMPLETED=_as_int_or_zero(noOfTripsCompleted),
                     CARID=car_id,
                     CARREGNO=car_reg_no,
                     CARMODEL=car_model,
@@ -207,10 +248,10 @@ def get_bids_for_request(
     except HTTPException:
         raise
     except SQLAlchemyError as e:
-        print(f"[get_bids_for_request] ERROR: {e}")
+        print(f"[get_bids_for_request] ERROR: {type(e).__name__}")
         return ErrorResponse(message="ERROR_PREPARE")
     except Exception as e:
-        print(f"[get_bids_for_request] ERROR_EXCEPTION: {e}")
+        print(f"[get_bids_for_request] ERROR_EXCEPTION: {type(e).__name__}")
         return ErrorResponse(message="ERROR_PREPARE")
     finally:
         db.close()

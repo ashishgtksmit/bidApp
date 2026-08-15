@@ -419,6 +419,84 @@ def test_get_bids_sql_failure_safe(seeded_db):
     assert "SELECT" not in str(result)
 
 
+def test_get_bids_optional_and_messy_vendor_fields_do_not_error_prepare(db):
+    from app_v1.crud.bid import _as_optional_date
+
+    assert _as_optional_date("0000-00-00") is None
+    assert _as_optional_date("0000-00-00 00:00:00") is None
+    assert _as_optional_date("07-12-2006") == date(2006, 12, 7)
+    assert _as_optional_date(datetime(2020, 5, 1, 8, 30, 0)) == date(2020, 5, 1)
+
+    _add_user(db, user_app_id=CUSTOMER_ID, uid=1, alsoVendor=False)
+    _add_user(
+        db,
+        user_app_id=VENDOR_A,
+        uid=3,
+        full_name="Vendor A",
+        rating="",
+        joiningDate=None,
+        tags="1,abc,2,",
+        dob="07-12-2006",
+        totalNoOfReviews=None,
+        noOfTripsCompleted=None,
+        profilePicture=None,
+        city="Siliguri",
+    )
+    db.add(Tag(TAGID=1, tagsName="AC"))
+    db.add(Tag(TAGID=2, tagsName="Verified"))
+    db.commit()
+    req = _seed_request(db, no_of_bids=1)
+    bid = _seed_bid(db, rid=req.RID, bidder_id=VENDOR_A, amount=1614.50, car_id=None)
+    result = get_bids_for_request(db, rid=req.RID, user_id=CUSTOMER_ID)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    item = result[0]
+    assert item.BIDID == bid.BID
+    assert item.BIDAMOUNT == 1614.5
+    assert item.BIDDERID == VENDOR_A
+    assert item.BIDSTATUS == "BID - OPEN"
+    assert item.JOININGDATE is None
+    assert item.DOB == date(2006, 12, 7)
+    assert item.BIDDERRATING == 0.0
+    assert item.TOTALNOOFREVIEWS == 0
+    assert item.NOOFTRIPSCOMPLETED == 0
+    assert item.PROFILEPIC is None
+    assert "AC" in item.TAGS
+    assert "Verified" in item.TAGS
+    dumped = item.model_dump()
+    for leaked in (
+        "FCMTOKEN",
+        "password",
+        "access_token",
+        "refresh_token",
+        "authSubjectId",
+        "bankAccountNo",
+        "imageAadhar",
+        "imagePAN",
+    ):
+        assert leaked not in dumped
+
+
+def test_get_bids_does_not_emit_domain_event(seeded_db):
+    req = _seed_request(seeded_db)
+    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=1500)
+    with patch("app_v1.crud.bid.maybe_append_domain_event") as ev:
+        result = get_bids_for_request(seeded_db, rid=req.RID, user_id=CUSTOMER_ID)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    ev.assert_not_called()
+
+
+def test_get_bids_join_does_not_cast_bidder_as_char():
+    src = (ROOT / "app_v1" / "crud" / "bid.py").read_text()
+    live = src.split("def get_bids_for_request")[1].split("def delete_bid_with_bid")[0]
+    assert "cast(BidDetail.bidderID, SAString)" not in live
+    assert "_bidder_user_join()" in live
+    helper = src.split("def _bidder_user_join")[1].split("def get_bids_for_request")[0]
+    assert "CAST" in helper.upper() or "BigInteger" in helper
+    assert "SAString" not in helper
+
+
 # --- Accept bid ---
 
 
@@ -886,7 +964,13 @@ def test_http_routes_ownership_and_contracts(seeded_db):
     body = list_resp.json()
     assert isinstance(body, list)
     assert body[0]["BIDID"] == bid.BID
+    assert body[0]["BIDAMOUNT"] == 1200.0
+    assert body[0]["BIDDERID"] == VENDOR_A
     assert "FCMTOKEN" not in body[0]
+    assert "password" not in body[0]
+    assert "authSubjectId" not in body[0]
+    assert "bankAccountNo" not in body[0]
+    assert "access_token" not in body[0]
 
     empty_req = _seed_request(seeded_db)
     empty_resp = client.get(f"/getallbidsforrequest?RID={empty_req.RID}")

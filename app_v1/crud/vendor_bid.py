@@ -21,7 +21,6 @@ from ..models.car_details import CarDetail
 from ..models.car_type_details import CarTypeDetail
 from ..models.location_details import LocationDetail
 from ..models.request_table import Request
-from ..models.tags_table import Tag
 from ..models.user_table import User
 from ..schemas.bid_details import (
     VendorBidDetail,
@@ -29,6 +28,12 @@ from ..schemas.bid_details import (
     BidAmountUpdate,
     VendorCarSummaryResponse,
     VendorRejectBody,
+)
+from ..crud.bid import (
+    _as_int_or_zero,
+    _as_optional_date,
+    _bidder_user_join,
+    _tag_names_from_csv,
 )
 from ..services.notifications import (
     notify_customer_new_bid,
@@ -175,13 +180,13 @@ def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
             User.rating,
             User.totalNoOfReviews,
             User.profilePicture,
-            User.joiningDate,
+            func.cast(User.joiningDate, SAString),
             User.tags,
             CarDetail.CARID,
             CarDetail.carRegNo,
             CarDetail.carModel,
         )
-        .join(User, User.userAppId == cast(BidDetail.bidderID, SAString))
+        .join(User, _bidder_user_join())
         .outerjoin(CarDetail, CarDetail.CARID == BidDetail.CARID)
         .filter(
             BidDetail.rID == rid,
@@ -203,26 +208,6 @@ def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
         car_reg_no,
         car_model,
     ) in bids:
-        tag_ids: list[int] = []
-        if tags_str:
-            for t in tags_str.split(","):
-                cleaned = t.strip()
-                if cleaned.isdigit():
-                    tag_ids.append(int(cleaned))
-
-        tag_names: list[str] = []
-        if tag_ids:
-            tags_rows = db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
-            for row in tags_rows:
-                tag_names.append(row[0])
-
-        safe_rating = float(rating) if rating is not None else 0.0
-        try:
-            safe_rating = float(safe_rating)
-        except (TypeError, ValueError):
-            safe_rating = 0.0
-        safe_reviews = int(total_reviews) if total_reviews is not None else 0
-
         result.append(
             VendorBidDetail(
                 BIDID=bid.BID,
@@ -230,11 +215,11 @@ def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
                 BIDAMOUNT=_as_float_amount(bid.bidAmount),
                 BIDSTATUS=bid.bidStatus,
                 BIDDERNAME=full_name,
-                BIDDERRATING=safe_rating,
-                TOTALNOOFREVIEWS=safe_reviews,
+                BIDDERRATING=_as_float_amount(rating),
+                TOTALNOOFREVIEWS=_as_int_or_zero(total_reviews),
                 PROFILEPIC=profile_picture,
-                JOININGDATE=joining_date,
-                TAGS=tag_names,
+                JOININGDATE=_as_optional_date(joining_date),
+                TAGS=_tag_names_from_csv(db, tags_str),
                 CARID=car_id,
                 CARREGNO=car_reg_no,
                 CARMODEL=car_model,
@@ -278,10 +263,10 @@ def get_bids_for_request_for_vendor(db: Session, rid: int, user_id: str):
     except HTTPException:
         raise
     except SQLAlchemyError as e:
-        print(f"[get_bids_for_request_for_vendor] ERROR: {e}")
+        print(f"[get_bids_for_request_for_vendor] ERROR: {type(e).__name__}")
         return ErrorResponse(message="ERROR_PREPARE")
     except Exception as e:
-        print(f"[get_bids_for_request_for_vendor] ERROR_EXCEPTION: {e}")
+        print(f"[get_bids_for_request_for_vendor] ERROR_EXCEPTION: {type(e).__name__}")
         return ErrorResponse(message="ERROR_PREPARE")
     finally:
         db.close()

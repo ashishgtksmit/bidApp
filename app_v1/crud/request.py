@@ -85,7 +85,8 @@ def get_all_open_requests(db : Session):
                 NOOFKIDS=req.noOfKids,
                 CARTYPE=req.carType,
                 ACREQUEST=req.acRequest,
-                CARRIERREQUES=req.carrierRequest,
+                CARRIERREQUEST=bool(req.carrierRequest),
+                SPECIALREQUEST=req.specialRequest or "",
                 BIDENDTIME=req.bidEndTime,
                 REQUESTSTATUS=req.requestStatus,
                 PAYMENTSTATUS=req.paymentStatus,
@@ -2270,7 +2271,7 @@ def get_all_cancelled_requests_for_vendor(
     return [row[2] for row in items]
 
 
-def get_all_requests_by_request_status(db: Session, customer_id : int, request_status : str):
+def get_all_requests_by_request_status(db: Session, customer_id : str, request_status : str):
     try:
         requests = db.query(Request).filter(
             Request.customerAppId == customer_id, 
@@ -2292,7 +2293,7 @@ def get_all_requests_by_request_status(db: Session, customer_id : int, request_s
                 CARTYPE=req.carType,
                 ACREQUEST=req.acRequest,
                 CARRIERREQUEST=req.carrierRequest,
-                SPECIALREQUEST=req.specialRequest,
+                SPECIALREQUEST=req.specialRequest or "",
                 BIDENDTIME=req.bidEndTime,
                 REQUESTSTATUS=req.requestStatus,
                 PAYMENTSTATUS=req.paymentStatus,

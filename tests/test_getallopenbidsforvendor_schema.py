@@ -83,11 +83,57 @@ def test_open_bids_for_vendor_null_specialrequest_is_empty_string():
     assert result[0].CARRIERREQUEST is False
 
 
-def test_crud_source_does_not_use_carrierreques_typo():
+def test_open_requests_maps_carrierrequest_and_specialrequest():
+    from app_v1.crud.request import get_all_open_requests
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [_req()]
+    result = get_all_open_requests(db)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    item = result[0]
+    assert isinstance(item, RequestConfirmedCommonResponse)
+    assert item.CARRIERREQUEST is True
+    assert item.SPECIALREQUEST == "Child seat"
+    dumped = item.model_dump()
+    assert "CARRIERREQUEST" in dumped
+    assert "CARRIERREQUES" not in dumped
+
+
+def test_open_requests_null_specialrequest_is_empty_string():
+    from app_v1.crud.request import get_all_open_requests
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [
+        _req(specialRequest=None, carrierRequest=False)
+    ]
+    result = get_all_open_requests(db)
+    assert result[0].SPECIALREQUEST == ""
+    assert result[0].CARRIERREQUEST is False
+
+
+def test_requests_by_status_null_specialrequest_is_empty_string():
+    from app_v1.crud.request import get_all_requests_by_request_status
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [
+        _req(specialRequest=None)
+    ]
+    result = get_all_requests_by_request_status(
+        db, customer_id="7022359323", request_status="BID - OPEN"
+    )
+    assert result[0].SPECIALREQUEST == ""
+
+
+def test_crud_source_getallopenrequests_does_not_use_carrierreques_typo():
     src = (ROOT / "app_v1" / "crud" / "request.py").read_text()
-    live = src.split("def get_all_open_requests_for_vendor")[1].split(
-        "def get_request_type"
-    )[0]
+    live = src.split("def get_all_open_requests(")[1].split("except SQLAlchemyError")[0]
     assert "CARRIERREQUES=" not in live
     assert "CARRIERREQUEST=" in live
     assert "SPECIALREQUEST=" in live
+    vendor = src.split("def get_all_open_requests_for_vendor(")[1].split(
+        "def get_request_type"
+    )[0]
+    assert "CARRIERREQUES=" not in vendor
+    assert "CARRIERREQUEST=" in vendor
+    assert "SPECIALREQUEST=" in vendor
