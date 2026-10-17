@@ -1682,6 +1682,8 @@ def vendor_update_with_kyc(
 
     Forces alsoVendor=true. Never sets vendorApproved. Never changes lockApp.
     Approved vendors are blocked with ALREADY_VENDOR. Pending vendors may resubmit.
+    Bank text fields and imageBankAccount are optional. Omitted bank values are
+    left unchanged. A provided passbook replaces imageBankAccount.
     """
     EMAIL_TO = "openbidresourceteam@wizzride.com"
     EMAIL_TO_NAME = "Wizzride"
@@ -1713,13 +1715,8 @@ def vendor_update_with_kyc(
         "addressLine2": getattr(vendor_update_data, "addressLine2", None),
         "city": getattr(vendor_update_data, "city", None),
         "state": getattr(vendor_update_data, "state", None),
-        "bankAccountHolderName": getattr(vendor_update_data, "bankAccountHolderName", None),
-        "bankAccountNo": getattr(vendor_update_data, "bankAccountNo", None),
-        "bankIFSC": getattr(vendor_update_data, "bankIFSC", None),
-        "bankName": getattr(vendor_update_data, "bankName", None),
         "imageAadhar": getattr(vendor_update_data, "imageAadhar", None),
         "imagePAN": getattr(vendor_update_data, "imagePAN", None),
-        "imageBankAccount": getattr(vendor_update_data, "imageBankAccount", None),
     }
     for field_name, field_value in required_fields.items():
         if field_value is None or _kyc_clean(field_value) == "":
@@ -1749,17 +1746,44 @@ def vendor_update_with_kyc(
     address = f"{address1} {address2}".strip()
     city = _kyc_clean(vendor_update_data.city)
     state = _kyc_clean(vendor_update_data.state)
-    acc_holder = _kyc_clean(vendor_update_data.bankAccountHolderName)
-    acc_no = _kyc_clean(vendor_update_data.bankAccountNo)
-    ifsc = _kyc_clean(vendor_update_data.bankIFSC).upper()
-    bank_name = _kyc_clean(vendor_update_data.bankName)
 
-    if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", ifsc):
+    def _optional_provided(value):
+        """None means omitted. A present empty string is invalid."""
+        if value is None:
+            return None
+        cleaned = _kyc_clean(value)
+        return cleaned
+
+    acc_holder = _optional_provided(getattr(vendor_update_data, "bankAccountHolderName", None))
+    acc_no = _optional_provided(getattr(vendor_update_data, "bankAccountNo", None))
+    ifsc_raw = _optional_provided(getattr(vendor_update_data, "bankIFSC", None))
+    bank_name = _optional_provided(getattr(vendor_update_data, "bankName", None))
+    bank_image = getattr(vendor_update_data, "imageBankAccount", None)
+    if bank_image is not None:
+        bank_image = _kyc_clean(bank_image)
+    ifsc = ifsc_raw.upper() if ifsc_raw is not None else None
+
+    if acc_holder is not None and acc_holder == "":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_MISSING_BANKACCOUNTHOLDERNAME",
+        )
+    if bank_name is not None and bank_name == "":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_MISSING_BANKNAME",
+        )
+    if bank_image is not None and bank_image == "":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ERROR_MISSING_IMAGEBANKACCOUNT",
+        )
+    if ifsc is not None and not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", ifsc):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ERROR_INVALID_IFSC",
         )
-    if not re.match(r"^[0-9A-Za-z\-]{6,22}$", acc_no):
+    if acc_no is not None and not re.match(r"^[0-9A-Za-z\-]{6,22}$", acc_no):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="ERROR_INVALID_ACCOUNTNO",
@@ -1832,18 +1856,20 @@ def vendor_update_with_kyc(
             )
         new_blob_urls.append(pan_url)
 
-        ok_b, bank_url = azure_blob_upload(
-            blob_name=f"{blob_base}Bank_{ts}",
-            base64_data=vendor_update_data.imageBankAccount,
-            make_public=False,
-            max_upload_bytes=_MAX_KYC_MEDIA_BYTES,
-        )
-        if not ok_b:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=_map_kyc_media_error(bank_url, "BANK"),
+        replaced_bank = bank_image is not None
+        if replaced_bank:
+            ok_b, bank_url = azure_blob_upload(
+                blob_name=f"{blob_base}Bank_{ts}",
+                base64_data=bank_image,
+                make_public=False,
+                max_upload_bytes=_MAX_KYC_MEDIA_BYTES,
             )
-        new_blob_urls.append(bank_url)
+            if not ok_b:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=_map_kyc_media_error(bank_url, "BANK"),
+                )
+            new_blob_urls.append(bank_url)
 
         # Re-check approval / lock under a fresh locked read before mutation apply
         # so an admin approval racing with upload is observed.
@@ -1887,17 +1913,25 @@ def vendor_update_with_kyc(
         user.city = city
         user.gender = gender
         user.state = state
-        user.bankAccountHolderName = acc_holder
-        user.bankAccountNo = acc_no
-        user.bankIFSC = ifsc
-        user.bankName = bank_name
+        if acc_holder is not None:
+            user.bankAccountHolderName = acc_holder
+        if acc_no is not None:
+            user.bankAccountNo = acc_no
+        if ifsc is not None:
+            user.bankIFSC = ifsc
+        if bank_name is not None:
+            user.bankName = bank_name
         user.imageAadhar = aadhaar_url
         user.imagePAN = pan_url
-        user.imageBankAccount = bank_url
+        if replaced_bank:
+            user.imageBankAccount = bank_url
 
         db.commit()
 
-        for old_url in [old_aadhaar_url, old_pan_url, old_bank_url]:
+        old_urls = [old_aadhaar_url, old_pan_url]
+        if replaced_bank:
+            old_urls.append(old_bank_url)
+        for old_url in old_urls:
             if old_url and old_url not in new_blob_urls:
                 try:
                     azure_blob_delete_by_url(old_url)
@@ -1905,8 +1939,22 @@ def vendor_update_with_kyc(
                     # Cleanup failure must not undo committed registration.
                     pass
 
-        masked_account = _mask_bank_account(acc_no)
+        def _email_text(value) -> str:
+            text = _kyc_clean(value)
+            return text if text else "Not provided"
+
+        stored_account = _kyc_clean(user.bankAccountNo)
+        account_label = (
+            _mask_bank_account(stored_account) if stored_account else "Not provided"
+        )
+        stored_bank_url = _kyc_clean(user.imageBankAccount)
         esc = html.escape
+        bank_doc_row = ""
+        if stored_bank_url:
+            bank_doc_row = (
+                f'<div class="row"><span class="k">Bank Doc:</span> '
+                f'<a href="{esc(stored_bank_url, quote=True)}" target="_blank">Private document</a></div>'
+            )
         email_html = f'''
         <html>
         <head>
@@ -1934,15 +1982,15 @@ def vendor_update_with_kyc(
                 <div class="row"><span class="k">City / State:</span> {esc(city)} / {esc(state)}</div>
 
                 <hr>
-                <div class="row"><span class="k">Bank A/C Holder:</span> {esc(acc_holder)}</div>
-                <div class="row"><span class="k">Account No:</span> {esc(masked_account)}</div>
-                <div class="row"><span class="k">IFSC:</span> {esc(ifsc)}</div>
-                <div class="row"><span class="k">Bank Name:</span> {esc(bank_name)}</div>
+                <div class="row"><span class="k">Bank A/C Holder:</span> {esc(_email_text(user.bankAccountHolderName))}</div>
+                <div class="row"><span class="k">Account No:</span> {esc(account_label)}</div>
+                <div class="row"><span class="k">IFSC:</span> {esc(_email_text(user.bankIFSC))}</div>
+                <div class="row"><span class="k">Bank Name:</span> {esc(_email_text(user.bankName))}</div>
 
                 <hr>
                 <div class="row"><span class="k">Aadhaar:</span> <a href="{esc(aadhaar_url or '', quote=True)}" target="_blank">Private document</a></div>
                 <div class="row"><span class="k">PAN:</span> <a href="{esc(pan_url or '', quote=True)}" target="_blank">Private document</a></div>
-                <div class="row"><span class="k">Bank Doc:</span> <a href="{esc(bank_url or '', quote=True)}" target="_blank">Private document</a></div>
+                {bank_doc_row}
 
                 <hr>
                 <div class="row">Submitted at: {datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")}</div>

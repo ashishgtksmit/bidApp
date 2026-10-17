@@ -315,6 +315,8 @@ class VendorKycCreate(TrimmedBaseModel):
     Applicant identity and lifecycle flags are server-derived from JWT.
     Legacy clients may still send optional userAppId / alsoVendor; ownership
     and alsoVendor are not client-authoritative.
+    Bank text fields and imageBankAccount are optional. Omitted values do not
+    clear stored bank data. Empty strings are rejected.
     """
 
     dob: str = Field(..., min_length=1)
@@ -323,13 +325,15 @@ class VendorKycCreate(TrimmedBaseModel):
     addressLine2: str = Field(..., min_length=1)
     city: str = Field(..., min_length=1)
     state: str = Field(..., min_length=1)
-    bankAccountHolderName: str = Field(..., min_length=1)
-    bankAccountNo: str = Field(..., min_length=1)
-    bankIFSC: str = Field(..., min_length=1)
-    bankName: str = Field(..., min_length=1)
+    # Omitted on registration. Present values are still validated.
+    # Empty strings are invalid. Post-approval updates use UserBankDetailsUpdate.
+    bankAccountHolderName: Optional[str] = None
+    bankAccountNo: Optional[str] = None
+    bankIFSC: Optional[str] = None
+    bankName: Optional[str] = None
     imageAadhar: str = Field(..., min_length=1)
     imagePAN: str = Field(..., min_length=1)
-    imageBankAccount: str = Field(..., min_length=1)
+    imageBankAccount: Optional[str] = None
     # Legacy / ignored — JWT sub is authoritative; alsoVendor forced server-side.
     userAppId: Optional[str] = None
     alsoVendor: Optional[bool] = None
@@ -369,25 +373,49 @@ class VendorKycCreate(TrimmedBaseModel):
             raise ValueError("ERROR_INVALID_GENDER")
         return mapping[key]
 
+    @field_validator("bankAccountHolderName", "bankName")
+    @classmethod
+    def validate_optional_bank_text(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        if not text:
+            raise ValueError("ERROR_REQUIRED_FIELD")
+        return text
+
     @field_validator("bankIFSC")
     @classmethod
     def validate_ifsc(cls, v):
-        if not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", str(v).upper()):
+        if v is None:
+            return None
+        text = str(v).strip()
+        if not text or not re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", text.upper()):
             raise ValueError("ERROR_INVALID_IFSC")
-        return str(v).upper()
+        return text.upper()
 
     @field_validator("bankAccountNo")
     @classmethod
     def validate_bank_account_no(cls, v):
-        cleaned = str(v).replace(" ", "")
-        if not re.match(r"^[0-9A-Za-z\-]{6,22}$", cleaned):
+        if v is None:
+            return None
+        cleaned = str(v).replace(" ", "").strip()
+        if not cleaned or not re.match(r"^[0-9A-Za-z\-]{6,22}$", cleaned):
             raise ValueError("ERROR_INVALID_ACCOUNTNO")
         return cleaned
 
-    @field_validator("imageAadhar", "imagePAN", "imageBankAccount")
+    @field_validator("imageAadhar", "imagePAN")
     @classmethod
     def validate_images(cls, v):
         if not v or str(v).strip() == "":
+            raise ValueError("ERROR_MISSING_IMAGES")
+        return v
+
+    @field_validator("imageBankAccount")
+    @classmethod
+    def validate_optional_bank_image(cls, v):
+        if v is None:
+            return None
+        if str(v).strip() == "":
             raise ValueError("ERROR_MISSING_IMAGES")
         return v
 

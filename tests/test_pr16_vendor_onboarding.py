@@ -654,3 +654,93 @@ def test_success_body_contains_no_kyc_urls_or_sql(db_session):
     assert payload == {"message": "UPDATED", "error": None}
     assert "SELECT" not in response.text
     assert "blob" not in response.text.lower()
+
+
+def _body_without_bank():
+    body = _valid_body()
+    for key in (
+        "bankAccountHolderName",
+        "bankAccountNo",
+        "bankIFSC",
+        "bankName",
+        "imageBankAccount",
+    ):
+        del body[key]
+    return body
+
+
+def test_registration_without_bank_leaves_columns_null(db_session):
+    db, engine, Session = db_session
+    _add_user(db, user_app_id=CUSTOMER_ID, uid=1)
+    client = _pr16_client(engine, Session, CUSTOMER_ID)
+
+    with patch.object(user_crud, "azure_blob_upload", side_effect=_fake_upload) as upload_mock, patch.object(
+        user_crud, "send_email", return_value={"message": "SENT"}
+    ) as email_mock:
+        response = client.put("/registernewvendor", json=_body_without_bank())
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "UPDATED"
+    assert upload_mock.call_count == 2
+    user = db.query(User).filter(User.userAppId == CUSTOMER_ID).first()
+    assert user.alsoVendor is True
+    assert user.bankAccountHolderName is None
+    assert user.bankAccountNo is None
+    assert user.bankIFSC is None
+    assert user.bankName is None
+    assert user.imageBankAccount is None
+    assert user.imageAadhar
+    assert user.imagePAN
+    message = email_mock.call_args.kwargs["message"]
+    assert "Not provided" in message
+    assert "Bank Doc:" not in message
+
+
+def test_resubmit_without_bank_preserves_existing_bank(db_session):
+    db, engine, Session = db_session
+    _add_user(
+        db,
+        user_app_id=PENDING_VENDOR,
+        uid=1,
+        alsoVendor=True,
+        vendorApproved=False,
+        bankAccountHolderName="Kept Holder",
+        bankAccountNo="123456789012",
+        bankIFSC="SBIN0001234",
+        bankName="State Bank of India",
+        imageAadhar="https://old/aadhaar.png",
+        imagePAN="https://old/pan.png",
+        imageBankAccount="https://old/bank.png",
+    )
+    client = _pr16_client(engine, Session, PENDING_VENDOR)
+    deleted = []
+
+    def _delete(url):
+        deleted.append(url)
+        return True
+
+    with patch.object(user_crud, "azure_blob_upload", side_effect=_fake_upload) as upload_mock, patch.object(
+        user_crud, "azure_blob_delete_by_url", side_effect=_delete
+    ), patch.object(user_crud, "send_email", return_value={"message": "SENT"}):
+        response = client.put("/registernewvendor", json=_body_without_bank())
+
+    assert response.status_code == 200
+    assert upload_mock.call_count == 2
+    user = db.query(User).filter(User.userAppId == PENDING_VENDOR).first()
+    assert user.bankAccountHolderName == "Kept Holder"
+    assert user.bankAccountNo == "123456789012"
+    assert user.bankIFSC == "SBIN0001234"
+    assert user.bankName == "State Bank of India"
+    assert user.imageBankAccount == "https://old/bank.png"
+    assert "https://old/bank.png" not in deleted
+    assert "https://old/aadhaar.png" in deleted
+    assert "https://old/pan.png" in deleted
+
+
+def test_empty_bank_ifsc_rejected(db_session):
+    db, engine, Session = db_session
+    _add_user(db, user_app_id=CUSTOMER_ID, uid=1)
+    client = _pr16_client(engine, Session, CUSTOMER_ID)
+    response = client.put("/registernewvendor", json=_valid_body(bankIFSC=""))
+    assert response.status_code == 422
+    assert "ERROR_INVALID_IFSC" in str(response.json())
