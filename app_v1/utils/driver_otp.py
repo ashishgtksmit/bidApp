@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from ..models.driver_otp import DriverOtpChallenge, DriverOtpToken
 from ..utils.common import ErrorResponse
-from ..utils.otp import hash_otp, send_exotel_sms
+from ..utils.otp import hash_otp, send_exotel_sms, wizzride_otp_sms_body
 
 load_dotenv(override=False)
 
@@ -169,31 +169,38 @@ def send_driver_otp(
     else:
         otp = "".join(random.choices(string.digits, k=4))
 
-    try:
-        upsert_driver_otp_challenge(
-            db,
-            vendor_app_id=vendor_app_id,
-            driver_phone=phone,
-            purpose=purpose,
-            otp=otp,
-            driver_id=driver_id,
-        )
-    except SQLAlchemyError:
-        db.rollback()
-        return ErrorResponse(message="ERROR")
+    def _store_challenge() -> Optional[ErrorResponse]:
+        try:
+            upsert_driver_otp_challenge(
+                db,
+                vendor_app_id=vendor_app_id,
+                driver_phone=phone,
+                purpose=purpose,
+                otp=otp,
+                driver_id=driver_id,
+            )
+        except SQLAlchemyError:
+            db.rollback()
+            return ErrorResponse(message="ERROR")
+        return None
 
     if bypass_sms:
+        stored = _store_challenge()
+        if stored is not None:
+            return stored
         return ErrorResponse(message="OTP_SENT")
 
     e164 = phone if phone.startswith("+") else f"+91{phone[-10:]}"
     sms_result = send_exotel_sms(
         e164,
-        f"Your OpenBid driver verification code is {otp}. Valid for "
-        f"{DRIVER_OTP_EXPIRY_MINUTES} minutes.",
+        wizzride_otp_sms_body(otp, DRIVER_OTP_EXPIRY_MINUTES),
     )
     if sms_result.get("message") != "SMS_SENT":
         return ErrorResponse(message="ERROR_SENDING_SMS")
 
+    stored = _store_challenge()
+    if stored is not None:
+        return stored
     return ErrorResponse(message="OTP_SENT")
 
 

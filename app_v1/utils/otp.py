@@ -47,6 +47,15 @@ def _constant_time_equals(left: str, right: str) -> bool:
     return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
+def wizzride_otp_sms_body(otp: str, valid_minutes: int) -> str:
+    """DLT-approved WIZZRIDE sender body. Driver and account OTP must share it."""
+    return (
+        f"{otp} is your OTP for the transaction that you are performing in WIZZRIDE. "
+        f"This OTP will be valid for the next {valid_minutes} mins. "
+        "Do not share OTP for Security Reason."
+    )
+
+
 def send_exotel_sms(to: str, body: str) -> Dict[str, Any]:
     api_key = os.getenv('EXOTEL_API_KEY')
     api_token = os.getenv('EXOTEL_API_TOKEN')
@@ -268,11 +277,7 @@ def send_otp_to_user(db: Session, user_app_id: str):
 
     try:
         otp = ''.join(random.choices(string.digits, k=4))
-        sms_body = (
-            f"{otp} is your OTP for the transaction that you are performing in WIZZRIDE. "
-            f"This OTP will be valid for the next {OTP_EXPIRY_MINUTES} mins. "
-            "Do not share OTP for Security Reason."
-        )
+        sms_body = wizzride_otp_sms_body(otp, OTP_EXPIRY_MINUTES)
 
         # Test-only hook: skip Exotel SMS. Optional OTP_TEST_FIXED_OTP sets the
         # challenge value for automated tests. Never returned in HTTP responses.
