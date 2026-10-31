@@ -64,23 +64,50 @@ def _as_optional_date(value):
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.date()
+        try:
+            return value.date()
+        except (ValueError, OverflowError, OSError):
+            return None
     if isinstance(value, date):
-        return value
+        try:
+            if value.year < 1000:
+                return None
+            return value
+        except (ValueError, OverflowError, OSError):
+            return None
     if isinstance(value, str):
         text = value.strip()
         if not text or text.startswith("0000-00-00"):
             return None
         parsed = parse_dob(text)
         if parsed is not None:
-            return parsed
+            return None if parsed.year < 1000 else parsed
         for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
             try:
-                return datetime.strptime(text[:19], fmt).date()
+                parsed = datetime.strptime(text[:19], fmt).date()
+                return None if parsed.year < 1000 else parsed
             except ValueError:
                 continue
         return None
     return None
+
+
+def _as_optional_timestamp_string(value):
+    """Coerce TIMESTAMP/date/string. MySQL zero-dates → None (never raise)."""
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            text = value.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            return None
+    else:
+        text = str(value).strip()
+    if not text or text.startswith("0000-00-00"):
+        return None
+    if "." in text:
+        text = text.split(".", 1)[0]
+    return text
 
 
 def _tag_names_from_csv(db: Session, tags_str) -> list:
@@ -92,7 +119,11 @@ def _tag_names_from_csv(db: Session, tags_str) -> list:
                 tag_ids.append(int(cleaned))
     if not tag_ids:
         return []
-    tags_rows = db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
+    try:
+        tags_rows = db.query(Tag.tagsName).filter(Tag.TAGID.in_(tag_ids)).all()
+    except SQLAlchemyError as e:
+        print(f"[get_bids_for_request] tags lookup error: {type(e).__name__}: {e}")
+        return []
     names = []
     for row in tags_rows:
         if row[0] is None:
@@ -144,9 +175,15 @@ def get_bids_for_request(
                 detail="INVALID_REQUEST_STATUS",
             )
 
+        # Select scalar columns only. Loading BidDetail / CarDetail ORM rows
+        # materializes TIMESTAMP columns; MySQL 0000-00-00 values then raise
+        # in PyMySQL ("year 0 is out of range") and become ERROR_PREPARE.
         bids = (
             db.query(
-                BidDetail,
+                BidDetail.BID,
+                BidDetail.bidderID,
+                BidDetail.bidAmount,
+                BidDetail.bidStatus,
                 User.fullName,
                 User.rating,
                 User.totalNoOfReviews,
@@ -162,7 +199,7 @@ def get_bids_for_request(
                 CarDetail.modelYear,
                 CarDetail.carColor,
                 CarDetail.ownerName,
-                CarDetail.registeredOn,
+                func.cast(CarDetail.registeredOn, SAString),
                 CarDetail.imageVehicleFront,
                 CarDetail.imageVehicleSide,
                 CarTypeDetail.car_type,
@@ -184,7 +221,10 @@ def get_bids_for_request(
         result = []
 
         for (
-            bid,
+            bid_id,
+            bidder_id,
+            bid_amount,
+            bid_status,
             fullName,
             rating,
             totalNoOfReviews,
@@ -206,20 +246,12 @@ def get_bids_for_request(
             car_type,
             car_sub_type,
         ) in bids:
-            registered_on_str = None
-            if registered_on is not None:
-                if hasattr(registered_on, "strftime"):
-                    registered_on_str = registered_on.strftime("%Y-%m-%d %H:%M:%S")
-                else:
-                    text = str(registered_on)
-                    registered_on_str = None if text.startswith("0000-00-00") else text
-
-            result.append(
-                CustomerBidDetail(
-                    BIDID=bid.BID,
-                    BIDDERID=str(bid.bidderID),
-                    BIDAMOUNT=_as_float_amount(bid.bidAmount),
-                    BIDSTATUS=bid.bidStatus,
+            try:
+                item = CustomerBidDetail(
+                    BIDID=bid_id,
+                    BIDDERID=str(bidder_id),
+                    BIDAMOUNT=_as_float_amount(bid_amount),
+                    BIDSTATUS=bid_status,
                     BIDDERNAME=fullName,
                     BIDDERRATING=_as_float_amount(rating),
                     TOTALNOOFREVIEWS=_as_int_or_zero(totalNoOfReviews),
@@ -235,23 +267,41 @@ def get_bids_for_request(
                     MODELYEAR=str(model_year) if model_year is not None else None,
                     CARCOLOR=car_color,
                     OWNERNAME=owner_name,
-                    REGISTEREDON=registered_on_str,
+                    REGISTEREDON=_as_optional_timestamp_string(registered_on),
                     IMAGEVEHICLEFRONT=image_vehicle_front,
                     IMAGEVEHICLESIDE=image_vehicle_side,
                     CAR_TYPE=car_type,
                     CAR_SUB_TYPE=car_sub_type,
                 )
-            )
+            except Exception as row_err:
+                print(
+                    f"[get_bids_for_request] ROW_ERROR bid={bid_id}: "
+                    f"{type(row_err).__name__}: {row_err}"
+                )
+                try:
+                    item = CustomerBidDetail(
+                        BIDID=bid_id,
+                        BIDDERID=str(bidder_id),
+                        BIDAMOUNT=_as_float_amount(bid_amount),
+                        BIDSTATUS=bid_status,
+                    )
+                except Exception as min_err:
+                    print(
+                        f"[get_bids_for_request] ROW_SKIP bid={bid_id}: "
+                        f"{type(min_err).__name__}: {min_err}"
+                    )
+                    continue
+            result.append(item)
 
         result.sort(key=lambda item: (_as_float_amount(item.BIDAMOUNT), item.BIDID))
         return result
     except HTTPException:
         raise
     except SQLAlchemyError as e:
-        print(f"[get_bids_for_request] ERROR: {type(e).__name__}")
+        print(f"[get_bids_for_request] ERROR: {type(e).__name__}: {e}")
         return ErrorResponse(message="ERROR_PREPARE")
     except Exception as e:
-        print(f"[get_bids_for_request] ERROR_EXCEPTION: {type(e).__name__}")
+        print(f"[get_bids_for_request] ERROR_EXCEPTION: {type(e).__name__}: {e}")
         return ErrorResponse(message="ERROR_PREPARE")
     finally:
         db.close()

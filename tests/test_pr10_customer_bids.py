@@ -405,9 +405,10 @@ def test_get_bids_excludes_rejected_and_confirmed_bids(seeded_db):
         status="REJECTED",
         car_id=303,
     )
+    open_bid_id = open_bid.BID
     result = get_bids_for_request(seeded_db, rid=req.RID, user_id=CUSTOMER_ID)
     assert len(result) == 1
-    assert result[0].BIDID == open_bid.BID
+    assert result[0].BIDID == open_bid_id
 
 
 def test_get_bids_sql_failure_safe(seeded_db):
@@ -420,12 +421,19 @@ def test_get_bids_sql_failure_safe(seeded_db):
 
 
 def test_get_bids_optional_and_messy_vendor_fields_do_not_error_prepare(db):
-    from app_v1.crud.bid import _as_optional_date
+    from app_v1.crud.bid import _as_optional_date, _as_optional_timestamp_string
 
     assert _as_optional_date("0000-00-00") is None
     assert _as_optional_date("0000-00-00 00:00:00") is None
+    assert _as_optional_date("0013-05-28") is None
     assert _as_optional_date("07-12-2006") == date(2006, 12, 7)
     assert _as_optional_date(datetime(2020, 5, 1, 8, 30, 0)) == date(2020, 5, 1)
+    assert _as_optional_timestamp_string("0000-00-00 00:00:00") is None
+    assert _as_optional_timestamp_string("0000-00-00") is None
+    assert _as_optional_timestamp_string("2020-05-01 08:30:00") == "2020-05-01 08:30:00"
+    assert _as_optional_timestamp_string(datetime(2020, 5, 1, 8, 30, 0)) == (
+        "2020-05-01 08:30:00"
+    )
 
     _add_user(db, user_app_id=CUSTOMER_ID, uid=1, alsoVendor=False)
     _add_user(
@@ -495,6 +503,59 @@ def test_get_bids_join_does_not_cast_bidder_as_char():
     helper = src.split("def _bidder_user_join")[1].split("def get_bids_for_request")[0]
     assert "CAST" in helper.upper() or "BigInteger" in helper
     assert "SAString" not in helper
+
+
+def test_get_bids_casts_registered_on_and_does_not_load_orm_timestamps():
+    src = (ROOT / "app_v1" / "crud" / "bid.py").read_text()
+    live = src.split("def get_bids_for_request")[1].split("def delete_bid_with_bid")[0]
+    assert "func.cast(CarDetail.registeredOn, SAString)" in live
+    assert "func.cast(User.joiningDate, SAString)" in live
+    assert "BidDetail.BID," in live
+    # ORM entity load would materialize biddetails TIMESTAMP columns.
+    assert "                BidDetail,\n" not in live
+    assert "\n                CarDetail.registeredOn,\n" not in live
+
+
+def test_get_bids_with_car_and_zero_date_strings_does_not_error_prepare(db):
+    from app_v1.models.car_details import CarDetail
+
+    _add_user(db, user_app_id=CUSTOMER_ID, uid=1, alsoVendor=False)
+    _add_user(
+        db,
+        user_app_id=VENDOR_A,
+        uid=3,
+        full_name="Vendor A",
+        joiningDate=None,
+        dob="0013-05-28",
+    )
+    db.add(
+        CarDetail(
+            CARID=101,
+            userAppId=VENDOR_A,
+            carRegNo="SK01A1234",
+            normalizedCarRegNo="SK01A1234",
+            carColor="White",
+            carModel="WagonR",
+            modelYear="2018",
+            ownerName="Vendor A",
+            registrationDoc="doc",
+            registeredOn=datetime(2020, 5, 1, 8, 30, 0),
+            adminApproved=True,
+            carOwnedBySameVendor=True,
+            CTD=1,
+        )
+    )
+    db.commit()
+    req = _seed_request(db, no_of_bids=1)
+    bid = _seed_bid(db, rid=req.RID, bidder_id=VENDOR_A, amount=1614.50, car_id=101)
+    result = get_bids_for_request(db, rid=req.RID, user_id=CUSTOMER_ID)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0].BIDID == bid.BID
+    assert result[0].CARID == 101
+    assert result[0].CARMODEL == "WagonR"
+    assert result[0].REGISTEREDON == "2020-05-01 08:30:00"
+    assert result[0].DOB is None
 
 
 # --- Accept bid ---
