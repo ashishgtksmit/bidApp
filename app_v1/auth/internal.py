@@ -58,6 +58,20 @@ async def require_internal_notification_access(
     )
 
 
+WALLET_OPS_HEADER = "X-OpenBid-Wallet-Ops-Key"
+WALLET_OPS_ACCESS_REQUIRED = "WALLET_OPS_ACCESS_REQUIRED"
+
+
+async def require_wallet_ops_access(
+    ops_key: str | None = Header(default=None, alias=WALLET_OPS_HEADER),
+) -> None:
+    """PR48 — wallet withdrawal ops. Separate secret ``WALLET_OPS_KEY`` so the
+    notification/email key cannot move money. Fails closed when unset."""
+    expected = (os.getenv("WALLET_OPS_KEY") or "").strip()
+    if not expected or not _keys_match(ops_key or "", expected):
+        raise HTTPException(status_code=403, detail=WALLET_OPS_ACCESS_REQUIRED)
+
+
 async def require_internal_email_access(
     internal_key: str | None = Header(
         default=None,

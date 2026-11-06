@@ -1060,6 +1060,10 @@ def update_vendor_bank_details(
             db.commit()
             return ErrorResponse(message="UPDATED")
 
+        from .vendor_bank_security import require_bank_change_otp
+
+        require_bank_change_otp(db, user, getattr(user_data, "otp", None))
+
         user.bankAccountHolderName = holder
         user.bankAccountNo = account_no
         user.bankIFSC = ifsc

@@ -17,6 +17,7 @@ from .endpoints.utils import router as utils_router
 from .endpoints.auth import router as auth_router
 from .endpoints.reporting import router as reporting_router
 from .endpoints.chat import router as chat_router
+from .endpoints.vendor_wallet import router as vendor_wallet_router
 from .database import Base, engine
 from .auth.deps import get_current_user_id
 from .events.outbox import (
@@ -27,6 +28,8 @@ from .events.outbox import (
 from .models import otp_challenge as _otp_challenge_models  # noqa: F401
 # Ensure PR14 driver OTP challenge / token tables are registered before create_all.
 from .models import driver_otp as _driver_otp_models  # noqa: F401
+# Ensure PR47 vendor wallet tables are registered before create_all.
+from .models import vendor_wallet as _vendor_wallet_models  # noqa: F401
 import traceback
 
 
@@ -70,6 +73,7 @@ app.include_router(driver_router, tags=['Driver'])
 app.include_router(utils_router, tags=['Utilities'])
 app.include_router(reporting_router, tags=['Reporting'])
 app.include_router(chat_router, tags=['Chat'])
+app.include_router(vendor_wallet_router, tags=['Wallet'])
 
 Base.metadata.create_all(bind=engine)
 

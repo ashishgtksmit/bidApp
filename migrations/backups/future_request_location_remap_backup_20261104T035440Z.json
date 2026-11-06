@@ -1,0 +1,12 @@
+[
+  {
+    "RID": 1621,
+    "fromLocation": "Gangtok, East Sikkim",
+    "toLocation": "Bagdogra Airport",
+    "pickUpDate": "2026-12-04",
+    "pickUpTime": "18:16:00",
+    "requestStatus": "BID - OPEN",
+    "bidEndTime": "2026-12-04T09:00:00",
+    "noOfBids": 1
+  }
+]

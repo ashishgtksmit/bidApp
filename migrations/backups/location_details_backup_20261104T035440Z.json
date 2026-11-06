@@ -1,0 +1,446 @@
+[
+  {
+    "LID": 1,
+    "location": "Bagdogra Airportt",
+    "location_shortCode": "IXB",
+    "regionId": 2
+  },
+  {
+    "LID": 2,
+    "location": "NJP Railway Station",
+    "location_shortCode": "NJP",
+    "regionId": 2
+  },
+  {
+    "LID": 3,
+    "location": "Gangtok, East Sikkim",
+    "location_shortCode": "GTK",
+    "regionId": 1
+  },
+  {
+    "LID": 4,
+    "location": "Pakyong",
+    "location_shortCode": "PKG",
+    "regionId": 1
+  },
+  {
+    "LID": 5,
+    "location": "Singtam",
+    "location_shortCode": "STM",
+    "regionId": 1
+  },
+  {
+    "LID": 6,
+    "location": "Rangpo",
+    "location_shortCode": "RGP",
+    "regionId": 1
+  },
+  {
+    "LID": 7,
+    "location": "Namchi",
+    "location_shortCode": "NMH",
+    "regionId": 1
+  },
+  {
+    "LID": 8,
+    "location": "Jorethang",
+    "location_shortCode": "JRT",
+    "regionId": 1
+  },
+  {
+    "LID": 9,
+    "location": "Darjeeling",
+    "location_shortCode": "DRJ",
+    "regionId": 2
+  },
+  {
+    "LID": 10,
+    "location": "Kurseong",
+    "location_shortCode": "KRS",
+    "regionId": 2
+  },
+  {
+    "LID": 11,
+    "location": "Kalimpong",
+    "location_shortCode": "KAL",
+    "regionId": 2
+  },
+  {
+    "LID": 12,
+    "location": "Pelling",
+    "location_shortCode": "PEL",
+    "regionId": 1
+  },
+  {
+    "LID": 13,
+    "location": "Ravangla",
+    "location_shortCode": "RVG",
+    "regionId": 1
+  },
+  {
+    "LID": 14,
+    "location": "Siliguri",
+    "location_shortCode": "SLG",
+    "regionId": 2
+  },
+  {
+    "LID": 15,
+    "location": "Mirik",
+    "location_shortCode": "MRK",
+    "regionId": 2
+  },
+  {
+    "LID": 16,
+    "location": "Melli",
+    "location_shortCode": "MEL",
+    "regionId": 2
+  },
+  {
+    "LID": 17,
+    "location": "Jaigaon",
+    "location_shortCode": "JGN",
+    "regionId": 4
+  },
+  {
+    "LID": 18,
+    "location": "Phuntsholing",
+    "location_shortCode": "PHT",
+    "regionId": 4
+  },
+  {
+    "LID": 19,
+    "location": "Kakirvitta (Panitanki)",
+    "location_shortCode": "KKR",
+    "regionId": 2
+  },
+  {
+    "LID": 20,
+    "location": "Chalsa",
+    "location_shortCode": "CHL",
+    "regionId": 4
+  },
+  {
+    "LID": 21,
+    "location": "Lataguri",
+    "location_shortCode": "LTG",
+    "regionId": 4
+  },
+  {
+    "LID": 22,
+    "location": "Pedong",
+    "location_shortCode": "PDG",
+    "regionId": 2
+  },
+  {
+    "LID": 23,
+    "location": "Sonada",
+    "location_shortCode": "SND",
+    "regionId": 2
+  },
+  {
+    "LID": 24,
+    "location": "Jorebunglow",
+    "location_shortCode": "JBG",
+    "regionId": 2
+  },
+  {
+    "LID": 25,
+    "location": "Lava",
+    "location_shortCode": "LAV",
+    "regionId": 2
+  },
+  {
+    "LID": 26,
+    "location": "Legship",
+    "location_shortCode": "LGP",
+    "regionId": 1
+  },
+  {
+    "LID": 27,
+    "location": "Baiguney",
+    "location_shortCode": "BGN",
+    "regionId": 1
+  },
+  {
+    "LID": 28,
+    "location": "Jaldapara",
+    "location_shortCode": "JLP",
+    "regionId": 4
+  },
+  {
+    "LID": 29,
+    "location": "Yuksam",
+    "location_shortCode": "YKM",
+    "regionId": 1
+  },
+  {
+    "LID": 30,
+    "location": "Guwahati Airport",
+    "location_shortCode": "GAU",
+    "regionId": 5
+  },
+  {
+    "LID": 31,
+    "location": "Guwahati Railway Station",
+    "location_shortCode": "GHY",
+    "regionId": 5
+  },
+  {
+    "LID": 32,
+    "location": "Shillong",
+    "location_shortCode": "SHL",
+    "regionId": 5
+  },
+  {
+    "LID": 37,
+    "location": "Malbazar",
+    "location_shortCode": "MLB",
+    "regionId": 4
+  },
+  {
+    "LID": 38,
+    "location": "Lachung",
+    "location_shortCode": "LCH",
+    "regionId": 1
+  },
+  {
+    "LID": 39,
+    "location": "Kishanganj",
+    "location_shortCode": "KSG",
+    "regionId": 6
+  },
+  {
+    "LID": 40,
+    "location": "Dhotrey",
+    "location_shortCode": "DHT",
+    "regionId": 2
+  },
+  {
+    "LID": 41,
+    "location": "Maneybhanjyang",
+    "location_shortCode": "MNG",
+    "regionId": 2
+  },
+  {
+    "LID": 42,
+    "location": "Rimbick",
+    "location_shortCode": "RMB",
+    "regionId": 2
+  },
+  {
+    "LID": 43,
+    "location": "Sandakphu",
+    "location_shortCode": "SKU",
+    "regionId": 2
+  },
+  {
+    "LID": 44,
+    "location": "Guwahati Town",
+    "location_shortCode": "GHT",
+    "regionId": 5
+  },
+  {
+    "LID": 45,
+    "location": "Kathmandu",
+    "location_shortCode": "KTM",
+    "regionId": 7
+  },
+  {
+    "LID": 46,
+    "location": "Kolkata",
+    "location_shortCode": "KOL",
+    "regionId": 3
+  },
+  {
+    "LID": 48,
+    "location": "Majitar",
+    "location_shortCode": "MJR",
+    "regionId": 1
+  },
+  {
+    "LID": 49,
+    "location": "Hasimara",
+    "location_shortCode": "HSM",
+    "regionId": 4
+  },
+  {
+    "LID": 50,
+    "location": "Binnaguri",
+    "location_shortCode": "BNG",
+    "regionId": 4
+  },
+  {
+    "LID": 51,
+    "location": "Jalpaiguri",
+    "location_shortCode": "JPG",
+    "regionId": 2
+  },
+  {
+    "LID": 52,
+    "location": "Mangan",
+    "location_shortCode": "MNN",
+    "regionId": 1
+  },
+  {
+    "LID": 53,
+    "location": "Lachen",
+    "location_shortCode": "LAH",
+    "regionId": 1
+  },
+  {
+    "LID": 54,
+    "location": "Purnea",
+    "location_shortCode": "PRN",
+    "regionId": 6
+  },
+  {
+    "LID": 55,
+    "location": "Geyzing, West Sikkim",
+    "location_shortCode": "GYZ",
+    "regionId": 1
+  },
+  {
+    "LID": 56,
+    "location": "Simri, Bihar",
+    "location_shortCode": "SIM",
+    "regionId": 6
+  },
+  {
+    "LID": 57,
+    "location": "Alipurduar",
+    "location_shortCode": "ALP",
+    "regionId": 4
+  },
+  {
+    "LID": 58,
+    "location": "Temi Tea",
+    "location_shortCode": "TMT",
+    "regionId": 1
+  },
+  {
+    "LID": 59,
+    "location": "Rishop",
+    "location_shortCode": "RSP",
+    "regionId": 2
+  },
+  {
+    "LID": 60,
+    "location": "Kabi",
+    "location_shortCode": "KBI",
+    "regionId": 1
+  },
+  {
+    "LID": 61,
+    "location": "Cooch Behar",
+    "location_shortCode": "CBH",
+    "regionId": 2
+  },
+  {
+    "LID": 62,
+    "location": "Islampur",
+    "location_shortCode": "ISL",
+    "regionId": 2
+  },
+  {
+    "LID": 63,
+    "location": "Raiganj",
+    "location_shortCode": "RGN",
+    "regionId": 2
+  },
+  {
+    "LID": 64,
+    "location": "Balurghat",
+    "location_shortCode": "BLR",
+    "regionId": 3
+  },
+  {
+    "LID": 65,
+    "location": "Malda",
+    "location_shortCode": "MLD",
+    "regionId": 3
+  },
+  {
+    "LID": 67,
+    "location": "Shri Rampur",
+    "location_shortCode": "SHR",
+    "regionId": 2
+  },
+  {
+    "LID": 68,
+    "location": "Dudia",
+    "location_shortCode": "DDA",
+    "regionId": 2
+  },
+  {
+    "LID": 69,
+    "location": "Chota Mangwa",
+    "location_shortCode": "CHM",
+    "regionId": 2
+  },
+  {
+    "LID": 83,
+    "location": "Chapra",
+    "location_shortCode": "CHP",
+    "regionId": 6
+  },
+  {
+    "LID": 84,
+    "location": "Tezpur",
+    "location_shortCode": "TZP",
+    "regionId": 5
+  },
+  {
+    "LID": 85,
+    "location": "Dimapur",
+    "location_shortCode": "DMP",
+    "regionId": 5
+  },
+  {
+    "LID": 86,
+    "location": "Jorhat",
+    "location_shortCode": "JOR",
+    "regionId": 5
+  },
+  {
+    "LID": 87,
+    "location": "NJP",
+    "location_shortCode": "NJP",
+    "regionId": 2
+  },
+  {
+    "LID": 88,
+    "location": "Iccha gaon",
+    "location_shortCode": "ICC",
+    "regionId": 2
+  },
+  {
+    "LID": 89,
+    "location": "Bhadrapur Airport ",
+    "location_shortCode": "CAN",
+    "regionId": 7
+  },
+  {
+    "LID": 90,
+    "location": "Kaziranga",
+    "location_shortCode": "KZG",
+    "regionId": 5
+  },
+  {
+    "LID": 91,
+    "location": "Bomdila",
+    "location_shortCode": "BOM",
+    "regionId": 5
+  },
+  {
+    "LID": 92,
+    "location": "Tawang",
+    "location_shortCode": "TWG",
+    "regionId": 5
+  },
+  {
+    "LID": 93,
+    "location": "Itanagar",
+    "location_shortCode": "ITG",
+    "regionId": 5
+  }
+]

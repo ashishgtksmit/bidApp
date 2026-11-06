@@ -199,6 +199,8 @@ class UserBankDetailsUpdate(TrimmedBaseModel):
     bankName: str = Field(..., min_length=1)
     # Transitional only — JWT sub is authoritative.
     userAppId: Optional[str] = None
+    # PR49 — required only when BANK_CHANGE_OTP_REQUIRED=1 and details change.
+    otp: Optional[str] = Field(default=None, pattern=r"^\d{4,8}$")
 
     @field_validator("bankAccountHolderName", "bankName")
     @classmethod
