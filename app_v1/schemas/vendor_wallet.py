@@ -26,6 +26,8 @@ class VendorWalletTransactionItem(BaseModel):
     amountPaise: int
     balanceAfterPaise: int
     description: Optional[str] = None
+    # App side that caused the entry: CUSTOMER / VENDOR; null = ops/system.
+    source: Optional[str] = None
     createdAt: str
 
 
@@ -49,6 +51,7 @@ class WalletRechargeOrder(BaseModel):
     environment: str
     paymentSessionId: Optional[str] = None
     creditedTransactionId: Optional[str] = None
+    source: Optional[str] = None
 
 
 # --- PR48 withdrawal --------------------------------------------------------
@@ -77,6 +80,8 @@ class WalletWithdrawalPreflight(BaseModel):
     dailyLimitPaise: int
     dailyRemainingPaise: int
     feeSlabs: List[WalletFeeSlab]
+    # e.g. VENDOR_ACCESS_RESTRICTED when withdrawal is not allowed; null = allowed.
+    withdrawalBlockedReason: Optional[str] = None
 
 
 class WalletWithdrawalOtpResponse(BaseModel):
@@ -102,6 +107,7 @@ class WalletWithdrawalItem(BaseModel):
     resolvedAt: Optional[str] = None
     utr: Optional[str] = None
     rejectionReason: Optional[str] = None
+    source: Optional[str] = None
 
 
 class WalletWithdrawalList(BaseModel):

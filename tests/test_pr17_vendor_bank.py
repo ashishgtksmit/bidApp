@@ -341,7 +341,8 @@ def test_missing_jwt_user_404(db_session):
 # --- Eligibility ------------------------------------------------------------
 
 
-def test_customer_only_vendor_not_eligible(db_session):
+def test_customer_only_user_allowed(db_session):
+    """Single wallet: any unlocked user may register bank details."""
     db, engine, Session = db_session
     _add_user(
         db,
@@ -352,14 +353,13 @@ def test_customer_only_vendor_not_eligible(db_session):
     )
     client = _pr17_client(engine, Session, CUSTOMER_ID)
     get_resp = client.get("/getregisteredbankaccount")
-    assert get_resp.status_code == 403
-    assert get_resp.json()["detail"] == "VENDOR_NOT_ELIGIBLE"
+    assert get_resp.status_code == 200
     put_resp = client.put("/updatevendorbankdetails", json=_valid_put())
-    assert put_resp.status_code == 403
-    assert put_resp.json()["detail"] == "VENDOR_NOT_ELIGIBLE"
+    assert put_resp.status_code == 200
+    assert put_resp.json()["message"] == "UPDATED"
 
 
-def test_pending_vendor_not_eligible(db_session):
+def test_pending_vendor_allowed(db_session):
     db, engine, Session = db_session
     _add_user(
         db,
@@ -371,11 +371,10 @@ def test_pending_vendor_not_eligible(db_session):
     )
     client = _pr17_client(engine, Session, PENDING_VENDOR)
     get_resp = client.get("/getregisteredbankaccount")
-    assert get_resp.status_code == 403
-    assert get_resp.json()["detail"] == "VENDOR_NOT_ELIGIBLE"
+    assert get_resp.status_code == 200
+    assert get_resp.json()["hasBankAccount"] is True
     put_resp = client.put("/updatevendorbankdetails", json=_valid_put())
-    assert put_resp.status_code == 403
-    assert put_resp.json()["detail"] == "VENDOR_NOT_ELIGIBLE"
+    assert put_resp.status_code == 200
 
 
 def test_approved_unlocked_vendor_allowed(db_session):
@@ -408,7 +407,7 @@ def test_lock_app_account_locked(db_session):
     assert put_resp.json()["detail"] == "ACCOUNT_LOCKED"
 
 
-def test_approval_revoked_before_transaction_rejected(db_session):
+def test_approval_revoked_still_allows_bank_update(db_session):
     db, engine, Session = db_session
     _add_user(db, user_app_id=APPROVED_VENDOR, uid=1)
     client = _pr17_client(engine, Session, APPROVED_VENDOR)
@@ -417,8 +416,7 @@ def test_approval_revoked_before_transaction_rejected(db_session):
     )
     db.commit()
     response = client.put("/updatevendorbankdetails", json=_valid_put())
-    assert response.status_code == 403
-    assert response.json()["detail"] == "VENDOR_NOT_ELIGIBLE"
+    assert response.status_code == 200
 
 
 def test_lock_applied_before_transaction_rejected(db_session):

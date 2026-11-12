@@ -283,10 +283,10 @@ def test_bank_unchanged_needs_no_otp(env, monkeypatch):
     assert result.message == "UPDATED"
 
 
-def test_bank_otp_not_for_customers(env):
+def test_bank_otp_allowed_for_customers(env):
     _, Session = env
     resp = _client(Session, _auth(CUSTOMER, CUSTOMER_UID)).post("/vendor/bank-details/otp")
-    assert resp.status_code == 403
+    assert resp.status_code == 200
 
 
 def test_withdrawal_and_bank_otps_are_separate(env, monkeypatch):
@@ -639,8 +639,10 @@ def test_statement_emails_csv(env, statement_mail):
     assert not os.path.exists(mail["attachment_path"])
     rows = mail["csv_rows"]
     assert rows[0][0] == "Date (IST)"
-    assert rows[1][4] == "500.00" and rows[1][5] == ""
-    assert rows[2][5] == "100.00" and rows[2][6] == "400.00"
+    assert rows[0][4] == "Side"
+    assert rows[1][4] == "OpenBid"
+    assert rows[1][5] == "500.00" and rows[1][6] == ""
+    assert rows[2][6] == "100.00" and rows[2][7] == "400.00"
     assert rows[2][3] == "'=HYPERLINK(evil)"
 
 

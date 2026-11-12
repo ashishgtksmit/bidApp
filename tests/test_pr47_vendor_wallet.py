@@ -365,6 +365,7 @@ def test_history_newest_first_and_contract(env):
         "amountPaise",
         "balanceAfterPaise",
         "description",
+        "source",
         "createdAt",
     }
     assert item["transactionId"].startswith("WT")

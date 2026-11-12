@@ -1,8 +1,12 @@
-"""PR48 vendor wallet withdrawal to the registered bank account (manual payout).
+"""PR48 wallet withdrawal to the registered bank account (manual payout).
+
+One wallet per user; requests come from the customer or vendor side and the
+row records which (``source``). Vendor applicants who are not approved
+cannot withdraw from either side.
 
 Request: OTP-confirmed, holds amount + fee, emails the ops mailbox.
 Ops then marks it PAID (with UTR; hold is debited) or REJECTED (hold released)
-through internal endpoints. The vendor API never returns the full account no.
+through internal endpoints. The app API never returns the full account no.
 """
 
 from __future__ import annotations
@@ -21,7 +25,12 @@ from sqlalchemy.orm import Session
 
 from ..auth.deps import AuthenticatedUser
 from ..crud.user import _has_bank_account, _mask_bank_account_mobile
-from ..crud.vendor_wallet import _load_eligible_vendor
+from ..crud.vendor_wallet import (
+    SIDE_CUSTOMER,
+    SIDE_VENDOR,
+    enforce_withdrawal_allowed,
+    load_wallet_owner,
+)
 from ..models.user_table import User
 from ..models.vendor_wallet import (
     VendorWallet,
@@ -184,19 +193,30 @@ def _to_item(row: VendorWalletWithdrawal) -> WalletWithdrawalItem:
         resolvedAt=_fmt_dt(row.resolved_at),
         utr=row.utr,
         rejectionReason=row.rejection_reason,
+        source=row.source,
     )
 
 
-# --- Vendor: preflight ------------------------------------------------------
+def _blocked_reason(user: User) -> Optional[str]:
+    try:
+        enforce_withdrawal_allowed(user)
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
+# --- Preflight ----------------------------------------------------------------
 
 
 def get_withdrawal_preflight(
     db: Session,
     current_user: AuthenticatedUser,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletWithdrawalPreflight:
     _require_enabled()
     try:
-        user = _load_eligible_vendor(db, current_user)
+        user = load_wallet_owner(db, current_user, side)
         available = _available_paise(db, current_user.uid)
         today = _withdrawn_today_paise(db, current_user.uid)
     except HTTPException:
@@ -220,26 +240,30 @@ def get_withdrawal_preflight(
         dailyLimitPaise=daily,
         dailyRemainingPaise=max(daily - today, 0),
         feeSlabs=[WalletFeeSlab(upToPaise=upper, feePaise=fee) for upper, fee in FEE_SLABS],
+        withdrawalBlockedReason=_blocked_reason(user),
     )
 
 
-# --- Vendor: OTP ------------------------------------------------------------
+# --- OTP ----------------------------------------------------------------------
 
 
 def send_withdrawal_otp(
     db: Session,
     current_user: AuthenticatedUser,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletWithdrawalOtpResponse:
-    """Bank check, then penny drop (when enabled), then SMS OTP — so a vendor
+    """Bank check, then penny drop (when enabled), then SMS OTP — so a user
     with an unverifiable account learns it before receiving an OTP."""
     _require_enabled()
     try:
-        user = _load_eligible_vendor(db, current_user)
+        user = load_wallet_owner(db, current_user, side)
     except HTTPException:
         raise
     except SQLAlchemyError:
         db.rollback()
         raise _db_error("otp_user") from None
+    enforce_withdrawal_allowed(user)
     _require_bank(user)
     ensure_bank_verified(db, user)
 
@@ -264,7 +288,7 @@ def _consume_otp(db: Session, user_uid: int, otp: str) -> None:
     )
 
 
-# --- Vendor: create / list --------------------------------------------------
+# --- Create / list ----------------------------------------------------------
 
 
 def _find_by_client_key(db: Session, user_uid: int, key: str) -> Optional[VendorWalletWithdrawal]:
@@ -283,12 +307,14 @@ def create_withdrawal(
     current_user: AuthenticatedUser,
     payload: WalletWithdrawalCreateRequest,
     background_tasks: Optional[BackgroundTasks] = None,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletWithdrawalItem:
     _require_enabled()
     uid = current_user.uid
     amount = payload.amountPaise
     try:
-        user = _load_eligible_vendor(db, current_user)
+        user = load_wallet_owner(db, current_user, side)
         existing = _find_by_client_key(db, uid, payload.idempotencyKey)
     except HTTPException:
         raise
@@ -300,6 +326,7 @@ def create_withdrawal(
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_KEY_REUSED")
         return _to_item(existing)
 
+    enforce_withdrawal_allowed(user)
     _require_bank(user)
     verification = ensure_bank_verified(db, user)
     try:
@@ -328,6 +355,7 @@ def create_withdrawal(
             bank_ifsc=str(user.bankIFSC).strip().upper(),
             bank_name=(str(user.bankName).strip() if user.bankName else None),
             bank_verification_note=verification_note(verification),
+            source=side,
             requested_at=_ist_now_naive(),
         )
         db.add(row)
@@ -368,9 +396,11 @@ def _push(background_tasks: Optional[BackgroundTasks], uid: int, title: str, bod
 def list_withdrawals(
     db: Session,
     current_user: AuthenticatedUser,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletWithdrawalList:
     try:
-        _load_eligible_vendor(db, current_user)
+        load_wallet_owner(db, current_user, side)
         rows = (
             db.query(VendorWalletWithdrawal)
             .filter(VendorWalletWithdrawal.user_uid == current_user.uid)
@@ -389,6 +419,14 @@ def list_withdrawals(
 # --- Ops email ---------------------------------------------------------------
 
 
+def _side_label(source: Optional[str]) -> str:
+    if source == SIDE_CUSTOMER:
+        return "Customer side of the app"
+    if source == SIDE_VENDOR:
+        return "Vendor side of the app"
+    return "Unknown"
+
+
 def _ops_email_body(
     row: VendorWalletWithdrawal,
     user: User,
@@ -401,22 +439,24 @@ def _ops_email_body(
     ttl_days = max(1, wallet_ops_links.ops_link_ttl_seconds() // 86400)
     return "\n".join(
         [
-            "A vendor has requested a withdrawal from their OpenBid wallet.",
+            "A user has requested a withdrawal from their OpenBid wallet.",
             "",
             f"Withdrawal ID     : {row.withdrawal_ref}",
             f"Requested at (IST): {_fmt_dt(row.requested_at)}",
+            f"Requested from    : {_side_label(row.source)}",
             "",
-            "VENDOR",
+            "USER",
             f"Name              : {getattr(user, 'fullName', '') or ''}",
             f"Phone             : {getattr(user, 'userAppId', '') or ''}",
             f"Email             : {getattr(user, 'emailId', '') or ''}",
+            f"Vendor account    : {'Approved vendor' if getattr(user, 'vendorApproved', False) else 'No'}",
             "",
             "AMOUNT",
-            f"Transfer to vendor: {_rupees(int(row.amount_paise))}",
+            f"Transfer to user  : {_rupees(int(row.amount_paise))}",
             f"Withdrawal fee    : {_rupees(int(row.fee_paise))} (kept by OpenBid)",
             f"Held from wallet  : {_rupees(total)}",
             "",
-            "BANK ACCOUNT (registered by the vendor)",
+            "BANK ACCOUNT (registered by the user)",
             f"Account holder    : {row.bank_account_holder_name}",
             f"Account number    : {row.bank_account_no}",
             f"IFSC              : {row.bank_ifsc}",
@@ -425,21 +465,21 @@ def _ops_email_body(
             "",
             "WHAT TO DO",
             f"1. Transfer exactly {_rupees(int(row.amount_paise))} to the account above by IMPS/NEFT.",
-            "   Check the account holder name matches the vendor before paying.",
+            "   Check the account holder name matches the user before paying.",
             "2. After the transfer succeeds, open this link and enter the bank UTR:",
             f"   {paid_url}",
             "3. If you cannot pay (details wrong, suspicious request), open this link",
-            "   and enter a short reason (shown to the vendor):",
+            "   and enter a short reason (shown to the user):",
             f"   {reject_url}",
             "",
             f"These links expire in {ttl_days} day(s) and can each be used once.",
-            "Until one of these is done, the amount stays on hold in the vendor's wallet.",
+            "Until one of these is done, the amount stays on hold in the user's wallet.",
             "",
             "Automation fallback (ops key required):",
             f"   POST {api_base}/internal/wallet/withdrawals/{row.withdrawal_ref}/paid",
             '   Header X-OpenBid-Wallet-Ops-Key, body {"utr": "<UTR>"}',
             f"   POST {api_base}/internal/wallet/withdrawals/{row.withdrawal_ref}/rejected",
-            '   Header X-OpenBid-Wallet-Ops-Key, body {"reason": "<reason shown to vendor>"}',
+            '   Header X-OpenBid-Wallet-Ops-Key, body {"reason": "<reason shown to user>"}',
             "Pending requests: GET /internal/wallet/withdrawals?status=REQUESTED",
             "",
             "This mailbox contains bank details. Do not forward outside the accounts team.",
@@ -565,6 +605,7 @@ def _apply_paid_on_locked_row(
         description=f"Withdrawal to bank {_mask_bank_account_mobile(row.bank_account_no)} (UTR {utr})",
         reference_id=row.withdrawal_ref,
         consume_hold_paise=int(row.amount_paise),
+        source=row.source,
     )
     if int(row.fee_paise) > 0:
         apply_wallet_entry(
@@ -577,6 +618,7 @@ def _apply_paid_on_locked_row(
             description="Withdrawal fee",
             reference_id=row.withdrawal_ref,
             consume_hold_paise=int(row.fee_paise),
+            source=row.source,
         )
     row.status = STATUS_PAID
     row.utr = utr

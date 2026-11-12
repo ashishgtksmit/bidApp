@@ -1,8 +1,8 @@
-"""PR47 vendor wallet ledger (PR50: also customer wallets).
+"""PR47 wallet ledger — one wallet per user (customer and vendor share it).
 
-The only module allowed to change wallet balances. Defaults to the vendor
-tables; pass ``wallet_model=CustomerWallet`` and
-``txn_model=CustomerWalletTransaction`` for the customer wallet.
+The only module allowed to change ``VendorWallet.balance_paise``.
+Each ledger row records ``source`` — the app side the action came from
+(``CUSTOMER`` / ``VENDOR``), or None for ops/system entries.
 Callers own the DB transaction (commit / rollback); this module only flushes.
 """
 
@@ -23,6 +23,10 @@ CURRENCY = "INR"
 DIRECTION_CREDIT = "CREDIT"
 DIRECTION_DEBIT = "DEBIT"
 DIRECTIONS = frozenset({DIRECTION_CREDIT, DIRECTION_DEBIT})
+
+SOURCE_CUSTOMER = "CUSTOMER"
+SOURCE_VENDOR = "VENDOR"
+SOURCES = frozenset({SOURCE_CUSTOMER, SOURCE_VENDOR})
 
 TXN_TYPE_RECHARGE = "RECHARGE"
 TXN_TYPE_WITHDRAWAL = "WITHDRAWAL"
@@ -61,12 +65,10 @@ def _validate_amount(amount_paise: int, *, allow_zero: bool = False) -> None:
         raise WalletLedgerError("amount must be positive")
 
 
-def hold_funds(
-    db: Session, *, user_uid: int, amount_paise: int, wallet_model=VendorWallet
-):
+def hold_funds(db: Session, *, user_uid: int, amount_paise: int) -> VendorWallet:
     """Reserve available funds (pending withdrawal). Caller commits."""
     _validate_amount(amount_paise)
-    wallet = lock_or_create_wallet(db, user_uid, wallet_model=wallet_model)
+    wallet = lock_or_create_wallet(db, user_uid)
     balance = int(wallet.balance_paise or 0)
     held = int(wallet.held_paise or 0)
     if amount_paise > balance - held:
@@ -76,12 +78,10 @@ def hold_funds(
     return wallet
 
 
-def release_held_funds(
-    db: Session, *, user_uid: int, amount_paise: int, wallet_model=VendorWallet
-):
+def release_held_funds(db: Session, *, user_uid: int, amount_paise: int) -> VendorWallet:
     """Return reserved funds to available (rejected withdrawal). Caller commits."""
     _validate_amount(amount_paise)
-    wallet = lock_or_create_wallet(db, user_uid, wallet_model=wallet_model)
+    wallet = lock_or_create_wallet(db, user_uid)
     held = int(wallet.held_paise or 0)
     if amount_paise > held:
         raise WalletLedgerError("release exceeds held funds")
@@ -90,21 +90,20 @@ def release_held_funds(
     return wallet
 
 
-def _new_txn_ref(txn_model) -> str:
-    prefix = getattr(txn_model, "TXN_REF_PREFIX", "WT")
-    return f"{prefix}{uuid.uuid4().hex[:24].upper()}"
+def _new_txn_ref() -> str:
+    return f"WT{uuid.uuid4().hex[:24].upper()}"
 
 
-def lock_or_create_wallet(db: Session, user_uid: int, *, wallet_model=VendorWallet):
+def lock_or_create_wallet(db: Session, user_uid: int) -> VendorWallet:
     """Return the user's wallet row locked FOR UPDATE, creating it if absent."""
     wallet = (
-        db.query(wallet_model)
-        .filter(wallet_model.user_uid == user_uid)
+        db.query(VendorWallet)
+        .filter(VendorWallet.user_uid == user_uid)
         .with_for_update()
         .first()
     )
     if wallet is None:
-        wallet = wallet_model(
+        wallet = VendorWallet(
             user_uid=user_uid,
             balance_paise=0,
             held_paise=0,
@@ -126,9 +125,8 @@ def apply_wallet_entry(
     description: Optional[str] = None,
     reference_id: Optional[str] = None,
     consume_hold_paise: int = 0,
-    wallet_model=VendorWallet,
-    txn_model=VendorWalletTransaction,
-):
+    source: Optional[str] = None,
+) -> VendorWalletTransaction:
     """Append one SUCCESS ledger row and move the balance.
 
     Replaying the same ``idempotency_key`` returns the original row without
@@ -143,16 +141,18 @@ def apply_wallet_entry(
         raise WalletLedgerError("invalid direction")
     if txn_type not in TXN_TYPES:
         raise WalletLedgerError("invalid txn_type")
+    if source is not None and source not in SOURCES:
+        raise WalletLedgerError("invalid source")
     _validate_amount(amount_paise)
     key = (idempotency_key or "").strip()
     if not key:
         raise WalletLedgerError("idempotency_key required")
 
-    wallet = lock_or_create_wallet(db, user_uid, wallet_model=wallet_model)
+    wallet = lock_or_create_wallet(db, user_uid)
 
     existing = (
-        db.query(txn_model)
-        .filter(txn_model.idempotency_key == key)
+        db.query(VendorWalletTransaction)
+        .filter(VendorWalletTransaction.idempotency_key == key)
         .first()
     )
     if existing is not None:
@@ -172,8 +172,8 @@ def apply_wallet_entry(
     else:
         new_balance = balance + amount_paise
 
-    txn = txn_model(
-        txn_ref=_new_txn_ref(txn_model),
+    txn = VendorWalletTransaction(
+        txn_ref=_new_txn_ref(),
         user_uid=user_uid,
         direction=direction,
         txn_type=txn_type,
@@ -183,6 +183,7 @@ def apply_wallet_entry(
         description=(description or None),
         reference_id=(reference_id or None),
         idempotency_key=key,
+        source=source,
         created_at=_ist_now_naive(),
     )
     wallet.balance_paise = new_balance

@@ -1,14 +1,21 @@
-"""PR47 vendor wallet read CRUD (balance + transaction history).
+"""PR47 wallet read CRUD (balance + transaction history) and app-side access.
 
-JWT-owned via AuthenticatedUser.uid. Approved, unlocked vendors only.
-Read paths never create wallet rows; a missing wallet reads as zero.
+One wallet per user, shared by the customer and vendor sides of the app
+(single wallet, 2026-11-12). ``side`` is the app side calling:
+- ``VENDOR`` (``/vendor/wallet/*``): approved, unlocked vendors only.
+- ``CUSTOMER`` (``/customer/wallet/*``): any unlocked user.
+Withdrawals are additionally blocked for vendors who are not approved
+(see ``enforce_withdrawal_allowed``).
+
+JWT-owned via AuthenticatedUser.uid. Read paths never create wallet rows;
+a missing wallet reads as zero.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta
-from typing import Callable, Optional
+from typing import Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,7 +31,7 @@ from ..schemas.vendor_wallet import (
     VendorWalletTransactionItem,
     VendorWalletTransactionPage,
 )
-from ..services.vendor_wallet_ledger import CURRENCY
+from ..services.vendor_wallet_ledger import CURRENCY, SOURCE_CUSTOMER, SOURCE_VENDOR
 
 logger = logging.getLogger(__name__)
 
@@ -32,40 +39,65 @@ DEFAULT_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 50
 MAX_RANGE_MONTHS = 24
 
+SIDE_CUSTOMER = SOURCE_CUSTOMER
+SIDE_VENDOR = SOURCE_VENDOR
 
-def _load_eligible_vendor(db: Session, current_user: AuthenticatedUser) -> User:
+
+def _load_user(db: Session, current_user: AuthenticatedUser) -> User:
     user = db.query(User).filter(User.UID == current_user.uid).first()
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="USER_NOT_FOUND",
         )
+    return user
+
+
+def _load_eligible_vendor(db: Session, current_user: AuthenticatedUser) -> User:
+    user = _load_user(db, current_user)
     _enforce_approved_vendor_eligibility(user)
     return user
 
 
-def get_vendor_wallet_summary(
-    db: Session,
-    current_user: AuthenticatedUser,
-) -> VendorWalletSummary:
-    return read_wallet_summary(
-        db, current_user, wallet_model=VendorWallet, load_owner=_load_eligible_vendor
-    )
+def load_wallet_owner(db: Session, current_user: AuthenticatedUser, side: str) -> User:
+    """Load the caller and apply the gate for the app side in use."""
+    if side == SIDE_VENDOR:
+        return _load_eligible_vendor(db, current_user)
+    if side != SIDE_CUSTOMER:
+        raise ValueError(f"unknown wallet side {side!r}")
+    user = _load_user(db, current_user)
+    if bool(getattr(user, "lockApp", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ACCOUNT_LOCKED",
+        )
+    return user
 
 
-def read_wallet_summary(
+def enforce_withdrawal_allowed(user: User) -> None:
+    """A vendor applicant who is not approved (pending, rejected, or vendor
+    access locked) cannot withdraw from either side; they can still view
+    and recharge. Users who never applied as vendors can withdraw."""
+    if bool(getattr(user, "alsoVendor", False)) and not bool(
+        getattr(user, "vendorApproved", False)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="VENDOR_ACCESS_RESTRICTED",
+        )
+
+
+def get_wallet_summary(
     db: Session,
     current_user: AuthenticatedUser,
     *,
-    wallet_model,
-    load_owner: Callable[[Session, AuthenticatedUser], User],
+    side: str,
 ) -> VendorWalletSummary:
-    """Shared by the vendor (PR47) and customer (PR50) wallets."""
     try:
-        load_owner(db, current_user)
+        load_wallet_owner(db, current_user, side)
         wallet = (
-            db.query(wallet_model)
-            .filter(wallet_model.user_uid == current_user.uid)
+            db.query(VendorWallet)
+            .filter(VendorWallet.user_uid == current_user.uid)
             .first()
         )
     except HTTPException:
@@ -95,6 +127,13 @@ def read_wallet_summary(
     )
 
 
+def get_vendor_wallet_summary(
+    db: Session,
+    current_user: AuthenticatedUser,
+) -> VendorWalletSummary:
+    return get_wallet_summary(db, current_user, side=SIDE_VENDOR)
+
+
 def _parse_cursor(cursor: Optional[str]) -> Optional[int]:
     if cursor is None or str(cursor).strip() == "":
         return None
@@ -107,7 +146,7 @@ def _parse_cursor(cursor: Optional[str]) -> Optional[int]:
     return int(text)
 
 
-def _to_item(row) -> VendorWalletTransactionItem:
+def _to_item(row: VendorWalletTransaction) -> VendorWalletTransactionItem:
     created = row.created_at
     created_str = (
         created.strftime("%Y-%m-%dT%H:%M:%S") if isinstance(created, datetime) else ""
@@ -120,44 +159,23 @@ def _to_item(row) -> VendorWalletTransactionItem:
         amountPaise=int(row.amount_paise),
         balanceAfterPaise=int(row.balance_after_paise),
         description=row.description,
+        source=row.source,
         createdAt=created_str,
     )
 
 
-def list_vendor_wallet_transactions(
+def list_wallet_transactions(
     db: Session,
     current_user: AuthenticatedUser,
     *,
+    side: str,
     limit: int = DEFAULT_PAGE_SIZE,
     cursor: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> VendorWalletTransactionPage:
-    """Newest-first ledger page. ``nextCursor`` is opaque to clients."""
-    return read_wallet_transactions(
-        db,
-        current_user,
-        txn_model=VendorWalletTransaction,
-        load_owner=_load_eligible_vendor,
-        limit=limit,
-        cursor=cursor,
-        start_date=start_date,
-        end_date=end_date,
-    )
-
-
-def read_wallet_transactions(
-    db: Session,
-    current_user: AuthenticatedUser,
-    *,
-    txn_model,
-    load_owner: Callable[[Session, AuthenticatedUser], User],
-    limit: int = DEFAULT_PAGE_SIZE,
-    cursor: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-) -> VendorWalletTransactionPage:
-    """Shared by the vendor (PR47) and customer (PR50) wallets."""
+    """Newest-first ledger page (both sides' entries). ``nextCursor`` is
+    opaque to clients."""
     has_start = start_date is not None and str(start_date).strip() != ""
     has_end = end_date is not None and str(end_date).strip() != ""
     if has_start ^ has_end:
@@ -183,18 +201,20 @@ def read_wallet_transactions(
     page_size = max(1, min(int(limit), MAX_PAGE_SIZE))
 
     try:
-        load_owner(db, current_user)
-        query = db.query(txn_model).filter(txn_model.user_uid == current_user.uid)
+        load_wallet_owner(db, current_user, side)
+        query = db.query(VendorWalletTransaction).filter(
+            VendorWalletTransaction.user_uid == current_user.uid
+        )
         if range_start is not None and range_end is not None:
             query = query.filter(
-                txn_model.created_at >= datetime.combine(range_start, time.min),
-                txn_model.created_at
+                VendorWalletTransaction.created_at >= datetime.combine(range_start, time.min),
+                VendorWalletTransaction.created_at
                 < datetime.combine(range_end + timedelta(days=1), time.min),
             )
         if before_id is not None:
-            query = query.filter(txn_model.id < before_id)
+            query = query.filter(VendorWalletTransaction.id < before_id)
         rows = (
-            query.order_by(txn_model.id.desc())
+            query.order_by(VendorWalletTransaction.id.desc())
             .limit(page_size + 1)
             .all()
         )
@@ -214,4 +234,24 @@ def read_wallet_transactions(
     return VendorWalletTransactionPage(
         items=[_to_item(row) for row in page],
         nextCursor=next_cursor,
+    )
+
+
+def list_vendor_wallet_transactions(
+    db: Session,
+    current_user: AuthenticatedUser,
+    *,
+    limit: int = DEFAULT_PAGE_SIZE,
+    cursor: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> VendorWalletTransactionPage:
+    return list_wallet_transactions(
+        db,
+        current_user,
+        side=SIDE_VENDOR,
+        limit=limit,
+        cursor=cursor,
+        start_date=start_date,
+        end_date=end_date,
     )

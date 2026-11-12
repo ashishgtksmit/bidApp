@@ -1,4 +1,4 @@
-"""PR48 vendor wallet recharge via Cashfree PG.
+"""PR48 wallet recharge via Cashfree PG (customer or vendor side; one wallet).
 
 The wallet is credited only by ``refresh_recharge``, after a server-side
 Cashfree order fetch whose order id, currency and amount match the stored
@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..auth.deps import AuthenticatedUser
-from ..crud.vendor_wallet import _load_eligible_vendor
+from ..crud.vendor_wallet import SIDE_VENDOR, load_wallet_owner
 from ..models.user_table import User
 from ..models.vendor_wallet import VendorWalletRecharge
 from ..schemas.vendor_wallet import WalletRechargeCreateRequest, WalletRechargeOrder
@@ -93,6 +93,7 @@ def _to_response(row: VendorWalletRecharge) -> WalletRechargeOrder:
         environment=row.environment,
         paymentSessionId=row.payment_session_id if row.status == STATUS_PENDING else None,
         creditedTransactionId=row.credited_txn_ref,
+        source=row.source,
     )
 
 
@@ -176,6 +177,8 @@ def create_recharge(
     db: Session,
     current_user: AuthenticatedUser,
     payload: WalletRechargeCreateRequest,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletRechargeOrder:
     config = _require_enabled_config()
     amount = payload.amountPaise
@@ -185,7 +188,7 @@ def create_recharge(
         raise HTTPException(status_code=422, detail="RECHARGE_ABOVE_MAX")
 
     try:
-        user = _load_eligible_vendor(db, current_user)
+        user = load_wallet_owner(db, current_user, side)
         existing = (
             db.query(VendorWalletRecharge)
             .filter(
@@ -224,6 +227,7 @@ def create_recharge(
         status=STATUS_CREATE_PENDING,
         environment=config.environment,
         client_idempotency_key=payload.idempotencyKey,
+        source=side,
         created_at=_ist_now_naive(),
     )
     try:
@@ -277,6 +281,7 @@ def _interpret_and_apply(db: Session, row: VendorWalletRecharge, order: dict) ->
             idempotency_key=f"cf:{row.order_id}",
             description="Wallet recharge",
             reference_id=row.order_id,
+            source=row.source,
         )
         row.status = STATUS_PAID
         row.failure_code = None
@@ -395,11 +400,13 @@ def get_recharge_status(
     current_user: AuthenticatedUser,
     order_id: str,
     background_tasks: Optional[BackgroundTasks] = None,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletRechargeOrder:
     if not ORDER_ID_PATTERN.match(order_id or ""):
         raise HTTPException(status_code=404, detail="RECHARGE_NOT_FOUND")
     try:
-        _load_eligible_vendor(db, current_user)
+        load_wallet_owner(db, current_user, side)
         row = (
             db.query(VendorWalletRecharge)
             .filter(

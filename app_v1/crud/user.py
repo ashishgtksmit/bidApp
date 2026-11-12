@@ -478,8 +478,14 @@ def _reject_user_app_id_mismatch(jwt_sub: str, user_app_id: Optional[str]) -> No
 
 
 def _enforce_bank_vendor_eligibility(user: User) -> None:
-    """PR17 bank GET/PUT eligibility — ACCOUNT_LOCKED before VENDOR_NOT_ELIGIBLE."""
-    _enforce_approved_vendor_eligibility(user)
+    """Bank details GET/PUT + bank-change OTP: any unlocked user, so customers
+    can withdraw from the shared wallet (single wallet, 2026-11-12; PR17 was
+    approved vendors only)."""
+    if bool(getattr(user, "lockApp", False)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ACCOUNT_LOCKED",
+        )
 
 
 def _enforce_approved_vendor_eligibility(user: User) -> None:

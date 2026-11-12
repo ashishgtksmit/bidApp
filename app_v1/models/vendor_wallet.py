@@ -15,6 +15,9 @@ _BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
 class VendorWallet(Base):
     """One wallet per user, keyed by immutable usertable.UID (PR47).
 
+    Shared by the customer and vendor sides of the app (single wallet,
+    2026-11-12); the table keeps its PR47 name.
+
     Amounts are integer paise. ``held_paise`` is reserved for pending
     withdrawals; available = balance - held. Rows are only changed through
     ``services.vendor_wallet_ledger`` under a row lock.
@@ -57,6 +60,8 @@ class VendorWalletTransaction(Base):
     description = Column(String(255), nullable=True)
     reference_id = Column(String(64), nullable=True)
     idempotency_key = Column(String(100), nullable=True, unique=True)
+    # App side that caused the entry: CUSTOMER / VENDOR; NULL = ops/system.
+    source = Column(String(10), nullable=True)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(
         DateTime,
@@ -92,6 +97,8 @@ class VendorWalletRecharge(Base):
     failure_code = Column(String(40), nullable=True)
     credited_txn_ref = Column(String(40), nullable=True)
     ops_alerted_at = Column(DateTime, nullable=True)
+    # App side the recharge was started from: CUSTOMER / VENDOR.
+    source = Column(String(10), nullable=True)
     created_at = Column(DateTime, nullable=False)
     paid_at = Column(DateTime, nullable=True)
     updated_at = Column(
@@ -129,6 +136,8 @@ class VendorWalletWithdrawal(Base):
     bank_name = Column(String(255), nullable=True)
     ops_email_status = Column(String(20), nullable=True)
     bank_verification_note = Column(String(255), nullable=True)
+    # App side the withdrawal was requested from: CUSTOMER / VENDOR.
+    source = Column(String(10), nullable=True)
     # Signed one-time ops email links (paid / rejected HTML forms).
     ops_link_paid_jti_hash = Column(String(64), nullable=True)
     ops_link_reject_jti_hash = Column(String(64), nullable=True)

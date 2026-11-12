@@ -1,5 +1,5 @@
-"""PR49 wallet statement: CSV of ledger rows emailed to the vendor's
-registered email address. Same date rules as GET /vendor/wallet/transactions
+"""PR49 wallet statement: CSV of ledger rows (both app sides, with a Side
+column) emailed to the user's registered email address. Same date rules as GET /vendor/wallet/transactions
 (yyyy-MM-dd inclusive, Asia/Kolkata, max 24 months)."""
 
 from __future__ import annotations
@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 
 from ..auth.deps import AuthenticatedUser
 from ..crud.vendor_earnings import _calendar_months_spanned, _parse_report_date
-from ..crud.vendor_wallet import MAX_RANGE_MONTHS, _load_eligible_vendor
+from ..crud.vendor_wallet import (
+    MAX_RANGE_MONTHS,
+    SIDE_CUSTOMER,
+    SIDE_VENDOR,
+    load_wallet_owner,
+)
 from ..models.vendor_wallet import VendorWalletTransaction
 from ..schemas.vendor_wallet import WalletStatementRequest, WalletStatementResponse
 from ..services.wallet_notifications import rupees
@@ -36,6 +41,7 @@ _TYPE_LABELS = {
     "WITHDRAWAL_REVERSAL": "Withdrawal Reversed",
     "ADJUSTMENT": "Adjustment",
 }
+_SIDE_LABELS = {SIDE_CUSTOMER: "Customer", SIDE_VENDOR: "Vendor"}
 
 
 def _mask_email(email: str) -> str:
@@ -57,6 +63,8 @@ def email_wallet_statement(
     db: Session,
     current_user: AuthenticatedUser,
     payload: WalletStatementRequest,
+    *,
+    side: str = SIDE_VENDOR,
 ) -> WalletStatementResponse:
     start = _parse_report_date(payload.startDate, "startDate")
     end = _parse_report_date(payload.endDate, "endDate")
@@ -66,7 +74,7 @@ def email_wallet_statement(
         raise HTTPException(status_code=422, detail="WALLET_RANGE_TOO_LARGE")
 
     try:
-        user = _load_eligible_vendor(db, current_user)
+        user = load_wallet_owner(db, current_user, side)
     except HTTPException:
         raise
     except SQLAlchemyError:
@@ -113,7 +121,7 @@ def email_wallet_statement(
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(
-                ["Date (IST)", "Transaction ID", "Type", "Description", "Credit (INR)", "Debit (INR)", "Balance After (INR)", "Status"]
+                ["Date (IST)", "Transaction ID", "Type", "Description", "Side", "Credit (INR)", "Debit (INR)", "Balance After (INR)", "Status"]
             )
             for r in rows:
                 amount = _amount(int(r.amount_paise))
@@ -123,6 +131,7 @@ def email_wallet_statement(
                         r.txn_ref,
                         _TYPE_LABELS.get(r.txn_type, r.txn_type),
                         _csv_cell(r.description or ""),
+                        _SIDE_LABELS.get(r.source, "OpenBid"),
                         amount if r.direction == "CREDIT" else "",
                         amount if r.direction == "DEBIT" else "",
                         _amount(int(r.balance_after_paise)),
@@ -131,7 +140,7 @@ def email_wallet_statement(
                 )
         body = "\n".join(
             [
-                f"Dear {getattr(user, 'fullName', '') or 'Vendor'},",
+                f"Dear {getattr(user, 'fullName', '') or 'OpenBid user'},",
                 "",
                 f"Your OpenBid wallet statement for {period} is attached.",
                 "",
@@ -150,7 +159,7 @@ def email_wallet_statement(
             from_address=(os.getenv("WALLET_STATEMENT_EMAIL_FROM") or "reservations@wizzride.com").strip(),
             from_name="OpenBid Wallet",
             to_address=email,
-            to_name=str(getattr(user, "fullName", "") or "Vendor"),
+            to_name=str(getattr(user, "fullName", "") or "OpenBid user"),
             attachment_path=path,
             is_html=False,
         )

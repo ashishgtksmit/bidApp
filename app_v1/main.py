@@ -30,10 +30,7 @@ from .models import otp_challenge as _otp_challenge_models  # noqa: F401
 # Ensure PR14 driver OTP challenge / token tables are registered before create_all.
 from .models import driver_otp as _driver_otp_models  # noqa: F401
 # Ensure PR47 vendor wallet tables are registered before create_all.
-from .models import vendor_wallet as _vendor_wallet_models  # noqa: F401
-# Ensure PR50 customer wallet tables are registered before create_all.
-from .models import customer_wallet as _customer_wallet_models  # noqa: F401
-import traceback
+from .models import vendor_wallet as _vendor_wallet_models  # noqa: F401import traceback
 
 
 @asynccontextmanager
