@@ -164,6 +164,9 @@ def vendor_can_view_request_bids(
     return _request_matches_vendor_open_feed(db, vendor, request_row)
 
 
+_MASKED_COMPETITOR_BIDDER_NAME = "Bidder"
+
+
 def _recompute_no_of_bids(db: Session, rid: int) -> int:
     """COUNT of all bid rows for RID (active lifecycle rows)."""
     count = (
@@ -172,7 +175,10 @@ def _recompute_no_of_bids(db: Session, rid: int) -> int:
     return int(count)
 
 
-def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
+def _build_vendor_bid_details(
+    db: Session, rid: int, viewer_user_id: str
+) -> list[VendorBidDetail]:
+    """Build vendor bid rows; mask competitor name/photo for the viewing vendor."""
     bids = (
         db.query(
             BidDetail,
@@ -195,6 +201,7 @@ def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
         .all()
     )
 
+    viewer = str(viewer_user_id).strip()
     result: list[VendorBidDetail] = []
     for (
         bid,
@@ -208,16 +215,17 @@ def _build_vendor_bid_details(db: Session, rid: int) -> list[VendorBidDetail]:
         car_reg_no,
         car_model,
     ) in bids:
+        is_own = str(bid.bidderID).strip() == viewer
         result.append(
             VendorBidDetail(
                 BIDID=bid.BID,
                 BIDDERID=str(bid.bidderID),
                 BIDAMOUNT=_as_float_amount(bid.bidAmount),
                 BIDSTATUS=bid.bidStatus,
-                BIDDERNAME=full_name,
+                BIDDERNAME=full_name if is_own else _MASKED_COMPETITOR_BIDDER_NAME,
                 BIDDERRATING=_as_float_amount(rating),
                 TOTALNOOFREVIEWS=_as_int_or_zero(total_reviews),
-                PROFILEPIC=profile_picture,
+                PROFILEPIC=profile_picture if is_own else None,
                 JOININGDATE=_as_optional_date(joining_date),
                 TAGS=_tag_names_from_csv(db, tags_str),
                 CARID=car_id,
@@ -236,6 +244,7 @@ def get_bids_for_request_for_vendor(db: Session, rid: int, user_id: str):
 
     Auth order: JWT vendor → load RID → BID - OPEN → eligibility → BID - OPEN bids.
     Empty → []. Never returns FCMTOKEN. Does not enforce bidEndTime.
+    Competitor bids: BIDDERNAME masked as "Bidder", PROFILEPIC null; own bid unchanged.
     """
     try:
         vendor = require_active_vendor(db, user_id)
@@ -259,7 +268,7 @@ def get_bids_for_request_for_vendor(db: Session, rid: int, user_id: str):
                 detail="Not authorized to view bids for this request",
             )
 
-        return _build_vendor_bid_details(db, rid)
+        return _build_vendor_bid_details(db, rid, viewer_user_id=user_id)
     except HTTPException:
         raise
     except SQLAlchemyError as e:

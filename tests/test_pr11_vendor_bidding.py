@@ -390,6 +390,8 @@ def test_vendor_get_bids_eligible_open_request(seeded_db):
     assert isinstance(result, list)
     assert len(result) == 1
     assert result[0].BIDAMOUNT == 1500
+    assert result[0].BIDDERNAME == "Bidder"
+    assert result[0].PROFILEPIC is None
     assert not hasattr(result[0], "FCMTOKEN") or "FCMTOKEN" not in result[0].model_dump()
 
 
@@ -482,6 +484,34 @@ def test_vendor_get_via_existing_bid_without_city_prefs(seeded_db):
         session, rid=req.RID, user_id=VENDOR_C
     )
     assert len(result) == 1
+
+
+def test_vendor_get_masks_competitor_name_and_photo(seeded_db):
+    """Own bid keeps identity; competitors get BIDDERNAME=Bidder and PROFILEPIC=null."""
+    seeded_db.query(User).filter(User.userAppId == VENDOR_A).update(
+        {"fullName": "Vendor A", "profilePicture": "https://cdn.example/a.jpg"}
+    )
+    seeded_db.query(User).filter(User.userAppId == VENDOR_B).update(
+        {"fullName": "Vendor B", "profilePicture": "https://cdn.example/b.jpg"}
+    )
+    seeded_db.commit()
+
+    req = _seed_request(seeded_db, no_of_bids=2)
+    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_A, amount=2000, car_id=1)
+    _seed_bid(seeded_db, rid=req.RID, bidder_id=VENDOR_B, amount=1000, car_id=2)
+    session = _reopen(seeded_db)
+    result = vendor_bid_mod.get_bids_for_request_for_vendor(
+        session, rid=req.RID, user_id=VENDOR_A
+    )
+    assert len(result) == 2
+    by_bidder = {b.BIDDERID: b for b in result}
+    own = by_bidder[VENDOR_A]
+    other = by_bidder[VENDOR_B]
+    assert own.BIDDERNAME == "Vendor A"
+    assert own.PROFILEPIC == "https://cdn.example/a.jpg"
+    assert other.BIDDERNAME == "Bidder"
+    assert other.PROFILEPIC is None
+    assert other.BIDAMOUNT == 1000.0
 
 
 # ---------------------------------------------------------------------------

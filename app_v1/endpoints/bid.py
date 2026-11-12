@@ -58,6 +58,7 @@ def get_all_bids_for_vendor(
     Active vendor + BID - OPEN + open-feed eligibility (or existing bid).
     Does not weaken customer GET ownership. Empty → []. No FCMTOKEN.
     Intentionally does not enforce bidEndTime.
+    Competitor BIDDERNAME/PROFILEPIC are masked; own bid identity is unchanged.
     """
     user_id = current_user.user_app_id
     return get_bids_for_request_for_vendor(db, rid=RID, user_id=user_id)

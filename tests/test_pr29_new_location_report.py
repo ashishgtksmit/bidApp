@@ -623,12 +623,12 @@ def test_50_html_escaped_when_reaching_template():
 # ---------------------------------------------------------------------------
 
 
-def test_51_missing_recipient_config(client, seeded, mock_sent, monkeypatch):
+def test_51_missing_recipient_config_uses_default_to(client, seeded, mock_sent, monkeypatch):
     monkeypatch.delenv("LOCATION_REPORT_EMAIL_TO", raising=False)
     r = client.post("/location-reports", json=_valid_body())
-    assert r.status_code == 503
-    assert r.json()["detail"] == "LOCATION_REPORT_CONFIGURATION_INVALID"
-    mock_sent.assert_not_called()
+    assert r.status_code == 200
+    assert r.json() == {"message": "REPORT_SUBMITTED"}
+    assert mock_sent.call_args.kwargs["to_address"] == "openbidadmin@wizzride.com"
 
 
 def test_52_invalid_from_config(client, seeded, mock_sent, monkeypatch):
@@ -697,12 +697,16 @@ def test_61_62_location_daily_and_normalization(client, seeded, mock_sent):
         json=_valid_body(locationName="  Tathangchen   Hill ", landmark="Gate A"),
     )
     assert r1.status_code == 200
+    assert mock_sent.call_count == 1
     r2 = client.post(
         "/location-reports",
         json=_valid_body(locationName="tathangchen hill", landmark="Gate B"),
     )
-    assert r2.status_code == 429
-    assert r2.json()["detail"] == "LOCATION_REPORT_RATE_LIMITED"
+    # Same location+region+usage already reported today → idempotent success,
+    # no duplicate admin email.
+    assert r2.status_code == 200
+    assert r2.json() == {"message": "REPORT_SUBMITTED"}
+    assert mock_sent.call_count == 1
 
 
 def test_63_different_usage_type_separate_bucket(client, seeded, mock_sent):
@@ -771,9 +775,27 @@ def test_66_validation_failures_do_not_consume_bucket(client, seeded, mock_sent)
         assert r.status_code == 200
 
 
-def test_67_rate_limit_code_stable(client, seeded, mock_sent):
+def test_67_same_location_idempotent_not_429(client, seeded, mock_sent):
     client.post("/location-reports", json=_valid_body())
     r = client.post("/location-reports", json=_valid_body())
+    assert r.status_code == 200
+    assert r.json() == {"message": "REPORT_SUBMITTED"}
+    assert mock_sent.call_count == 1
+
+
+def test_67b_sender_hourly_code_stable(client, seeded, mock_sent):
+    for i in range(5):
+        assert (
+            client.post(
+                "/location-reports",
+                json=_valid_body(locationName=f"Hourly {i}", landmark=f"H{i}"),
+            ).status_code
+            == 200
+        )
+    r = client.post(
+        "/location-reports",
+        json=_valid_body(locationName="Hourly six", landmark="H6"),
+    )
     assert r.status_code == 429
     assert r.json()["detail"] == "LOCATION_REPORT_RATE_LIMITED"
 

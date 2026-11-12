@@ -41,6 +41,8 @@ _LOCATION_WINDOW = int(
 )
 
 _DEFAULT_FROM = "customersupport@wizzride.com"
+# Operational default when LOCATION_REPORT_EMAIL_TO is unset (legacy admin inbox).
+_DEFAULT_TO = "openbidadmin@wizzride.com"
 _SUPPORTED_FROM = frozenset(
     {
         "reservations@wizzride.com",
@@ -148,7 +150,15 @@ def _parse_email_list(raw: Optional[str]) -> list[str]:
 
 
 def _load_mail_config() -> Dict[str, Any]:
-    to_list = _parse_email_list(os.getenv("LOCATION_REPORT_EMAIL_TO"))
+    raw_to = (os.getenv("LOCATION_REPORT_EMAIL_TO") or "").strip()
+    if not raw_to:
+        _logger.warning(
+            "location_report_mail_config category=%s detail=%s",
+            "missing_to_env",
+            "using_default_to",
+        )
+        raw_to = _DEFAULT_TO
+    to_list = _parse_email_list(raw_to)
     if not to_list:
         raise LocationReportError(503, "LOCATION_REPORT_CONFIGURATION_INVALID")
 
@@ -221,7 +231,13 @@ def _apply_rate_limits(
     location_name: str,
     region_name: str,
     usage_type: str,
-) -> None:
+) -> bool:
+    """Apply sender + same-location buckets.
+
+    Returns True when this exact location+region+usageType was already reported
+    in the daily window (idempotent accept — skip duplicate SMTP).
+    Raises 429 only for the hourly sender spam budget.
+    """
     sender_limited = enforce_rate_limit(
         db,
         bucket_key=f"location_report:sender:{_hash_part(reporter_id)}",
@@ -244,7 +260,13 @@ def _apply_rate_limits(
         window_seconds=_LOCATION_WINDOW,
     )
     if loc_limited is not None:
-        raise LocationReportError(429, "LOCATION_REPORT_RATE_LIMITED")
+        _logger.info(
+            "location_report_already_reported usage=%s reporter_hash=%s",
+            usage_type,
+            _hash_part(reporter_id),
+        )
+        return True
+    return False
 
 
 def submit_location_report(
@@ -285,13 +307,17 @@ def submit_location_report(
 
     mail_cfg = _load_mail_config()
 
-    _apply_rate_limits(
+    already_reported = _apply_rate_limits(
         db,
         reporter_id=str(reporter.userAppId),
         location_name=location_clean,
         region_name=region_name,
         usage_type=usage_type,
     )
+    if already_reported:
+        # Admin already notified for this place today — do not re-mail; still
+        # succeed so the client can accept the free-text place for booking.
+        return {"message": "REPORT_SUBMITTED"}
 
     reporter_name = _normalize_text(str(getattr(reporter, "fullName", "") or "")) or "—"
     reporter_phone = str(getattr(reporter, "userAppId", "") or "")

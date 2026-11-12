@@ -181,7 +181,8 @@ class CustomerBidDetail(BaseModel):
 class VendorBidDetail(BaseModel):
     """Vendor-safe bid list item for GET /getallbidsforrequestforvendor (PR11).
 
-    Same visible field set as customer View Bids UI needs. No FCMTOKEN.
+    Competitor rows mask BIDDERNAME as "Bidder" and PROFILEPIC as null for the
+    viewing vendor; own bid keeps real name/photo. No FCMTOKEN.
     """
 
     BIDID: int
