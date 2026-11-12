@@ -512,8 +512,11 @@ def test_withdrawal_holds_funds_and_emails_ops(env):
     assert ACCOUNT_NO in kwargs["message"]
     assert "SBIN0001234" in kwargs["message"]
     assert body["withdrawalId"] in kwargs["message"]
-    assert "/paid" in kwargs["message"] and "/rejected" in kwargs["message"]
-    assert db.query(VendorWalletWithdrawal).one().ops_email_status == "SENT"
+    assert "/ops/paid?t=" in kwargs["message"] and "/ops/rejected?t=" in kwargs["message"]
+    row = db.query(VendorWalletWithdrawal).one()
+    assert row.ops_email_status == "SENT"
+    assert row.ops_link_paid_jti_hash and row.ops_link_reject_jti_hash
+    assert row.ops_link_expires_at is not None
     listed = client.get("/vendor/wallet/withdrawals").json()["items"]
     assert listed[0]["withdrawalId"] == body["withdrawalId"]
     assert ACCOUNT_NO not in json.dumps(listed)
@@ -679,6 +682,97 @@ def test_vendor_cannot_call_ops_with_jwt(env):
     ref = _requested(db, Session)
     r = _vendor(Session).post(f"/internal/wallet/withdrawals/{ref}/paid", json={"utr": "UTR123456"})
     assert r.status_code == 403
+
+
+def _ops_link_from_email(message: str, action: str) -> tuple[str, str]:
+    """Return (path_with_query, token) for the signed ops link in the email body."""
+    marker = f"/internal/wallet/withdrawals/"
+    for line in message.splitlines():
+        line = line.strip()
+        if marker in line and f"/ops/{action}?t=" in line:
+            # May be absolute URL; keep path+query for TestClient.
+            idx = line.index(marker)
+            url = line[idx:]
+            token = url.split("?t=", 1)[1]
+            return url, token
+    raise AssertionError(f"no {action} ops link in email")
+
+
+def test_ops_signed_link_paid_flow(env):
+    db, Session = env
+    _fund(db, 300_000)
+    client = _client(Session)
+    with patch.object(withdrawal_crud, "send_email", return_value={"message": "SENT"}) as mail:
+        ref = _withdraw(_vendor(Session)).json()["withdrawalId"]
+    path, token = _ops_link_from_email(mail.call_args.kwargs["message"], "paid")
+    form = client.get(path)
+    assert form.status_code == 200
+    assert "Mark withdrawal paid" in form.text
+    assert "name=\"utr\"" in form.text
+    assert token in form.text
+    posted = client.post(
+        f"/internal/wallet/withdrawals/{ref}/ops/paid",
+        data={"t": token, "utr": "HDFC123456"},
+    )
+    assert posted.status_code == 200
+    assert "marked paid" in posted.text.lower()
+    wallet = _wallet(db)
+    assert wallet.held_paise == 0
+    assert wallet.balance_paise == 300_000 - 100_708
+    row = db.query(VendorWalletWithdrawal).one()
+    assert row.status == "PAID"
+    assert row.utr == "HDFC123456"
+    assert row.ops_link_paid_jti_hash is None
+    assert row.ops_link_reject_jti_hash is None
+    reuse = client.get(path)
+    assert reuse.status_code == 410
+    assert "already used" in reuse.text.lower()
+
+
+def test_ops_signed_link_reject_flow(env):
+    db, Session = env
+    _fund(db, 300_000)
+    client = _client(Session)
+    with patch.object(withdrawal_crud, "send_email", return_value={"message": "SENT"}) as mail:
+        ref = _withdraw(_vendor(Session)).json()["withdrawalId"]
+    path, token = _ops_link_from_email(mail.call_args.kwargs["message"], "rejected")
+    assert client.get(path).status_code == 200
+    posted = client.post(
+        f"/internal/wallet/withdrawals/{ref}/ops/rejected",
+        data={"t": token, "reason": "Name mismatch on transfer"},
+    )
+    assert posted.status_code == 200
+    assert "rejected" in posted.text.lower()
+    wallet = _wallet(db)
+    assert wallet.balance_paise == 300_000
+    assert wallet.held_paise == 0
+    assert db.query(VendorWalletWithdrawal).one().status == "REJECTED"
+
+
+def test_ops_signed_link_tampered_token(env):
+    db, Session = env
+    _fund(db, 300_000)
+    client = _client(Session)
+    with patch.object(withdrawal_crud, "send_email", return_value={"message": "SENT"}) as mail:
+        _withdraw(_vendor(Session))
+    path, _token = _ops_link_from_email(mail.call_args.kwargs["message"], "paid")
+    bad = path[:-4] + "dead"
+    r = client.get(bad)
+    assert r.status_code == 403
+    assert _wallet(db).held_paise == 100_708
+    assert db.query(VendorWalletWithdrawal).one().status == "REQUESTED"
+
+
+def test_ops_key_json_still_works_after_links_minted(env):
+    db, Session = env
+    ref = _requested(db, Session)
+    r = _client(Session).post(
+        f"/internal/wallet/withdrawals/{ref}/paid",
+        json={"utr": "UTR999888"},
+        headers={"X-OpenBid-Wallet-Ops-Key": OPS_KEY},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "PAID"
 
 
 # --- Ledger holds -------------------------------------------------------------

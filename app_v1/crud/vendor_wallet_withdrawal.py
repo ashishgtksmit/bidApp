@@ -54,6 +54,7 @@ from ..crud.vendor_bank_security import (
     verification_note,
 )
 from ..services import wallet_notifications
+from ..services import wallet_ops_links
 from ..services.vendor_otp import consume_otp, issue_otp
 from ..utils.email import send_email
 
@@ -388,9 +389,16 @@ def list_withdrawals(
 # --- Ops email ---------------------------------------------------------------
 
 
-def _ops_email_body(row: VendorWalletWithdrawal, user: User) -> str:
+def _ops_email_body(
+    row: VendorWalletWithdrawal,
+    user: User,
+    *,
+    paid_url: str,
+    reject_url: str,
+) -> str:
     total = int(row.amount_paise) + int(row.fee_paise)
     api_base = (os.getenv("OPENBID_PUBLIC_API_BASE_URL") or "<OpenBid API base URL>").rstrip("/")
+    ttl_days = max(1, wallet_ops_links.ops_link_ttl_seconds() // 86400)
     return "\n".join(
         [
             "A vendor has requested a withdrawal from their OpenBid wallet.",
@@ -418,16 +426,20 @@ def _ops_email_body(row: VendorWalletWithdrawal, user: User) -> str:
             "WHAT TO DO",
             f"1. Transfer exactly {_rupees(int(row.amount_paise))} to the account above by IMPS/NEFT.",
             "   Check the account holder name matches the vendor before paying.",
-            "2. After the transfer succeeds, mark it paid with the bank UTR:",
+            "2. After the transfer succeeds, open this link and enter the bank UTR:",
+            f"   {paid_url}",
+            "3. If you cannot pay (details wrong, suspicious request), open this link",
+            "   and enter a short reason (shown to the vendor):",
+            f"   {reject_url}",
+            "",
+            f"These links expire in {ttl_days} day(s) and can each be used once.",
+            "Until one of these is done, the amount stays on hold in the vendor's wallet.",
+            "",
+            "Automation fallback (ops key required):",
             f"   POST {api_base}/internal/wallet/withdrawals/{row.withdrawal_ref}/paid",
             '   Header X-OpenBid-Wallet-Ops-Key, body {"utr": "<UTR>"}',
-            "   This debits the held amount from the vendor's wallet.",
-            "3. If you cannot pay (details wrong, suspicious request), reject it:",
             f"   POST {api_base}/internal/wallet/withdrawals/{row.withdrawal_ref}/rejected",
             '   Header X-OpenBid-Wallet-Ops-Key, body {"reason": "<reason shown to vendor>"}',
-            "   This returns the held amount to the vendor's available balance.",
-            "",
-            "Until one of these is done, the amount stays on hold in the vendor's wallet.",
             "Pending requests: GET /internal/wallet/withdrawals?status=REQUESTED",
             "",
             "This mailbox contains bank details. Do not forward outside the accounts team.",
@@ -438,9 +450,26 @@ def _ops_email_body(row: VendorWalletWithdrawal, user: User) -> str:
 def _notify_ops(db: Session, row: VendorWalletWithdrawal, user: User) -> None:
     to_address = wallet_notifications.ops_email_address()
     from_address = wallet_notifications.ops_email_from()
+    api_base = (os.getenv("OPENBID_PUBLIC_API_BASE_URL") or "").rstrip("/")
+    sent = False
     try:
+        paid_token, reject_token = wallet_ops_links.mint_ops_link_pair(row)
+        # Persist one-time jti hashes even if SMTP fails afterward.
+        db.commit()
+        paid_url = wallet_ops_links.public_ops_link_url(
+            api_base=api_base or "<OpenBid API base URL>",
+            withdrawal_ref=row.withdrawal_ref,
+            action=wallet_ops_links.ACTION_PAID,
+            token=paid_token,
+        )
+        reject_url = wallet_ops_links.public_ops_link_url(
+            api_base=api_base or "<OpenBid API base URL>",
+            withdrawal_ref=row.withdrawal_ref,
+            action=wallet_ops_links.ACTION_REJECTED,
+            token=reject_token,
+        )
         result = send_email(
-            message=_ops_email_body(row, user),
+            message=_ops_email_body(row, user, paid_url=paid_url, reject_url=reject_url),
             subject=f"[OpenBid] Wallet withdrawal {row.withdrawal_ref} - {_rupees(int(row.amount_paise))}",
             from_address=from_address,
             from_name="OpenBid Wallet",
@@ -449,16 +478,30 @@ def _notify_ops(db: Session, row: VendorWalletWithdrawal, user: User) -> None:
             is_html=False,
         )
         sent = isinstance(result, dict) and result.get("message") == "SENT"
+    except HTTPException:
+        # Missing WALLET_OPS_KEY → cannot mint links; still record email failure.
+        sent = False
+        db.rollback()
     except Exception:
         sent = False
     if not sent:
         logger.error("WALLET_WITHDRAWAL_OPS_EMAIL_FAILED ref=%s", row.withdrawal_ref)
     try:
-        row.ops_email_status = "SENT" if sent else "FAILED"
-        db.commit()
+        # Re-load if previous rollback cleared the session identity.
+        locked = (
+            db.query(VendorWalletWithdrawal)
+            .filter(VendorWalletWithdrawal.id == row.id)
+            .with_for_update()
+            .first()
+        )
+        if locked is not None:
+            locked.ops_email_status = "SENT" if sent else "FAILED"
+            db.commit()
+        else:
+            row.ops_email_status = "SENT" if sent else "FAILED"
+            db.commit()
     except SQLAlchemyError:
         db.rollback()
-
 
 # --- Ops actions (internal key) ----------------------------------------------
 
@@ -501,6 +544,64 @@ def _lock_withdrawal(db: Session, withdrawal_ref: str) -> VendorWalletWithdrawal
     return row
 
 
+def _apply_paid_on_locked_row(
+    db: Session,
+    row: VendorWalletWithdrawal,
+    utr: str,
+) -> VendorWalletWithdrawal:
+    utr = utr.strip().upper()
+    if row.status == STATUS_PAID and row.utr == utr:
+        return row
+    if row.status != STATUS_REQUESTED:
+        raise HTTPException(status_code=409, detail="WITHDRAWAL_NOT_PENDING")
+    uid = int(row.user_uid)
+    apply_wallet_entry(
+        db,
+        user_uid=uid,
+        direction=DIRECTION_DEBIT,
+        txn_type=TXN_TYPE_WITHDRAWAL,
+        amount_paise=int(row.amount_paise),
+        idempotency_key=f"wd:{row.withdrawal_ref}:amount",
+        description=f"Withdrawal to bank {_mask_bank_account_mobile(row.bank_account_no)} (UTR {utr})",
+        reference_id=row.withdrawal_ref,
+        consume_hold_paise=int(row.amount_paise),
+    )
+    if int(row.fee_paise) > 0:
+        apply_wallet_entry(
+            db,
+            user_uid=uid,
+            direction=DIRECTION_DEBIT,
+            txn_type=TXN_TYPE_WITHDRAWAL_FEE,
+            amount_paise=int(row.fee_paise),
+            idempotency_key=f"wd:{row.withdrawal_ref}:fee",
+            description="Withdrawal fee",
+            reference_id=row.withdrawal_ref,
+            consume_hold_paise=int(row.fee_paise),
+        )
+    row.status = STATUS_PAID
+    row.utr = utr
+    row.resolved_at = _ist_now_naive()
+    return row
+
+
+def _apply_rejected_on_locked_row(
+    db: Session,
+    row: VendorWalletWithdrawal,
+    reason: str,
+) -> VendorWalletWithdrawal:
+    if row.status != STATUS_REQUESTED:
+        raise HTTPException(status_code=409, detail="WITHDRAWAL_NOT_PENDING")
+    release_held_funds(
+        db,
+        user_uid=int(row.user_uid),
+        amount_paise=int(row.amount_paise) + int(row.fee_paise),
+    )
+    row.status = STATUS_REJECTED
+    row.rejection_reason = reason.strip()
+    row.resolved_at = _ist_now_naive()
+    return row
+
+
 def ops_mark_paid(
     db: Session,
     withdrawal_ref: str,
@@ -510,39 +611,7 @@ def ops_mark_paid(
     utr = utr.strip().upper()
     try:
         row = _lock_withdrawal(db, withdrawal_ref)
-        if row.status == STATUS_PAID and row.utr == utr:
-            db.commit()
-            return _ops_item(row, None)
-        if row.status != STATUS_REQUESTED:
-            db.rollback()
-            raise HTTPException(status_code=409, detail="WITHDRAWAL_NOT_PENDING")
-        uid = int(row.user_uid)
-        apply_wallet_entry(
-            db,
-            user_uid=uid,
-            direction=DIRECTION_DEBIT,
-            txn_type=TXN_TYPE_WITHDRAWAL,
-            amount_paise=int(row.amount_paise),
-            idempotency_key=f"wd:{row.withdrawal_ref}:amount",
-            description=f"Withdrawal to bank {_mask_bank_account_mobile(row.bank_account_no)} (UTR {utr})",
-            reference_id=row.withdrawal_ref,
-            consume_hold_paise=int(row.amount_paise),
-        )
-        if int(row.fee_paise) > 0:
-            apply_wallet_entry(
-                db,
-                user_uid=uid,
-                direction=DIRECTION_DEBIT,
-                txn_type=TXN_TYPE_WITHDRAWAL_FEE,
-                amount_paise=int(row.fee_paise),
-                idempotency_key=f"wd:{row.withdrawal_ref}:fee",
-                description="Withdrawal fee",
-                reference_id=row.withdrawal_ref,
-                consume_hold_paise=int(row.fee_paise),
-            )
-        row.status = STATUS_PAID
-        row.utr = utr
-        row.resolved_at = _ist_now_naive()
+        row = _apply_paid_on_locked_row(db, row, utr)
         db.commit()
     except HTTPException:
         raise
@@ -567,17 +636,7 @@ def ops_mark_rejected(
 ) -> OpsWithdrawalItem:
     try:
         row = _lock_withdrawal(db, withdrawal_ref)
-        if row.status != STATUS_REQUESTED:
-            db.rollback()
-            raise HTTPException(status_code=409, detail="WITHDRAWAL_NOT_PENDING")
-        release_held_funds(
-            db,
-            user_uid=int(row.user_uid),
-            amount_paise=int(row.amount_paise) + int(row.fee_paise),
-        )
-        row.status = STATUS_REJECTED
-        row.rejection_reason = reason.strip()
-        row.resolved_at = _ist_now_naive()
+        row = _apply_rejected_on_locked_row(db, row, reason)
         db.commit()
     except HTTPException:
         raise
@@ -591,4 +650,73 @@ def ops_mark_rejected(
         "Withdrawal rejected",
         f"Your withdrawal of {_rupees(int(row.amount_paise))} was rejected and the amount is back in your wallet. Reason: {row.rejection_reason}",
     )
+    return _ops_item(row, None)
+
+
+def load_withdrawal_for_ops_link(db: Session, withdrawal_ref: str) -> VendorWalletWithdrawal:
+    row = (
+        db.query(VendorWalletWithdrawal)
+        .filter(VendorWalletWithdrawal.withdrawal_ref == withdrawal_ref)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="WITHDRAWAL_NOT_FOUND")
+    return row
+
+
+def ops_resolve_via_link(
+    db: Session,
+    *,
+    withdrawal_ref: str,
+    action: str,
+    token: str,
+    utr: Optional[str] = None,
+    reason: Optional[str] = None,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> OpsWithdrawalItem:
+    """Verify one-time link, apply paid/reject, burn both link tokens."""
+    if action not in (wallet_ops_links.ACTION_PAID, wallet_ops_links.ACTION_REJECTED):
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+    try:
+        row = _lock_withdrawal(db, withdrawal_ref)
+        wallet_ops_links.verify_ops_link_against_row(
+            row,
+            withdrawal_ref=withdrawal_ref,
+            action=action,  # type: ignore[arg-type]
+            token=token,
+        )
+        # Burn tokens before money movement so concurrent uses fail closed.
+        wallet_ops_links.consume_ops_link_tokens(row)
+        if action == wallet_ops_links.ACTION_PAID:
+            if not utr or not utr.strip():
+                raise HTTPException(status_code=422, detail="UTR_REQUIRED")
+            row = _apply_paid_on_locked_row(db, row, utr)
+        else:
+            if not reason or len(reason.strip()) < 3:
+                raise HTTPException(status_code=422, detail="REASON_REQUIRED")
+            row = _apply_rejected_on_locked_row(db, row, reason)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise _db_error("ops_link") from None
+
+    if action == wallet_ops_links.ACTION_PAID:
+        logger.info("WALLET_WITHDRAWAL_PAID_VIA_LINK ref=%s", withdrawal_ref)
+        _push(
+            background_tasks,
+            int(row.user_uid),
+            "Withdrawal paid",
+            f"{_rupees(int(row.amount_paise))} has been transferred to your bank account (UTR {row.utr}).",
+        )
+    else:
+        logger.info("WALLET_WITHDRAWAL_REJECTED_VIA_LINK ref=%s", withdrawal_ref)
+        _push(
+            background_tasks,
+            int(row.user_uid),
+            "Withdrawal rejected",
+            f"Your withdrawal of {_rupees(int(row.amount_paise))} was rejected and the amount is back in your wallet. Reason: {row.rejection_reason}",
+        )
     return _ops_item(row, None)

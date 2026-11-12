@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, time, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
@@ -48,11 +48,24 @@ def get_vendor_wallet_summary(
     db: Session,
     current_user: AuthenticatedUser,
 ) -> VendorWalletSummary:
+    return read_wallet_summary(
+        db, current_user, wallet_model=VendorWallet, load_owner=_load_eligible_vendor
+    )
+
+
+def read_wallet_summary(
+    db: Session,
+    current_user: AuthenticatedUser,
+    *,
+    wallet_model,
+    load_owner: Callable[[Session, AuthenticatedUser], User],
+) -> VendorWalletSummary:
+    """Shared by the vendor (PR47) and customer (PR50) wallets."""
     try:
-        _load_eligible_vendor(db, current_user)
+        load_owner(db, current_user)
         wallet = (
-            db.query(VendorWallet)
-            .filter(VendorWallet.user_uid == current_user.uid)
+            db.query(wallet_model)
+            .filter(wallet_model.user_uid == current_user.uid)
             .first()
         )
     except HTTPException:
@@ -94,7 +107,7 @@ def _parse_cursor(cursor: Optional[str]) -> Optional[int]:
     return int(text)
 
 
-def _to_item(row: VendorWalletTransaction) -> VendorWalletTransactionItem:
+def _to_item(row) -> VendorWalletTransactionItem:
     created = row.created_at
     created_str = (
         created.strftime("%Y-%m-%dT%H:%M:%S") if isinstance(created, datetime) else ""
@@ -121,6 +134,30 @@ def list_vendor_wallet_transactions(
     end_date: Optional[str] = None,
 ) -> VendorWalletTransactionPage:
     """Newest-first ledger page. ``nextCursor`` is opaque to clients."""
+    return read_wallet_transactions(
+        db,
+        current_user,
+        txn_model=VendorWalletTransaction,
+        load_owner=_load_eligible_vendor,
+        limit=limit,
+        cursor=cursor,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def read_wallet_transactions(
+    db: Session,
+    current_user: AuthenticatedUser,
+    *,
+    txn_model,
+    load_owner: Callable[[Session, AuthenticatedUser], User],
+    limit: int = DEFAULT_PAGE_SIZE,
+    cursor: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> VendorWalletTransactionPage:
+    """Shared by the vendor (PR47) and customer (PR50) wallets."""
     has_start = start_date is not None and str(start_date).strip() != ""
     has_end = end_date is not None and str(end_date).strip() != ""
     if has_start ^ has_end:
@@ -146,20 +183,18 @@ def list_vendor_wallet_transactions(
     page_size = max(1, min(int(limit), MAX_PAGE_SIZE))
 
     try:
-        _load_eligible_vendor(db, current_user)
-        query = db.query(VendorWalletTransaction).filter(
-            VendorWalletTransaction.user_uid == current_user.uid
-        )
+        load_owner(db, current_user)
+        query = db.query(txn_model).filter(txn_model.user_uid == current_user.uid)
         if range_start is not None and range_end is not None:
             query = query.filter(
-                VendorWalletTransaction.created_at >= datetime.combine(range_start, time.min),
-                VendorWalletTransaction.created_at
+                txn_model.created_at >= datetime.combine(range_start, time.min),
+                txn_model.created_at
                 < datetime.combine(range_end + timedelta(days=1), time.min),
             )
         if before_id is not None:
-            query = query.filter(VendorWalletTransaction.id < before_id)
+            query = query.filter(txn_model.id < before_id)
         rows = (
-            query.order_by(VendorWalletTransaction.id.desc())
+            query.order_by(txn_model.id.desc())
             .limit(page_size + 1)
             .all()
         )

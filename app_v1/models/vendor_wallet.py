@@ -129,6 +129,10 @@ class VendorWalletWithdrawal(Base):
     bank_name = Column(String(255), nullable=True)
     ops_email_status = Column(String(20), nullable=True)
     bank_verification_note = Column(String(255), nullable=True)
+    # Signed one-time ops email links (paid / rejected HTML forms).
+    ops_link_paid_jti_hash = Column(String(64), nullable=True)
+    ops_link_reject_jti_hash = Column(String(64), nullable=True)
+    ops_link_expires_at = Column(DateTime, nullable=True)
     utr = Column(String(40), nullable=True)
     rejection_reason = Column(String(255), nullable=True)
     requested_at = Column(DateTime, nullable=False)

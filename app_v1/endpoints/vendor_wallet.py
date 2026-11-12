@@ -6,9 +6,9 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Path, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from ..auth.deps import AuthenticatedUser, get_current_user
@@ -22,8 +22,10 @@ from ..crud.vendor_wallet import (
 from ..crud import vendor_wallet_recharge as recharge_crud
 from ..crud import vendor_wallet_statement as statement_crud
 from ..crud import vendor_wallet_withdrawal as withdrawal_crud
+from ..crud.user import _mask_bank_account_mobile
 from ..crud.vendor_bank_security import send_bank_change_otp
 from ..database import get_db
+from ..models.user_table import User
 from ..schemas.vendor_wallet import (
     OtpSentResponse,
     OpsWithdrawalItem,
@@ -42,6 +44,7 @@ from ..schemas.vendor_wallet import (
     WalletWithdrawalOtpResponse,
     WalletWithdrawalPreflight,
 )
+from ..services import wallet_ops_link_html, wallet_ops_links
 
 router = APIRouter()
 
@@ -287,3 +290,152 @@ def ops_mark_wallet_withdrawal_rejected(
     db: Session = Depends(get_db),
 ) -> OpsWithdrawalItem:
     return withdrawal_crud.ops_mark_rejected(db, withdrawalId, payload.reason, background_tasks)
+
+
+_OPS_LINK_ACTION = r"^(paid|rejected)$"
+
+
+def _ops_link_detail_message(detail: object) -> str:
+    code = detail if isinstance(detail, str) else "OPS_LINK_INVALID"
+    return {
+        "OPS_LINK_INVALID": "This link is invalid or has been tampered with.",
+        "OPS_LINK_EXPIRED": "This link has expired. Use the ops API with the wallet ops key, or ask for a new withdrawal email.",
+        "OPS_LINK_USED": "This link was already used.",
+        "WITHDRAWAL_NOT_FOUND": "Withdrawal not found.",
+        "WITHDRAWAL_NOT_PENDING": "This withdrawal is no longer pending.",
+        "UTR_REQUIRED": "Enter the bank UTR.",
+        "REASON_REQUIRED": "Enter a rejection reason (at least 3 characters).",
+        "WALLET_OPS_LINKS_UNAVAILABLE": "Ops links are not configured on the server.",
+    }.get(str(code), str(code))
+
+
+def _ops_form_context(db: Session, withdrawal_id: str, action: str, token: str):
+    row = withdrawal_crud.load_withdrawal_for_ops_link(db, withdrawal_id)
+    wallet_ops_links.verify_ops_link_against_row(
+        row,
+        withdrawal_ref=withdrawal_id,
+        action=action,  # type: ignore[arg-type]
+        token=token,
+    )
+    if row.status != withdrawal_crud.STATUS_REQUESTED:
+        raise HTTPException(status_code=409, detail="WITHDRAWAL_NOT_PENDING")
+    user = db.query(User).filter(User.UID == int(row.user_uid)).first()
+    amount_label = (
+        f"Transfer {withdrawal_crud._rupees(int(row.amount_paise))} "
+        f"(fee {withdrawal_crud._rupees(int(row.fee_paise))})"
+    )
+    return row, user, amount_label
+
+
+@router.get(
+    "/internal/wallet/withdrawals/{withdrawalId}/ops/{action}",
+    include_in_schema=False,
+    response_class=HTMLResponse,
+)
+def ops_wallet_withdrawal_link_form(
+    withdrawalId: str = Path(..., pattern=_WITHDRAWAL_REF),
+    action: str = Path(..., pattern=_OPS_LINK_ACTION),
+    t: str = Query(..., min_length=20),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    try:
+        _row, user, amount_label = _ops_form_context(db, withdrawalId, action, t)
+    except HTTPException as exc:
+        return HTMLResponse(
+            wallet_ops_link_html.error_page(
+                "OpenBid wallet ops",
+                _ops_link_detail_message(exc.detail),
+            ),
+            status_code=exc.status_code if exc.status_code in (403, 404, 409, 410) else 400,
+        )
+    return HTMLResponse(
+        wallet_ops_link_html.form_page(
+            action=action,
+            withdrawal_id=withdrawalId,
+            amount_label=amount_label,
+            vendor_name=str(getattr(user, "fullName", "") or "") if user else "",
+            masked_account=_mask_bank_account_mobile(_row.bank_account_no),
+            token=t,
+            form_action_url=f"/internal/wallet/withdrawals/{withdrawalId}/ops/{action}",
+        )
+    )
+
+
+@router.post(
+    "/internal/wallet/withdrawals/{withdrawalId}/ops/{action}",
+    include_in_schema=False,
+    response_class=HTMLResponse,
+)
+def ops_wallet_withdrawal_link_submit(
+    background_tasks: BackgroundTasks,
+    withdrawalId: str = Path(..., pattern=_WITHDRAWAL_REF),
+    action: str = Path(..., pattern=_OPS_LINK_ACTION),
+    t: str = Form(...),
+    utr: Optional[str] = Form(None),
+    reason: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    try:
+        if action == wallet_ops_links.ACTION_PAID:
+            # Match OpsWithdrawalPaidRequest constraints.
+            cleaned = (utr or "").strip()
+            if len(cleaned) < 6 or len(cleaned) > 40 or not cleaned.isalnum():
+                raise HTTPException(status_code=422, detail="UTR_REQUIRED")
+            item = withdrawal_crud.ops_resolve_via_link(
+                db,
+                withdrawal_ref=withdrawalId,
+                action=action,
+                token=t,
+                utr=cleaned,
+                background_tasks=background_tasks,
+            )
+            return HTMLResponse(
+                wallet_ops_link_html.success_page(
+                    "Withdrawal marked paid",
+                    f"{item.withdrawalId} is paid. UTR {item.utr}.",
+                )
+            )
+        cleaned_reason = (reason or "").strip()
+        if len(cleaned_reason) < 3:
+            raise HTTPException(status_code=422, detail="REASON_REQUIRED")
+        item = withdrawal_crud.ops_resolve_via_link(
+            db,
+            withdrawal_ref=withdrawalId,
+            action=action,
+            token=t,
+            reason=cleaned_reason,
+            background_tasks=background_tasks,
+        )
+        return HTMLResponse(
+            wallet_ops_link_html.success_page(
+                "Withdrawal rejected",
+                f"{item.withdrawalId} was rejected. Held funds were released.",
+            )
+        )
+    except HTTPException as exc:
+        # Re-show the form when validation fails but the token is still valid.
+        if exc.status_code == 422:
+            try:
+                row, user, amount_label = _ops_form_context(db, withdrawalId, action, t)
+                return HTMLResponse(
+                    wallet_ops_link_html.form_page(
+                        action=action,
+                        withdrawal_id=withdrawalId,
+                        amount_label=amount_label,
+                        vendor_name=str(getattr(user, "fullName", "") or "") if user else "",
+                        masked_account=_mask_bank_account_mobile(row.bank_account_no),
+                        token=t,
+                        form_action_url=f"/internal/wallet/withdrawals/{withdrawalId}/ops/{action}",
+                        error=_ops_link_detail_message(exc.detail),
+                    ),
+                    status_code=422,
+                )
+            except HTTPException:
+                pass
+        return HTMLResponse(
+            wallet_ops_link_html.error_page(
+                "OpenBid wallet ops",
+                _ops_link_detail_message(exc.detail),
+            ),
+            status_code=exc.status_code if exc.status_code in (403, 404, 409, 410, 422) else 400,
+        )
