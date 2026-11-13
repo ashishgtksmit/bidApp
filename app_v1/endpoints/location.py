@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from ..crud.location import get_all_locations,get_all_cities,get_all_regions,get_region_city_selections
+from ..crud.sightseeing import list_spots_for_location
+from ..schemas.sightseeing import SightseeingSpotResponse
 from ..schemas.location_details import Location,CityDetail,RegionDetail,LocationResponse
 from ..schemas.city_list import CityListDetail
 from ..schemas.region_details import RegionDetailBase
@@ -22,6 +25,24 @@ def read_locations(
     ):
     user_id = current_user.user_app_id
     return get_all_locations(db)
+
+
+@router.get("/getsightseeingspots", response_model=List[SightseeingSpotResponse])
+def read_sightseeing_spots(
+    locationCode: int = Query(..., ge=1, description="location_details.LID (LOCATIONCODE from /getlocations)"),
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Active curated sightseeing spots for a base city (PR51). Empty list when none."""
+    try:
+        return list_spots_for_location(db, locationCode)
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SIGHTSEEING_SPOTS_QUERY_FAILED",
+        )
+    finally:
+        db.close()
 
 
 @router.get("/getcities", response_model=List[CityListDetail])

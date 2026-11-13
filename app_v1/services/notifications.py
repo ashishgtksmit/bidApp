@@ -313,6 +313,8 @@ def send_notification_to_user(db: Session, notification_data: FCMSend):
             travel_date=notification_data.travelDate,
             pickup_time=notification_data.pickupTime,
             sound_file=notification_data.soundFile,
+            request_id=notification_data.requestId,
+            request_type=notification_data.requestType,
         )
 
         if not result.get("success"):
@@ -370,6 +372,8 @@ def send_notification_to_selected_users(db: Session, data: FCMSendDrivers):
             url=data.url,
             notification_type="drivernotification",
             sound_file=data.soundFile,
+            request_id=data.requestId,
+            request_type=data.requestType,
         )
 
         total_processed += 1
@@ -675,7 +679,29 @@ def notify_driver_assigned_to_customer_background(
         db.close()
 
 
-def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
+def _request_routing(db: Session, request_id: Optional[int]) -> Dict[str, Optional[int]]:
+    """requestId/requestType for FCM deep links (PR53). Empty when unknown."""
+    if request_id is None:
+        return {}
+    from ..models.request_table import Request
+
+    try:
+        rid = int(request_id)
+        row = db.query(Request.requestType).filter(Request.RID == rid).first()
+    except Exception:
+        return {}
+    return {
+        "requestId": rid,
+        "requestType": int(row[0]) if row is not None and row[0] is not None else None,
+    }
+
+
+def notify_vendors_for_request(
+    vendor_ids: List[str],
+    create_data,
+    request_id: Optional[int] = None,
+    request_type: Optional[int] = None,
+) -> None:
     """
     Notify selected vendors about a newly created request.
 
@@ -700,6 +726,8 @@ def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
             destination=create_data.toLocation or "",
             travelDate=str(create_data.pickUpDate) if create_data.pickUpDate else "",
             pickupTime=str(create_data.pickUpTime) if create_data.pickUpTime else "",
+            requestId=request_id,
+            requestType=request_type,
         )
 
         send_notification_to_selected_users(db, notification_data)
@@ -712,6 +740,7 @@ def notify_vendors_for_request(vendor_ids: List[str], create_data) -> None:
 def notify_vendor_bid_accepted(
     vendor_user_app_id: str,
     notification_type: str = "default",
+    request_id: Optional[int] = None,
 ) -> None:
     """
     Notify the selected/winning vendor after customer accept bid commits.
@@ -740,6 +769,7 @@ def notify_vendor_bid_accepted(
                 destination=None,
                 travelDate=None,
                 pickupTime=None,
+                **_request_routing(db, request_id),
             ),
         )
     except Exception as e:
@@ -751,6 +781,7 @@ def notify_vendor_bid_accepted(
 def notify_customer_new_bid(
     customer_user_app_id: str,
     notification_type: str = "default",
+    request_id: Optional[int] = None,
 ) -> None:
     """Notify customer after vendor insert bid commits. Owns SessionLocal()."""
     from ..database import SessionLocal
@@ -772,6 +803,7 @@ def notify_customer_new_bid(
                 destination=None,
                 travelDate=None,
                 pickupTime=None,
+                **_request_routing(db, request_id),
             ),
         )
     except Exception as e:
@@ -808,6 +840,7 @@ def notify_other_vendors_new_bid(
                 type=notification_type,
                 soundFile="normal_notification",
                 driverIds=other_vendor_ids,
+                **_request_routing(db, rid),
             ),
         )
     except Exception as e:
@@ -819,6 +852,7 @@ def notify_other_vendors_new_bid(
 def notify_customer_vendor_accepted(
     customer_user_app_id: str,
     notification_type: str = "passengernotification",
+    request_id: Optional[int] = None,
 ) -> None:
     """Notify customer after vendor accept handshake. Owns SessionLocal()."""
     from ..database import SessionLocal
@@ -840,6 +874,7 @@ def notify_customer_vendor_accepted(
                 destination="",
                 travelDate="",
                 pickupTime="",
+                **_request_routing(db, request_id),
             ),
         )
     except Exception as e:
@@ -876,6 +911,7 @@ def notify_customer_vendor_rejected(
     customer_user_app_id: str,
     rejection_reason: str,
     notification_type: str = "default",
+    request_id: Optional[int] = None,
 ) -> None:
     """Notify customer after vendor reject handshake. Owns SessionLocal()."""
     from ..database import SessionLocal
@@ -897,6 +933,7 @@ def notify_customer_vendor_rejected(
                 destination="",
                 travelDate="",
                 pickupTime="",
+                **_request_routing(db, request_id),
             ),
         )
     except Exception as e:
@@ -931,6 +968,7 @@ def notify_vendors_bidding_reopened(
                 url="Bidding Reopened!",
                 soundFile="alarm_notification",
                 driverIds=remaining,
+                **_request_routing(db, rid),
             ),
         )
     except Exception as e:
@@ -942,6 +980,7 @@ def notify_vendors_bidding_reopened(
 def notify_vendor_booking_cancelled_by_customer(
     vendor_user_app_id: str,
     notification_type: str = "default",
+    request_id: Optional[int] = None,
 ) -> None:
     """
     Notify the selected vendor after customer confirmed-booking cancellation (PR12).
@@ -969,6 +1008,7 @@ def notify_vendor_booking_cancelled_by_customer(
                 destination=None,
                 travelDate=None,
                 pickupTime=None,
+                **_request_routing(db, request_id),
             ),
         )
     except Exception as e:

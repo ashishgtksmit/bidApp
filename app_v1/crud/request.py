@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import date, datetime, time, timedelta
@@ -31,6 +31,14 @@ from ..schemas.booking_history import (
 )
 from ..schemas.request_type_details import RequestTypeBase
 from ..utils.common import ErrorResponse,EmailErrorResponse, FCMSend
+from .sightseeing import (
+    ItineraryError,
+    clone_itinerary,
+    delete_itinerary,
+    get_sightseeing_request_type_id,
+    validate_itinerary,
+    write_itinerary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +267,22 @@ def _history_pickup_datetime(req: Request) -> datetime:
         ) from exc
 
 
+def _history_completion_datetime(req: Request, pickup_dt: datetime) -> datetime:
+    """Pickup for transfers; end of the last itinerary day for sightseeing."""
+    trip_end = getattr(req, "tripEndDate", None)
+    if isinstance(trip_end, date):
+        return datetime.combine(trip_end + timedelta(days=1), time.min)
+    return pickup_dt
+
+
+def _history_request_type(req: Request) -> Optional[int]:
+    value = getattr(req, "requestType", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _history_pickup_date_value(req: Request, pickup_dt: datetime) -> date:
     pickup_date = getattr(req, "pickUpDate", None)
     if isinstance(pickup_date, datetime):
@@ -431,13 +455,15 @@ def get_all_requests_for_user(
                 detail="HISTORY_DATA_INVALID",
             )
         pickup_dt = _history_pickup_datetime(req)
-        if pickup_dt >= now_ist:
+        if _history_completion_datetime(req, pickup_dt) >= now_ist:
             continue
         items.append(
             (
                 pickup_dt,
                 int(req.RID),
                 CustomerBookingHistoryItem(
+                    requestType=_history_request_type(req),
+                    tripEndDate=getattr(req, "tripEndDate", None),
                     requestId=int(req.RID),
                     requestStatus=str(req.requestStatus),
                     fromLocation=req.fromLocation or "",
@@ -717,13 +743,34 @@ def update_request(
         if (existing.noOfBids or 0) > 0:
             return ErrorResponse(message="NO OF BIDS MORE THAN 0")
 
+        sightseeing_type_id = get_sightseeing_request_type_id(db)
+        is_sightseeing = (
+            sightseeing_type_id is not None
+            and existing.requestType == sightseeing_type_id
+        )
+        validated_itinerary = None
+        if is_sightseeing or request_data.itinerary:
+            try:
+                validated_itinerary = validate_itinerary(
+                    db,
+                    request_type=existing.requestType,
+                    itinerary=request_data.itinerary,
+                    from_location=request_data.fromLocation or existing.fromLocation,
+                    from_landmark=request_data.fromLandmark,
+                    pick_up_date=request_data.pickUpDate,
+                    pick_up_time=request_data.pickUpTime,
+                    now=_now_ist_naive(),
+                )
+            except ItineraryError as e:
+                return ErrorResponse(message=e.code)
+
         special = (
             request_data.specialRequest.strip()
             if request_data.specialRequest and request_data.specialRequest.strip()
             else None
         )
 
-        updated = db.query(Request).filter(Request.RID == request_data.RID).update({
+        values = {
             Request.fromLocation: request_data.fromLocation,
             Request.fromLandmark: request_data.fromLandmark,
             Request.toLocation: request_data.toLocation,
@@ -740,7 +787,14 @@ def update_request(
             Request.tableTimestamp: datetime.now(
                 ZoneInfo("Asia/Kolkata")
             ).replace(tzinfo=None),
-        })
+        }
+        if validated_itinerary is not None:
+            values[Request.tripEndDate] = validated_itinerary.trip_end_date
+        updated = db.query(Request).filter(Request.RID == request_data.RID).update(values)
+
+        if updated != 0 and validated_itinerary is not None:
+            delete_itinerary(db, int(request_data.RID))
+            write_itinerary(db, int(request_data.RID), validated_itinerary)
 
         # PR44: request.updated outbox in the SAME transaction (master ∧ per-event).
         # Same-value updates still bump tableTimestamp and commit (existing PR9
@@ -1401,6 +1455,7 @@ def booking_cancelled_by_user(
             background_tasks.add_task(
                 notify_vendor_booking_cancelled_by_customer,
                 vendor_to_notify,
+                request_id=int(rid),
             )
 
         return ErrorResponse(message="UPDATED")
@@ -1560,7 +1615,7 @@ def get_all_confirmed_requests_for_vendor(
                 detail="HISTORY_DATA_INVALID",
             )
         pickup_dt = _history_pickup_datetime(req)
-        if pickup_dt >= now_ist:
+        if _history_completion_datetime(req, pickup_dt) >= now_ist:
             continue
 
         rating_value: Optional[float] = None
@@ -1575,6 +1630,8 @@ def get_all_confirmed_requests_for_vendor(
                 pickup_dt,
                 int(req.RID),
                 VendorBookingHistoryItem(
+                    requestType=_history_request_type(req),
+                    tripEndDate=getattr(req, "tripEndDate", None),
                     requestId=int(req.RID),
                     requestStatus=str(req.requestStatus),
                     fromLocation=req.fromLocation or "",
@@ -1699,6 +1756,8 @@ def reopen_request(
             commit=False,
             close_session=False,
             notify=False,
+            itinerary_source_rid=int(original.RID),
+            source_trip_end_date=getattr(original, "tripEndDate", None),
         )
 
         if isinstance(insert_result, EmailErrorResponse):
@@ -1728,16 +1787,24 @@ def reopen_request(
 
         # Notify eligible vendors after commit (same as normal create).
         try:
+            sightseeing_type_id = get_sightseeing_request_type_id(db)
+            is_sightseeing = (
+                sightseeing_type_id is not None
+                and original.requestType == sightseeing_type_id
+            )
             vendor_ids = get_vendors_for_request(
                 db,
                 create_data.fromLocation,
                 create_data.toLocation,
+                request_type=sightseeing_type_id if is_sightseeing else None,
             )
             if vendor_ids:
                 background_tasks.add_task(
                     notify_vendors_for_request,
                     vendor_ids,
                     create_data,
+                    request_id=int(new_request.RID),
+                    request_type=original.requestType,
                 )
         except Exception as e:
             print(f"[reopen_request] notify schedule error: {e}")
@@ -1772,6 +1839,8 @@ def insert_request_row(
     notify: bool = True,
     background_tasks: Optional[BackgroundTasks] = None,
     emit: bool = True,
+    itinerary_source_rid: Optional[int] = None,
+    source_trip_end_date: Optional[date] = None,
 ):
     """
     Validate and insert a new request row.
@@ -1779,6 +1848,10 @@ def insert_request_row(
     When ``commit=False``, the row is flushed onto the shared session without
     committing or closing — safe for reopen's outer transaction.
     When ``commit=True`` (default), behaves like the public create_request path.
+
+    PR51: sightseeing requests carry ``itinerary`` (validated + persisted in the
+    same transaction). ``itinerary_source_rid`` clones an existing itinerary
+    instead (reopen path) and skips itinerary validation.
     """
     try:
         if user_id is not None:
@@ -1804,7 +1877,27 @@ def insert_request_row(
         if not existing_customer:
             return EmailErrorResponse(message="CUSTOMER_NOT_FOUND")
 
-        existing_request = db.query(Request).filter(
+        sightseeing_type_id = get_sightseeing_request_type_id(db)
+        is_sightseeing = (
+            sightseeing_type_id is not None and request_type == sightseeing_type_id
+        )
+        validated_itinerary = None
+        if itinerary_source_rid is None:
+            try:
+                validated_itinerary = validate_itinerary(
+                    db,
+                    request_type=create_data.requestType,
+                    itinerary=create_data.itinerary,
+                    from_location=create_data.fromLocation,
+                    from_landmark=create_data.fromLandmark,
+                    pick_up_date=create_data.pickUpDate,
+                    pick_up_time=create_data.pickUpTime,
+                    now=_now_ist_naive(),
+                )
+            except ItineraryError as e:
+                return EmailErrorResponse(message=e.code, error=e.detail)
+
+        duplicate_filters = [
             Request.fromLocation == create_data.fromLocation.strip(),
             Request.toLocation == create_data.toLocation.strip(),
             Request.pickUpDate == create_data.pickUpDate,
@@ -1813,10 +1906,23 @@ def insert_request_row(
             Request.noOfKids == create_data.noOfKids,
             Request.carType == (create_data.carType.strip() if create_data.carType else None),
             Request.requestStatus == STATUS_BID_OPEN,
-        ).first()
+        ]
+        if is_sightseeing:
+            duplicate_filters.append(Request.requestType == sightseeing_type_id)
+        elif sightseeing_type_id is not None:
+            duplicate_filters.append(
+                or_(Request.requestType.is_(None), Request.requestType != sightseeing_type_id)
+            )
+        existing_request = db.query(Request).filter(*duplicate_filters).first()
 
         if existing_request:
             return EmailErrorResponse(message="REQUEST_ALREADY_PRESENT")
+
+        trip_end_date = None
+        if validated_itinerary is not None:
+            trip_end_date = validated_itinerary.trip_end_date
+        elif itinerary_source_rid is not None and is_sightseeing:
+            trip_end_date = source_trip_end_date
 
         new_request = Request(
             WIZZPNR=wizzpnr,
@@ -1836,11 +1942,17 @@ def insert_request_row(
             requestStatus=request_status,
             customerAppId=persisted_customer_id,
             requestType=request_type,
+            tripEndDate=trip_end_date,
             tableTimestamp=_now_ist_naive(),
         )
 
         db.add(new_request)
         db.flush()
+
+        if validated_itinerary is not None:
+            write_itinerary(db, int(new_request.RID), validated_itinerary)
+        elif itinerary_source_rid is not None and is_sightseeing:
+            clone_itinerary(db, int(itinerary_source_rid), int(new_request.RID))
 
         if not commit:
             # Reopen / nested txn path: caller owns commit; do not emit
@@ -1865,12 +1977,15 @@ def insert_request_row(
                 db,
                 create_data.fromLocation,
                 create_data.toLocation,
+                request_type=sightseeing_type_id if is_sightseeing else None,
             )
             if vendor_ids:
                 background_tasks.add_task(
                     notify_vendors_for_request,
                     vendor_ids,
                     create_data,
+                    request_id=int(new_request.RID),
+                    request_type=request_type,
                 )
 
         return EmailErrorResponse(message="INSERTED")
@@ -2238,6 +2353,8 @@ def get_all_cancelled_requests_for_vendor(
                 pickup_dt,
                 rid,
                 VendorCancelledHistoryItem(
+                    requestType=_history_request_type(req),
+                    tripEndDate=getattr(req, "tripEndDate", None),
                     requestId=rid,
                     requestStatus=str(req.requestStatus),
                     fromLocation=_history_required_location(

@@ -346,8 +346,10 @@ def _normalize_notification_data(
     destination: Optional[str] = None,
     travel_date: Optional[str] = None,
     pickup_time: Optional[str] = None,
+    request_id: Optional[int] = None,
+    request_type: Optional[int] = None,
 ) -> Dict[str, str]:
-    return {
+    data = {
         "title": _safe_str(title),
         "body": _safe_str(body),
         "url": _safe_str(url),
@@ -357,6 +359,11 @@ def _normalize_notification_data(
         "travelDate": _safe_str(travel_date),
         "pickupTime": _safe_str(pickup_time),
     }
+    if request_id is not None:
+        data["rid"] = _safe_str(request_id)
+    if request_type is not None:
+        data["requestType"] = _safe_str(request_type)
+    return data
 
 
 def _build_fcm_message(
@@ -372,6 +379,8 @@ def _build_fcm_message(
     destination: Optional[str] = None,
     travel_date: Optional[str] = None,
     pickup_time: Optional[str] = None,
+    request_id: Optional[int] = None,
+    request_type: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not target_token and not target_topic:
         raise ValueError("Either target_token or target_topic is required")
@@ -385,6 +394,8 @@ def _build_fcm_message(
         destination=destination,
         travel_date=travel_date,
         pickup_time=pickup_time,
+        request_id=request_id,
+        request_type=request_type,
     )
 
     message: Dict[str, Any] = {
@@ -483,6 +494,8 @@ def send_notification_to_token(
     pickup_time: Optional[str] = None,
     notification_type: str = DEFAULT_NOTIFICATION_TYPE,
     sound_file: str = DEFAULT_SOUND_FILE,
+    request_id: Optional[int] = None,
+    request_type: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not fcm_token or not fcm_token.strip():
         return {
@@ -506,6 +519,8 @@ def send_notification_to_token(
             destination=destination,
             travel_date=travel_date,
             pickup_time=pickup_time,
+            request_id=request_id,
+            request_type=request_type,
         )
     except ValueError as e:
         return {

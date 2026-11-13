@@ -502,6 +502,7 @@ def insert_vendor_bid(
                 background_tasks.add_task(
                     notify_customer_new_bid,
                     str(customer_app_id),
+                    request_id=int(bid_data.RID),
                 )
             background_tasks.add_task(
                 notify_other_vendors_new_bid,
@@ -925,6 +926,7 @@ def accept_request_by_vendor(
                 background_tasks.add_task(
                     notify_customer_vendor_accepted,
                     str(customer_app_id),
+                    request_id=int(rid),
                 )
             if losing_vendor_ids:
                 background_tasks.add_task(
@@ -1096,6 +1098,7 @@ def reject_request_by_vendor_pr11(
                     notify_customer_vendor_rejected,
                     str(customer_app_id),
                     reason,
+                    request_id=int(rid),
                 )
             background_tasks.add_task(
                 notify_vendors_bidding_reopened,

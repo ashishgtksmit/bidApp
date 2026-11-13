@@ -32,6 +32,7 @@ class Request(Base):
     customerReviewDone = Column(String(10),default='N',nullable=True)
     requestType = Column(Integer, nullable=True)
     driverAssignedID = Column(Integer, nullable=True)
+    tripEndDate = Column(Date, nullable=True)
     tableTimestamp = Column(TIMESTAMP, nullable=False, server_default=func.current_timestamp(), onupdate=func.current_timestamp())
 
 

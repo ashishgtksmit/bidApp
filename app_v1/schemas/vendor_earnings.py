@@ -39,6 +39,7 @@ class VendorEarningTripItem(BaseModel):
     toLocation: str
     grossAmount: int
     requestStatus: str
+    requestType: Optional[int] = None
 
 
 class VendorEarningsReport(BaseModel):

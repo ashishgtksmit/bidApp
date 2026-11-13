@@ -656,3 +656,19 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
 - Dedicated emission/rollback/FCM tests in `tests/test_pr40_known_party_event_emission.py`.
 - Production `DOMAIN_EVENT_DRIVER_ASSIGNMENT_CHANGED_ENABLED` later enabled 2026-08-12 after canary PASS; **PRE-PRODUCTION ACCEPTED — ACCELERATED RISK-BASED POLICY** 2026-08-12T14:34:08Z (short observation healthy; 48h K2 not claimed).
 
+## PR50–PR58 — Sightseeing requests (2026-11-13)
+
+- **Schema / seed:** `migrations/pr50_sightseeing/` (see the README there). Adds `ob_sightseeing_spots`, `request_itinerary_days`, `request_itinerary_day_spots` and `requesttable.tripEndDate`. Scripts dry-run by default; pass `--apply` to execute.
+- **API:**
+  - `GET /getsightseeingspots?locationCode=`.
+  - `itinerary` on `/insertrequest` and `/updaterequest`; reopen clones it.
+  - Codes `INVALID_ITINERARY` / `SIGHTSEEING_DISABLED`; `SIGHTSEEING_MAX_DAYS` (default 15).
+  - History and earnings responses add `requestType` / `tripEndDate`.
+- **Push:** sightseeing requests target vendors whose `requestTypePreferences` include the type (transfers stay city-only). FCM data adds `rid` / `requestType`.
+- **Launch (feature switch):** `migrations/pr50_sightseeing/launch_sightseeing.py` inserts the `Sightseeing` request type and opts every vendor in. Run the dry run first, then `--apply`. After launch, new vendors get the type by default.
+- **Order:** PR50 apply → FastAPI + worker deploy → Flutter release → launch.
+
+```bash
+/tmp/obvenv/bin/python -m pytest tests/test_pr51_sightseeing_requests.py tests/test_pr58_launch_sightseeing.py -q
+```
+

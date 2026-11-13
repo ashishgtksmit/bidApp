@@ -2,6 +2,8 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import date,time,datetime
 
+from .sightseeing import ItineraryDayIn
+
 
 # -------------------------------- #
 # 🔹 Base Schema (shared fields).  #
@@ -34,6 +36,7 @@ class RequestCreate(RequestBase):
     wizzpnr : Optional[str] = None
     customerAppId : str
     requestStatus : Optional[str] = None
+    itinerary : Optional[List[ItineraryDayIn]] = None
 
 
 # ---------------------------------- #
@@ -99,6 +102,7 @@ class RequestUpdate(BaseModel):
     carrierRequest : Optional[bool] = None
     specialRequest : Optional[str] = None
     bidEndTime : Optional[datetime] = None
+    itinerary : Optional[List[ItineraryDayIn]] = None
 
 
 

@@ -536,6 +536,7 @@ def accept_bid(
                 notify_vendor_bid_accepted,
                 vendor_to_notify,
                 notification_type,
+                request_id=int(rid),
             )
 
         return ErrorResponse(message="UPDATED")

@@ -85,6 +85,13 @@ def _earnings_pickup_datetime(req: Request) -> datetime:
         ) from exc
 
 
+def _request_type_or_none(req: Request) -> Optional[int]:
+    value = getattr(req, "requestType", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _parse_report_date(value: str, field_name: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -317,6 +324,7 @@ def get_vendor_earnings_report(
                 toLocation=str(getattr(req, "toLocation", "") or ""),
                 grossAmount=amount,
                 requestStatus=str(getattr(req, "requestStatus", CONFIRMED_STATUS)),
+                requestType=_request_type_or_none(req),
             )
         )
 

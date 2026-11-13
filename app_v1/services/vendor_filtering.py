@@ -380,20 +380,36 @@ def get_vendors_by_region_ids(
 def get_vendors_for_request(
     db: Session,
     from_location: str,
-    to_location: str
+    to_location: str,
+    request_type: int | None = None,
 ) -> List[str]:
     """
     Core reusable function used by:
     - create_request()
     - admin notifications
     - future targeting logic
+
+    When ``request_type`` is given (sightseeing only, PR53), vendors must also
+    have it in requestTypePreferences. Transfers stay city-only.
     """
 
-    return get_vendors_by_city_preferences(
+    vendor_ids = get_vendors_by_city_preferences(
         db=db,
         from_location=from_location,
         to_location=to_location
     )
+    if request_type is None or not vendor_ids:
+        return vendor_ids
+
+    wanted = str(request_type)
+    allowed = {
+        str(v.userAppId)
+        for v in db.query(User.userAppId, User.requestTypePreferences)
+        .filter(User.userAppId.in_(vendor_ids))
+        .all()
+        if wanted in _split_csv(v.requestTypePreferences)
+    }
+    return [vid for vid in vendor_ids if vid in allowed]
 
 
 def get_vendors_by_tags(

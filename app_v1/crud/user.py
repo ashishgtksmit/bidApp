@@ -36,6 +36,7 @@ from ..utils.common import (
     _parse_id_list_strict,
 )
 from ..utils.vendor_snapshot_refresh import request_vendor_snapshot_refresh
+from .sightseeing import get_sightseeing_request_type_id
 from ..utils.image import upload_image,upload_vendor_profile_picture_azure,azure_blob_upload,azure_blob_delete_by_url
 from ..utils.email import send_email
 from ..utils.fcm import subscribe_token_to_topics, TOPIC_ALL_USERS, TOPIC_ALL_VENDORS, unsubscribe_token_from_topics
@@ -1913,7 +1914,11 @@ def vendor_update_with_kyc(
 
         existing_prefs = _kyc_clean(getattr(user, "requestTypePreferences", None))
         if not existing_prefs:
-            user.requestTypePreferences = "1,2,3,4"
+            default_prefs = "1,2,3,4"
+            sightseeing_type_id = get_sightseeing_request_type_id(db)
+            if sightseeing_type_id is not None and str(sightseeing_type_id) not in default_prefs.split(","):
+                default_prefs = f"{default_prefs},{sightseeing_type_id}"
+            user.requestTypePreferences = default_prefs
 
         user.alsoVendor = True
         user.vendorApproved = preserved_vendor_approved

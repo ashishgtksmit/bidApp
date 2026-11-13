@@ -35,8 +35,10 @@ class CustomerBookingHistoryItem(BaseModel):
     carRegistrationNumber: Optional[str] = None
     carModel: Optional[str] = None
     modelYear: Optional[int] = None
+    requestType: Optional[int] = None
+    tripEndDate: Optional[date] = None
 
-    @field_serializer("pickupDate", "driverDateOfBirth")
+    @field_serializer("pickupDate", "driverDateOfBirth", "tripEndDate")
     def _ser_date(self, value: Optional[date]) -> Optional[str]:
         return value.isoformat() if value is not None else None
 
@@ -71,6 +73,12 @@ class VendorBookingHistoryItem(BaseModel):
     carRegistrationNumber: Optional[str] = None
     carModel: Optional[str] = None
     driverName: Optional[str] = None
+    requestType: Optional[int] = None
+    tripEndDate: Optional[date] = None
+
+    @field_serializer("tripEndDate")
+    def _ser_trip_end(self, value: Optional[date]) -> Optional[str]:
+        return value.isoformat() if value is not None else None
 
     @field_serializer("pickupDate")
     def _ser_date(self, value: date) -> str:
@@ -101,6 +109,12 @@ class VendorCancelledHistoryItem(BaseModel):
     customerDisplayName: str
     customerProfileImageUrl: Optional[str] = None
     cancellationReason: str = ""
+    requestType: Optional[int] = None
+    tripEndDate: Optional[date] = None
+
+    @field_serializer("tripEndDate")
+    def _ser_trip_end(self, value: Optional[date]) -> Optional[str]:
+        return value.isoformat() if value is not None else None
 
     @field_serializer("pickupDate")
     def _ser_date(self, value: date) -> str:

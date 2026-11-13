@@ -189,6 +189,8 @@ class FCMSend(BaseModel):
     pickupTime: Optional[str] = None    
     type: Optional[str] = None
     soundFile: Optional[str] = None
+    requestId: Optional[int] = None
+    requestType: Optional[int] = None
 
 class FCMSendDrivers(FCMSend):
      driverIds : List[str]
