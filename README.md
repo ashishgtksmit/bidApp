@@ -663,6 +663,7 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
   - `GET /getsightseeingspots?locationCode=`.
   - `itinerary` on `/insertrequest` and `/updaterequest`; reopen clones it.
   - Codes `INVALID_ITINERARY` / `SIGHTSEEING_DISABLED`; `SIGHTSEEING_MAX_DAYS` (default 15).
+  - Since 2026-11-13 a new or edited sightseeing request must be exactly 1 day and `toLocation` must equal `fromLocation` (drop landmark may differ); otherwise `INVALID_ITINERARY`. Multi-day / city-to-city trips are for Tours (planned). Existing multi-day rows still load and reopen unchanged.
   - History and earnings responses add `requestType` / `tripEndDate`.
 - **Push:** sightseeing requests target vendors whose `requestTypePreferences` include the type (transfers stay city-only). FCM data adds `rid` / `requestType`.
 - **Launch (feature switch):** `migrations/pr50_sightseeing/launch_sightseeing.py` inserts the `Sightseeing` request type and opts every vendor in. Run the dry run first, then `--apply`. After launch, new vendors get the type by default.

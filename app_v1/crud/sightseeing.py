@@ -134,6 +134,7 @@ def validate_itinerary(
     pick_up_date: date,
     pick_up_time: time,
     now: datetime,
+    to_location: Optional[str] = None,
 ) -> Optional[ValidatedItinerary]:
     """Return the validated itinerary for sightseeing, None for other types.
 
@@ -155,6 +156,12 @@ def validate_itinerary(
     max_days = sightseeing_max_days()
     if len(itinerary) > max_days:
         raise ItineraryError(ERR_INVALID, f"At most {max_days} days are allowed")
+    # Sightseeing is a single day that starts and ends in the base city;
+    # multi-day or city-to-city trips belong to Tours.
+    if len(itinerary) != 1:
+        raise ItineraryError(ERR_INVALID, "Sightseeing is a single day")
+    if to_location is not None and to_location.strip().lower() != (from_location or "").strip().lower():
+        raise ItineraryError(ERR_INVALID, "Sightseeing must start and end in the same city")
 
     days = sorted(itinerary, key=lambda d: d.dayNo)
     if [d.dayNo for d in days] != list(range(1, len(days) + 1)):

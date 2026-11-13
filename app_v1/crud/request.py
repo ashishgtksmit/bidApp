@@ -760,6 +760,7 @@ def update_request(
                     pick_up_date=request_data.pickUpDate,
                     pick_up_time=request_data.pickUpTime,
                     now=_now_ist_naive(),
+                    to_location=request_data.toLocation or existing.toLocation,
                 )
             except ItineraryError as e:
                 return ErrorResponse(message=e.code)
@@ -1893,6 +1894,7 @@ def insert_request_row(
                     pick_up_date=create_data.pickUpDate,
                     pick_up_time=create_data.pickUpTime,
                     now=_now_ist_naive(),
+                    to_location=create_data.toLocation,
                 )
             except ItineraryError as e:
                 return EmailErrorResponse(message=e.code, error=e.detail)

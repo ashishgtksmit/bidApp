@@ -175,7 +175,6 @@ D2 = D1 + timedelta(days=1)
 def _itinerary(**overrides):
     days = [
         {"dayNo": 1, "date": D1.isoformat(), "startTime": "07:00", "pickupLandmark": "Hotel X", "spotIds": [1, 2]},
-        {"dayNo": 2, "date": D2.isoformat(), "startTime": "08:00", "pickupLandmark": "Hotel X", "spotIds": [3]},
     ]
     days = overrides.pop("days", days)
     return days
@@ -256,16 +255,13 @@ def test_insert_sightseeing_persists_itinerary(seeded):
     s = seeded()
     req = s.query(Request).one()
     assert req.requestType == SS_TYPE_ID
-    assert req.tripEndDate == D2
+    assert req.tripEndDate == D1
     days = s.query(RequestItineraryDay).order_by(RequestItineraryDay.dayNo).all()
-    assert [(d.dayNo, d.travelDate, d.pickupLandmark) for d in days] == [
-        (1, D1, "Hotel X"),
-        (2, D2, "Hotel X"),
-    ]
+    assert [(d.dayNo, d.travelDate, d.pickupLandmark) for d in days] == [(1, D1, "Hotel X")]
     loaded = ss.load_itineraries(s, [req.RID])[req.RID]
     assert [sp["NAME"] for sp in loaded[0]["SPOTS"]] == ["Tsomgo Lake", "Baba Mandir"]
     assert loaded[0]["SPOTS"][0]["PERMIT"] is True
-    assert loaded[1]["STARTTIME"] == "08:00:00"
+    assert loaded[0]["STARTTIME"] == "07:00:00"
     s.close()
 
 
@@ -334,10 +330,37 @@ def test_invalid_itineraries(seeded, days):
     s.close()
 
 
+TWO_DAYS = [
+    {"dayNo": 1, "date": D1.isoformat(), "startTime": "07:00", "pickupLandmark": "Hotel X", "spotIds": [1, 2]},
+    {"dayNo": 2, "date": D2.isoformat(), "startTime": "08:00", "pickupLandmark": "Hotel X", "spotIds": [3]},
+]
+
+
 def test_max_days_enforced(seeded, monkeypatch):
     monkeypatch.setenv("SIGHTSEEING_MAX_DAYS", "1")
-    result = _insert(seeded, _create())
+    result = _insert(seeded, _create(itinerary=TWO_DAYS))
     assert result.message == "INVALID_ITINERARY"
+
+
+def test_multi_day_sightseeing_rejected(seeded, monkeypatch):
+    monkeypatch.delenv("SIGHTSEEING_MAX_DAYS", raising=False)
+    result = _insert(seeded, _create(itinerary=TWO_DAYS))
+    assert result.message == "INVALID_ITINERARY"
+    s = seeded()
+    assert s.query(Request).count() == 0
+    s.close()
+
+
+def test_different_drop_city_rejected(seeded):
+    result = _insert(seeded, _create(toLocation="Bagdogra", toLandmark="Bagdogra Airport"))
+    assert result.message == "INVALID_ITINERARY"
+
+
+def test_same_city_different_drop_point_accepted(seeded):
+    assert _insert(seeded, _create(toLocation=" gangtok ", toLandmark="MG Marg")).message == "INSERTED"
+    s = seeded()
+    assert s.query(Request.toLandmark).scalar() == "MG Marg"
+    s.close()
 
 
 def test_default_max_days_is_15(monkeypatch):
@@ -386,6 +409,10 @@ def test_update_replaces_itinerary(seeded):
     assert update_request(seeded(), body, user_id=CUSTOMER_ID).message == "SUCCESS"
     s = seeded()
     assert s.query(Request).one().tripEndDate == D1
+    s.close()
+    moved = body.model_copy(update={"toLocation": "Siliguri"})
+    assert update_request(seeded(), moved, user_id=CUSTOMER_ID).message == "INVALID_ITINERARY"
+    s = seeded()
     loaded = ss.load_itineraries(s, [rid])[rid]
     assert len(loaded) == 1 and [x["NAME"] for x in loaded[0]["SPOTS"]] == ["MG Marg"]
     s.close()
@@ -407,6 +434,9 @@ def test_reopen_clones_itinerary(seeded):
     assert _insert(seeded, _create()).message == "INSERTED"
     s = seeded()
     original = s.query(Request).one()
+    # Legacy multi-day sightseeing (created before the 1-day rule) still reopens as is.
+    s.add(RequestItineraryDay(requestId=original.RID, dayNo=2, travelDate=D2, startTime=time(8, 0), pickupLandmark="Hotel X"))
+    original.tripEndDate = D2
     original.requestStatus = "BOOKING - CANCELLED BY USER"
     original.bidEndTime = datetime.now() + timedelta(days=2)
     s.commit()
