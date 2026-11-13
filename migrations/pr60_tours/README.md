@@ -1,6 +1,6 @@
 # PR60 — Tours (multi-day, city to city)
 
-**Status:** Columns applied to production 2026-11-13; launch rename not applied.
+**Status:** Applied to production 2026-11-13 (columns + launch rename `Tour` → `Tours`).
 
 ## Purpose
 
