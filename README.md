@@ -663,7 +663,7 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
   - `GET /getsightseeingspots?locationCode=`.
   - `itinerary` on `/insertrequest` and `/updaterequest`; reopen clones it.
   - Codes `INVALID_ITINERARY` / `SIGHTSEEING_DISABLED`; `SIGHTSEEING_MAX_DAYS` (default 15).
-  - Since 2026-11-13 a new or edited sightseeing request must be exactly 1 day and `toLocation` must equal `fromLocation` (drop landmark may differ); otherwise `INVALID_ITINERARY`. Multi-day / city-to-city trips are for Tours (planned). Existing multi-day rows still load and reopen unchanged.
+  - Since 2026-11-13 a new or edited sightseeing request must be exactly 1 day and `toLocation` must equal `fromLocation` (drop landmark may differ); otherwise `INVALID_ITINERARY`. Multi-day / city-to-city trips are Tours (PR60, below). Existing multi-day rows still load and reopen unchanged.
   - History and earnings responses add `requestType` / `tripEndDate`.
 - **Push:** sightseeing requests target vendors whose `requestTypePreferences` include the type (transfers stay city-only). FCM data adds `rid` / `requestType`.
 - **Launch (feature switch):** `migrations/pr50_sightseeing/launch_sightseeing.py` inserts the `Sightseeing` request type and opts every vendor in. Run the dry run first, then `--apply`. After launch, new vendors get the type by default.
@@ -685,3 +685,14 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
 /tmp/obvenv/bin/python -m pytest tests/test_pr59_bid_day_prices.py -q
 ```
 
+## PR60 — Tours (multi-day, city to city)
+
+- **Schema:** `migrations/pr60_tours/apply_migration.py` adds nullable `fromLocation`, `toLocation`, `dropLandmark` to `request_itinerary_days` (NULL for sightseeing). Dry run by default; `--apply` to execute. Apply before deploying this API and the worker (both select the columns).
+- **Type / switch:** reuses RTDID 4. Tours is enabled only while the type is named `Tours`; `migrations/pr60_tours/launch_tours.py --apply` renames `Tour` → `Tours` (run last, after the app build).
+- **API:** a tour itinerary is 2..`TOURS_MAX_DAYS` (default 15) days; each day sends `fromLocation`, `toLocation`, optional `dropLandmark`, `spotIds` (may be empty on a travel day). Days must chain (day N starts where day N−1 ended), day 1 starts in `fromLocation`, the last day ends in `toLocation`, cities must exist in `location_details`, a local day needs a spot. Errors use `INVALID_ITINERARY`.
+  - Duplicate check, push targeting (start or end city + type preference), reopen cloning and `dayPrices` work for tours as for sightseeing (`is_itinerary_type`).
+- **Docs:** `open_bid/docs/OPENBID_TOURS.md`.
+
+```bash
+/tmp/obvenv/bin/python -m pytest tests/test_pr60_tours.py -q
+```

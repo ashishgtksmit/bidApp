@@ -389,8 +389,8 @@ def get_vendors_for_request(
     - admin notifications
     - future targeting logic
 
-    When ``request_type`` is given (sightseeing only, PR53), vendors must also
-    have it in requestTypePreferences. Transfers stay city-only.
+    When ``request_type`` is given (sightseeing / tours, PR53 / PR60), vendors
+    must also have it in requestTypePreferences. Transfers stay city-only.
     """
 
     vendor_ids = get_vendors_by_city_preferences(

@@ -32,7 +32,7 @@ from ..schemas.bid_details import (
 from .bid_day_prices import (
     DayPriceError,
     delete_day_prices,
-    is_sightseeing_request,
+    is_itinerary_request,
     load_day_prices,
     save_day_prices,
     validate_day_prices,
@@ -282,7 +282,7 @@ def get_bids_for_request_for_vendor(db: Session, rid: int, user_id: str):
             db,
             rid,
             viewer_user_id=user_id,
-            with_day_prices=is_sightseeing_request(db, request_row),
+            with_day_prices=is_itinerary_request(db, request_row),
         )
     except HTTPException:
         raise
@@ -441,7 +441,7 @@ def insert_vendor_bid(
             db.rollback()
             return ErrorResponse(message="BID ALREADY PRESENT")
 
-        sightseeing = is_sightseeing_request(db, request_row)
+        sightseeing = is_itinerary_request(db, request_row)
         day_amounts = validate_day_prices(db, request_row, bid_data.bidAmount, bid_data.dayPrices)
 
         now = _ist_now_naive()
@@ -613,7 +613,7 @@ def update_vendor_bid(
                 detail="INVALID_BID_STATUS",
             )
 
-        sightseeing = is_sightseeing_request(db, request_row)
+        sightseeing = is_itinerary_request(db, request_row)
         day_amounts = validate_day_prices(db, request_row, body.bidAmount, body.dayPrices)
 
         now = _ist_now_naive()
@@ -743,7 +743,7 @@ def delete_vendor_bid(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Bid not found",
             )
-        if is_sightseeing_request(db, request_row):
+        if is_itinerary_request(db, request_row):
             delete_day_prices(db, bid_id)
 
         new_count = _recompute_no_of_bids(db, rid)
@@ -1100,7 +1100,7 @@ def reject_request_by_vendor_pr11(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Bid delete failed",
             )
-        if is_sightseeing_request(db, request_row):
+        if is_itinerary_request(db, request_row):
             delete_day_prices(db, bid_id)
 
         new_count = _recompute_no_of_bids(db, rid)

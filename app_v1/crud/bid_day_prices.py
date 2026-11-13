@@ -1,8 +1,8 @@
-"""PR59 per-day prices for sightseeing bids.
+"""PR59 per-day prices for sightseeing and (PR60) tour bids.
 
 biddetails.bidAmount stays the total; bid_day_prices holds the optional
 breakdown and biddetails.pricingMode records PER_DAY / TOTAL. Only called for
-sightseeing requests, so transfer bids never touch either object.
+sightseeing / tour requests, so transfer bids never touch either object.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from ..models.bid_day_prices import BidDayPrice
 from ..models.request_table import Request
 from ..models.sightseeing import RequestItineraryDay
-from .sightseeing import is_sightseeing_type
+from .sightseeing import is_itinerary_type
 
 PRICING_PER_DAY = "PER_DAY"
 PRICING_TOTAL = "TOTAL"
@@ -32,8 +32,9 @@ def _reject(detail: str) -> DayPriceError:
     return DayPriceError(detail)
 
 
-def is_sightseeing_request(db: Session, request_row: Request) -> bool:
-    return is_sightseeing_type(db, getattr(request_row, "requestType", None))
+def is_itinerary_request(db: Session, request_row: Request) -> bool:
+    """Sightseeing or tour request (the types that can carry per-day prices)."""
+    return is_itinerary_type(db, getattr(request_row, "requestType", None))
 
 
 def _itinerary_day_count(db: Session, rid: int) -> int:
@@ -58,8 +59,8 @@ def validate_day_prices(
     """
     if not day_prices:
         return None
-    if not is_sightseeing_request(db, request_row):
-        raise _reject("Per-day prices are only allowed for sightseeing requests")
+    if not is_itinerary_request(db, request_row):
+        raise _reject("Per-day prices are only allowed for sightseeing or tour requests")
     days = _itinerary_day_count(db, int(request_row.RID))
     if days < 1 or len(day_prices) != days:
         raise _reject(f"Enter a price for each of the {days} days")

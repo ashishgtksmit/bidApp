@@ -38,6 +38,10 @@ class RequestItineraryDay(Base):
     travelDate = Column(Date, nullable=False)
     startTime = Column(Time, nullable=False)
     pickupLandmark = Column(String(200), nullable=False)
+    # PR60 Tours: per-day route; NULL for sightseeing days.
+    fromLocation = Column(String(100), nullable=True)
+    toLocation = Column(String(100), nullable=True)
+    dropLandmark = Column(String(200), nullable=True)
     createdAt = Column(TIMESTAMP, server_default=func.current_timestamp())
 
 

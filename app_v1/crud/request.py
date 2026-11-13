@@ -35,7 +35,8 @@ from .sightseeing import (
     ItineraryError,
     clone_itinerary,
     delete_itinerary,
-    get_sightseeing_request_type_id,
+    is_itinerary_type,
+    itinerary_type_ids,
     validate_itinerary,
     write_itinerary,
 )
@@ -268,7 +269,7 @@ def _history_pickup_datetime(req: Request) -> datetime:
 
 
 def _history_completion_datetime(req: Request, pickup_dt: datetime) -> datetime:
-    """Pickup for transfers; end of the last itinerary day for sightseeing."""
+    """Pickup for transfers; end of the last itinerary day for sightseeing / tours."""
     trip_end = getattr(req, "tripEndDate", None)
     if isinstance(trip_end, date):
         return datetime.combine(trip_end + timedelta(days=1), time.min)
@@ -743,13 +744,9 @@ def update_request(
         if (existing.noOfBids or 0) > 0:
             return ErrorResponse(message="NO OF BIDS MORE THAN 0")
 
-        sightseeing_type_id = get_sightseeing_request_type_id(db)
-        is_sightseeing = (
-            sightseeing_type_id is not None
-            and existing.requestType == sightseeing_type_id
-        )
+        has_itinerary = is_itinerary_type(db, existing.requestType)
         validated_itinerary = None
-        if is_sightseeing or request_data.itinerary:
+        if has_itinerary or request_data.itinerary:
             try:
                 validated_itinerary = validate_itinerary(
                     db,
@@ -1788,16 +1785,13 @@ def reopen_request(
 
         # Notify eligible vendors after commit (same as normal create).
         try:
-            sightseeing_type_id = get_sightseeing_request_type_id(db)
-            is_sightseeing = (
-                sightseeing_type_id is not None
-                and original.requestType == sightseeing_type_id
-            )
             vendor_ids = get_vendors_for_request(
                 db,
                 create_data.fromLocation,
                 create_data.toLocation,
-                request_type=sightseeing_type_id if is_sightseeing else None,
+                request_type=(
+                    original.requestType if is_itinerary_type(db, original.requestType) else None
+                ),
             )
             if vendor_ids:
                 background_tasks.add_task(
@@ -1878,10 +1872,8 @@ def insert_request_row(
         if not existing_customer:
             return EmailErrorResponse(message="CUSTOMER_NOT_FOUND")
 
-        sightseeing_type_id = get_sightseeing_request_type_id(db)
-        is_sightseeing = (
-            sightseeing_type_id is not None and request_type == sightseeing_type_id
-        )
+        typed_ids = itinerary_type_ids(db)
+        has_itinerary = request_type in typed_ids
         validated_itinerary = None
         if itinerary_source_rid is None:
             try:
@@ -1909,11 +1901,11 @@ def insert_request_row(
             Request.carType == (create_data.carType.strip() if create_data.carType else None),
             Request.requestStatus == STATUS_BID_OPEN,
         ]
-        if is_sightseeing:
-            duplicate_filters.append(Request.requestType == sightseeing_type_id)
-        elif sightseeing_type_id is not None:
+        if has_itinerary:
+            duplicate_filters.append(Request.requestType == request_type)
+        elif typed_ids:
             duplicate_filters.append(
-                or_(Request.requestType.is_(None), Request.requestType != sightseeing_type_id)
+                or_(Request.requestType.is_(None), Request.requestType.notin_(typed_ids))
             )
         existing_request = db.query(Request).filter(*duplicate_filters).first()
 
@@ -1923,7 +1915,7 @@ def insert_request_row(
         trip_end_date = None
         if validated_itinerary is not None:
             trip_end_date = validated_itinerary.trip_end_date
-        elif itinerary_source_rid is not None and is_sightseeing:
+        elif itinerary_source_rid is not None and has_itinerary:
             trip_end_date = source_trip_end_date
 
         new_request = Request(
@@ -1953,7 +1945,7 @@ def insert_request_row(
 
         if validated_itinerary is not None:
             write_itinerary(db, int(new_request.RID), validated_itinerary)
-        elif itinerary_source_rid is not None and is_sightseeing:
+        elif itinerary_source_rid is not None and has_itinerary:
             clone_itinerary(db, int(itinerary_source_rid), int(new_request.RID))
 
         if not commit:
@@ -1979,7 +1971,7 @@ def insert_request_row(
                 db,
                 create_data.fromLocation,
                 create_data.toLocation,
-                request_type=sightseeing_type_id if is_sightseeing else None,
+                request_type=request_type if has_itinerary else None,
             )
             if vendor_ids:
                 background_tasks.add_task(

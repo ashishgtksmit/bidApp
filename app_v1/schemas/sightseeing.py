@@ -22,4 +22,10 @@ class ItineraryDayIn(BaseModel):
     date: dt.date
     startTime: dt.time
     pickupLandmark: str = Field(..., min_length=1, max_length=200)
-    spotIds: List[int] = Field(..., min_length=1)
+    # Sightseeing and local tour days need at least one spot (checked in
+    # validate_itinerary); tour travel days may have none.
+    spotIds: List[int] = Field(default_factory=list)
+    # PR60 Tours only: the day's route and where it ends.
+    fromLocation: Optional[str] = Field(None, max_length=100)
+    toLocation: Optional[str] = Field(None, max_length=100)
+    dropLandmark: Optional[str] = Field(None, max_length=200)

@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 from ..events.outbox import maybe_append_domain_event
 from ..events.registry import EVENT_BID_ACCEPTED
-from .bid_day_prices import is_sightseeing_request, load_day_prices
+from .bid_day_prices import is_itinerary_request, load_day_prices
 
 
 # Customer GET /getallbidsforrequest — only BID - OPEN requests (active review UI).
@@ -221,7 +221,7 @@ def get_bids_for_request(
 
         day_prices = (
             load_day_prices(db, [row[0] for row in bids])
-            if is_sightseeing_request(db, request_row)
+            if is_itinerary_request(db, request_row)
             else {}
         )
         result = []
