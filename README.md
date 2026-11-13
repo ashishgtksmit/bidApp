@@ -672,3 +672,15 @@ Backend ownership hardening for `PUT /fcmtokenupdate`, closing a client-authorit
 /tmp/obvenv/bin/python -m pytest tests/test_pr51_sightseeing_requests.py tests/test_pr58_launch_sightseeing.py -q
 ```
 
+## PR59 — Per-day prices for sightseeing bids
+
+- **Schema:** `migrations/pr59_bid_day_prices/` adds `bid_day_prices` (`bidId`, `dayNo`, `amount`) and `biddetails.pricingMode` (`PER_DAY` / `TOTAL` for sightseeing, NULL for transfers). Dry run by default; `--apply` to execute. Apply before deploying this API.
+- **API:** `/insertbid` and `/updatebid` accept optional `dayPrices` (one amount per itinerary day). `bidAmount` is still required and stays the total, so ranking, wallet, final amount and earnings are unchanged. Omitting `dayPrices` on update switches the bid back to one total price.
+  - Returns message `INVALID_DAY_PRICES` when `dayPrices` is sent for a transfer, the count does not match the itinerary days, or the days do not add up to `bidAmount` (±0.01).
+  - `/getallbidsforrequest` and `/getallbidsforrequestforvendor` add `DAYPRICES` (list, day 1 first; null = one total price).
+  - Deleting a bid or rejecting a booking removes its day rows. Transfer bids never touch the new table or column.
+
+```bash
+/tmp/obvenv/bin/python -m pytest tests/test_pr59_bid_day_prices.py -q
+```
+

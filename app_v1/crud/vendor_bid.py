@@ -29,6 +29,14 @@ from ..schemas.bid_details import (
     VendorCarSummaryResponse,
     VendorRejectBody,
 )
+from .bid_day_prices import (
+    DayPriceError,
+    delete_day_prices,
+    is_sightseeing_request,
+    load_day_prices,
+    save_day_prices,
+    validate_day_prices,
+)
 from ..crud.bid import (
     _as_int_or_zero,
     _as_optional_date,
@@ -176,7 +184,7 @@ def _recompute_no_of_bids(db: Session, rid: int) -> int:
 
 
 def _build_vendor_bid_details(
-    db: Session, rid: int, viewer_user_id: str
+    db: Session, rid: int, viewer_user_id: str, with_day_prices: bool = False
 ) -> list[VendorBidDetail]:
     """Build vendor bid rows; mask competitor name/photo for the viewing vendor."""
     bids = (
@@ -202,6 +210,7 @@ def _build_vendor_bid_details(
     )
 
     viewer = str(viewer_user_id).strip()
+    day_prices = load_day_prices(db, [row[0].BID for row in bids]) if with_day_prices else {}
     result: list[VendorBidDetail] = []
     for (
         bid,
@@ -231,6 +240,7 @@ def _build_vendor_bid_details(
                 CARID=car_id,
                 CARREGNO=car_reg_no,
                 CARMODEL=car_model,
+                DAYPRICES=day_prices.get(int(bid.BID)),
             )
         )
 
@@ -268,7 +278,12 @@ def get_bids_for_request_for_vendor(db: Session, rid: int, user_id: str):
                 detail="Not authorized to view bids for this request",
             )
 
-        return _build_vendor_bid_details(db, rid, viewer_user_id=user_id)
+        return _build_vendor_bid_details(
+            db,
+            rid,
+            viewer_user_id=user_id,
+            with_day_prices=is_sightseeing_request(db, request_row),
+        )
     except HTTPException:
         raise
     except SQLAlchemyError as e:
@@ -426,6 +441,9 @@ def insert_vendor_bid(
             db.rollback()
             return ErrorResponse(message="BID ALREADY PRESENT")
 
+        sightseeing = is_sightseeing_request(db, request_row)
+        day_amounts = validate_day_prices(db, request_row, bid_data.bidAmount, bid_data.dayPrices)
+
         now = _ist_now_naive()
         # bidderID column is Integer in schema — store numeric phone when possible
         try:
@@ -472,6 +490,9 @@ def insert_vendor_bid(
         if bid_id <= 0:
             raise RuntimeError("bid insert did not yield BID id")
 
+        if sightseeing:
+            save_day_prices(db, bid_id, day_amounts)
+
         new_count = _recompute_no_of_bids(db, bid_data.RID)
         db.query(Request).filter(Request.RID == bid_data.RID).update(
             {
@@ -512,6 +533,9 @@ def insert_vendor_bid(
 
         return ErrorResponse(message="INSERTED")
 
+    except DayPriceError as e:
+        db.rollback()
+        return ErrorResponse(message=e.code)
     except HTTPException:
         db.rollback()
         raise
@@ -589,6 +613,9 @@ def update_vendor_bid(
                 detail="INVALID_BID_STATUS",
             )
 
+        sightseeing = is_sightseeing_request(db, request_row)
+        day_amounts = validate_day_prices(db, request_row, body.bidAmount, body.dayPrices)
+
         now = _ist_now_naive()
         updated = (
             db.query(BidDetail)
@@ -607,6 +634,9 @@ def update_vendor_bid(
                 detail="Bid not found",
             )
 
+        if sightseeing:
+            save_day_prices(db, bid_id, day_amounts)
+
         maybe_append_domain_event(
             db,
             event_type=EVENT_BID_UPDATED,
@@ -621,6 +651,9 @@ def update_vendor_bid(
         db.commit()
         return ErrorResponse(message="UPDATED")
 
+    except DayPriceError as e:
+        db.rollback()
+        return ErrorResponse(message=e.code)
     except HTTPException:
         db.rollback()
         raise
@@ -710,6 +743,8 @@ def delete_vendor_bid(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Bid not found",
             )
+        if is_sightseeing_request(db, request_row):
+            delete_day_prices(db, bid_id)
 
         new_count = _recompute_no_of_bids(db, rid)
         db.query(Request).filter(Request.RID == rid).update(
@@ -1065,6 +1100,8 @@ def reject_request_by_vendor_pr11(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Bid delete failed",
             )
+        if is_sightseeing_request(db, request_row):
+            delete_day_prices(db, bid_id)
 
         new_count = _recompute_no_of_bids(db, rid)
         db.query(Request).filter(Request.RID == rid).update(

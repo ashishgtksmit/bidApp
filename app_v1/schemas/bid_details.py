@@ -40,28 +40,57 @@ def _validate_positive_bid_amount(v):
     return float(amount)
 
 
+_MAX_DAY_PRICES = 31
+
+
+def _validate_day_prices(v):
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise ValueError("dayPrices must be a list")
+    if len(v) > _MAX_DAY_PRICES:
+        raise ValueError("dayPrices has too many days")
+    return [_validate_positive_bid_amount(item) for item in v] or None
+
+
 class VendorBidInsert(BaseModel):
-    """Mobile insert body (PR11). Identity/status derived server-side from JWT."""
+    """Mobile insert body (PR11). Identity/status derived server-side from JWT.
+
+    PR59: optional dayPrices (sightseeing only) — one amount per itinerary day,
+    summing to bidAmount. Omitted or null means one total price.
+    """
 
     RID: int
     CARID: int
     bidAmount: float
+    dayPrices: Optional[List[float]] = None
 
     @field_validator("bidAmount", mode="before")
     @classmethod
     def validate_amount(cls, v):
         return _validate_positive_bid_amount(v)
+
+    @field_validator("dayPrices", mode="before")
+    @classmethod
+    def validate_day_prices(cls, v):
+        return _validate_day_prices(v)
 
 
 class BidAmountUpdate(BaseModel):
-    """Body for PUT /updatebid (PR11)."""
+    """Body for PUT /updatebid (PR11). PR59: optional dayPrices as on insert."""
 
     bidAmount: float
+    dayPrices: Optional[List[float]] = None
 
     @field_validator("bidAmount", mode="before")
     @classmethod
     def validate_amount(cls, v):
         return _validate_positive_bid_amount(v)
+
+    @field_validator("dayPrices", mode="before")
+    @classmethod
+    def validate_day_prices(cls, v):
+        return _validate_day_prices(v)
 
 
 class VendorRejectBody(BaseModel):
@@ -174,6 +203,8 @@ class CustomerBidDetail(BaseModel):
     IMAGEVEHICLESIDE: Optional[str] = None
     CAR_TYPE: Optional[str] = None
     CAR_SUB_TYPE: Optional[str] = None
+    # PR59: sightseeing per-day breakdown (day 1 first); null = one total price.
+    DAYPRICES: Optional[List[float]] = None
 
     model_config = {"from_attributes": True}
 
@@ -198,6 +229,7 @@ class VendorBidDetail(BaseModel):
     CARID: Optional[int] = None
     CARREGNO: Optional[str] = None
     CARMODEL: Optional[str] = None
+    DAYPRICES: Optional[List[float]] = None
 
     model_config = {"from_attributes": True}
 

@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 from ..events.outbox import maybe_append_domain_event
 from ..events.registry import EVENT_BID_ACCEPTED
+from .bid_day_prices import is_sightseeing_request, load_day_prices
 
 
 # Customer GET /getallbidsforrequest — only BID - OPEN requests (active review UI).
@@ -218,6 +219,11 @@ def get_bids_for_request(
         if not bids:
             return []
 
+        day_prices = (
+            load_day_prices(db, [row[0] for row in bids])
+            if is_sightseeing_request(db, request_row)
+            else {}
+        )
         result = []
 
         for (
@@ -272,6 +278,7 @@ def get_bids_for_request(
                     IMAGEVEHICLESIDE=image_vehicle_side,
                     CAR_TYPE=car_type,
                     CAR_SUB_TYPE=car_sub_type,
+                    DAYPRICES=day_prices.get(int(bid_id)),
                 )
             except Exception as row_err:
                 print(
@@ -284,6 +291,7 @@ def get_bids_for_request(
                         BIDDERID=str(bidder_id),
                         BIDAMOUNT=_as_float_amount(bid_amount),
                         BIDSTATUS=bid_status,
+                        DAYPRICES=day_prices.get(int(bid_id)),
                     )
                 except Exception as min_err:
                     print(
