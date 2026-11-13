@@ -1,8 +1,9 @@
 # PR50 — Sightseeing schema and spot seed
 
-**Status:** Migration package implemented. Not yet applied to Azure `bidapp`
-(the apply host could not reach `openbid-mysql.mysql.database.azure.com:3306`;
-the Azure MySQL firewall must allow the machine running the scripts).
+**Status:** Applied to Azure `bidapp` on 2026-11-13 (61 spots; audit OK).
+Launch applied the same day (RTDID 3 renamed; 97 vendors opted in; UIDs in
+`launch_applied_2026-11-13.txt`). The apply host's IP must be allowed on the
+`openbid-mysql` firewall.
 
 ## Purpose
 
