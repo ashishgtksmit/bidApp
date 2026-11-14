@@ -1,6 +1,6 @@
 # PR63 — Vendor subscription (Rs 500/month)
 
-**Status:** Not applied.
+**Status:** Applied to production `bidapp` on 2026-11-14 (tables + `purpose` + `MONTHLY` seed).
 
 ## Purpose
 
