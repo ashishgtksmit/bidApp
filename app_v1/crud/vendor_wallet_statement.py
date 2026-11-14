@@ -40,6 +40,7 @@ _TYPE_LABELS = {
     "WITHDRAWAL_FEE": "Withdrawal Fee",
     "WITHDRAWAL_REVERSAL": "Withdrawal Reversed",
     "ADJUSTMENT": "Adjustment",
+    "SUBSCRIPTION": "Vendor Subscription",
 }
 _SIDE_LABELS = {SIDE_CUSTOMER: "Customer", SIDE_VENDOR: "Vendor"}
 

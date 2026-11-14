@@ -99,6 +99,9 @@ class VendorWalletRecharge(Base):
     ops_alerted_at = Column(DateTime, nullable=True)
     # App side the recharge was started from: CUSTOMER / VENDOR.
     source = Column(String(10), nullable=True)
+    # NULL = plain recharge; "SUB:<planCode>" = pay a vendor subscription
+    # from the credited amount once PAID (PR63).
+    purpose = Column(String(20), nullable=True)
     created_at = Column(DateTime, nullable=False)
     paid_at = Column(DateTime, nullable=True)
     updated_at = Column(

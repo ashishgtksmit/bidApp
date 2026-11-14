@@ -29,7 +29,7 @@ from ..crud.driver_manage import (
     update_driver_for_vendor,
     delete_driver_for_vendor,
 )
-from ..crud.vendor_bid import require_active_vendor
+from ..crud.vendor_bid import require_subscribed_active_vendor
 from ..auth.deps import AuthenticatedUser, get_current_user
 from ..models.driver_details import DriverDetail
 from ..utils.driver_otp import (
@@ -157,7 +157,7 @@ def driver_otp_send(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.user_app_id
-    require_active_vendor(db, user_id)
+    require_subscribed_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
 
     purpose = body.purpose.value
@@ -228,7 +228,7 @@ def driver_otp_verify(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.user_app_id
-    require_active_vendor(db, user_id)
+    require_subscribed_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
     purpose = body.purpose.value
     driver_id = body.driverId

@@ -113,6 +113,17 @@ def require_active_vendor(db: Session, user_id: str) -> User:
     return user
 
 
+def require_subscribed_active_vendor(db: Session, user_id: str) -> User:
+    """``require_active_vendor`` plus 403 ``SUBSCRIPTION_REQUIRED`` when
+    PR63 enforcement is on. Only for new-business writes (place / revise bid,
+    add car, add / edit driver); never for reads or fulfilling won trips."""
+    user = require_active_vendor(db, user_id)
+    from .vendor_subscription import require_subscribed_vendor
+
+    require_subscribed_vendor(db, user)
+    return user
+
+
 def _vendor_has_bid_on_request(db: Session, rid: int, vendor_id: str) -> bool:
     return (
         db.query(BidDetail.BID)
@@ -376,7 +387,7 @@ def insert_vendor_bid(
     vendor_id = str(user_id)
 
     try:
-        require_active_vendor(db, user_id)
+        require_subscribed_active_vendor(db, user_id)
 
         request_row = (
             db.query(Request)
@@ -565,7 +576,7 @@ def update_vendor_bid(
     Same-value amount still UPDATEs tableTimestamp and emits the event.
     """
     try:
-        require_active_vendor(db, user_id)
+        require_subscribed_active_vendor(db, user_id)
 
         bid_row = (
             db.query(BidDetail)

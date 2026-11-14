@@ -14,7 +14,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..crud.vendor_bid import require_active_vendor
+from ..crud.vendor_bid import require_active_vendor, require_subscribed_active_vendor
 from ..models.bid_details import BidDetail
 from ..models.car_details import CarDetail
 from ..models.car_type_details import CarTypeDetail
@@ -274,7 +274,7 @@ def insert_car_for_vendor(
     EMAIL_TO = "openbidresourceteam@wizzride.com"
     EMAIL_TO_NAME = "OpenBid Resource Team"
 
-    require_active_vendor(db, user_id)
+    require_subscribed_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
 
     vendor = db.query(User).filter(User.userAppId == vendor_id).first()

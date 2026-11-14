@@ -14,7 +14,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..crud.vendor_bid import require_active_vendor
+from ..crud.vendor_bid import require_active_vendor, require_subscribed_active_vendor
 from ..models.driver_details import DriverDetail
 from ..models.request_table import Request
 from ..schemas.driver_details import (
@@ -155,7 +155,7 @@ def insert_driver_for_vendor(
     user_id: str,
 ) -> Union[EmailErrorResponse, ErrorResponse]:
     """Create driver owned by JWT vendor. Requires CREATE_DRIVER OTP token."""
-    require_active_vendor(db, user_id)
+    require_subscribed_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
 
     driver_name = _clean(driver_data.driverName)
@@ -347,7 +347,7 @@ def update_driver_for_vendor(
     user_id: str,
 ) -> Union[EmailErrorResponse, ErrorResponse]:
     """Update city / phone / optional photo. Phone change requires CHANGE_DRIVER_PHONE token."""
-    require_active_vendor(db, user_id)
+    require_subscribed_active_vendor(db, user_id)
     vendor_id = str(user_id).strip()
 
     driver_id = driver_data.DRIVERID

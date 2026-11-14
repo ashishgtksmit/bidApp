@@ -179,13 +179,17 @@ def create_recharge(
     payload: WalletRechargeCreateRequest,
     *,
     side: str = SIDE_VENDOR,
+    purpose: Optional[str] = None,
 ) -> WalletRechargeOrder:
+    """``purpose`` (PR63) tags the order, e.g. ``SUB:MONTHLY``; the amount
+    is then the server-side plan price, so recharge min/max do not apply."""
     config = _require_enabled_config()
     amount = payload.amountPaise
-    if amount < recharge_min_paise():
-        raise HTTPException(status_code=422, detail="RECHARGE_BELOW_MIN")
-    if amount > recharge_max_paise():
-        raise HTTPException(status_code=422, detail="RECHARGE_ABOVE_MAX")
+    if purpose is None:
+        if amount < recharge_min_paise():
+            raise HTTPException(status_code=422, detail="RECHARGE_BELOW_MIN")
+        if amount > recharge_max_paise():
+            raise HTTPException(status_code=422, detail="RECHARGE_ABOVE_MAX")
 
     try:
         user = load_wallet_owner(db, current_user, side)
@@ -204,7 +208,7 @@ def create_recharge(
         raise _db_error("create_lookup") from None
 
     if existing is not None:
-        if int(existing.amount_paise) != amount:
+        if int(existing.amount_paise) != amount or existing.purpose != purpose:
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_KEY_REUSED")
         if existing.status == STATUS_CREATE_PENDING:
             _open_gateway_order(db, config, existing, user, recover=True)
@@ -228,6 +232,7 @@ def create_recharge(
         environment=config.environment,
         client_idempotency_key=payload.idempotencyKey,
         source=side,
+        purpose=purpose,
         created_at=_ist_now_naive(),
     )
     try:
@@ -383,14 +388,23 @@ def refresh_recharge(
         .with_for_update()
         .first()
     )
-    newly_paid = alert = False
+    newly_paid = alert = subscription_applied = False
     if locked.status in REFRESHABLE:
         _interpret_and_apply(db, locked, order)
         newly_paid = locked.status == STATUS_PAID
         alert = locked.failure_code in REVIEW_FAILURE_CODES and locked.ops_alerted_at is None
         if alert:
             locked.ops_alerted_at = _ist_now_naive()
+        if newly_paid and locked.purpose:
+            from . import vendor_subscription
+
+            subscription_applied = vendor_subscription.apply_paid_order(db, locked)
     db.commit()
+    if subscription_applied:
+        from . import vendor_subscription
+
+        vendor_subscription.queue_activated_push(background_tasks, db, int(locked.user_uid))
+        newly_paid = False
     _queue_side_effects(background_tasks, locked, newly_paid=newly_paid, alert=alert)
     return locked
 
