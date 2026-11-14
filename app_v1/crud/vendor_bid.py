@@ -43,6 +43,10 @@ from ..crud.bid import (
     _bidder_user_join,
     _tag_names_from_csv,
 )
+from ..services.booking_integrity import (
+    assert_not_related_party,
+    assert_vehicle_available,
+)
 from ..services.notifications import (
     notify_customer_new_bid,
     notify_other_vendors_new_bid,
@@ -406,6 +410,9 @@ def insert_vendor_bid(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="INVALID_REQUEST_STATUS",
             )
+
+        # PR64 — block self-deal / related-party place bid.
+        assert_not_related_party(db, request_row.customerAppId, vendor_id)
 
         car = (
             db.query(CarDetail)
@@ -894,6 +901,15 @@ def accept_request_by_vendor(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Bid is not the selected confirmed bid",
             )
+
+        # PR64 — related-party + vehicle overlap at confirmation.
+        assert_not_related_party(db, request_row.customerAppId, vendor_id)
+        assert_vehicle_available(
+            db,
+            car_id=bid_row.CARID,
+            request_row=request_row,
+            exclude_rid=rid,
+        )
 
         final_amount = int(round(_as_float_amount(bid_row.bidAmount)))
         now = _ist_now_naive()

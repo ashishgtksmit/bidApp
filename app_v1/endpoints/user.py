@@ -132,13 +132,14 @@ def user_fcm_token_udpate(
     db: Session = Depends(get_db),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ):
-    """PR36 — JWT-owned FCM token registration (body ``fcmToken`` only)."""
+    """PR36 — JWT-owned FCM token registration; PR64 optional ``deviceId``."""
     user_id = current_user.user_app_id
     return fcm_token_update(
         db,
         user_id=str(user_id).strip(),
         fcm_token=payload.fcmToken,
         auth_subject=current_user.auth_subject,
+        device_id=getattr(payload, "deviceId", None),
     )
 
 # @router.post("/login",response_model=Union[LoginResponse,ErrorResponse])

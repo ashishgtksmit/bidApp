@@ -29,6 +29,10 @@ from zoneinfo import ZoneInfo
 
 from ..events.outbox import maybe_append_domain_event
 from ..events.registry import EVENT_BID_ACCEPTED
+from ..services.booking_integrity import (
+    assert_not_related_party,
+    assert_vehicle_available,
+)
 from .bid_day_prices import is_itinerary_request, load_day_prices
 
 
@@ -483,8 +487,17 @@ def accept_bid(
                 detail="Conflicting confirmed bids",
             )
 
-        now = _ist_now_naive()
+        # PR64 — related-party + vehicle overlap when handshake is sent.
         vendor_to_notify = str(bid_row.bidderID)
+        assert_not_related_party(db, request_row.customerAppId, vendor_to_notify)
+        assert_vehicle_available(
+            db,
+            car_id=bid_row.CARID,
+            request_row=request_row,
+            exclude_rid=rid,
+        )
+
+        now = _ist_now_naive()
 
         request_updated = (
             db.query(Request)

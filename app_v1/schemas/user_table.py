@@ -18,8 +18,11 @@ _FCM_TOKEN_MAX_LENGTH = 4096
 _FCM_TOKEN_REJECT_LITERALS = frozenset({"null", "none", "na"})
 
 
+_DEVICE_ID_MAX_LENGTH = 128
+
+
 class FcmTokenUpdateRequest(BaseModel):
-    """PR36 authenticated FCM token registration body.
+    """PR36 authenticated FCM token registration body (PR64 adds optional deviceId).
 
     JWT ``sub`` selects the user row. Client must not supply ownership fields.
     Extra body fields are rejected.
@@ -28,6 +31,7 @@ class FcmTokenUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     fcmToken: str = Field(..., min_length=1, max_length=_FCM_TOKEN_MAX_LENGTH)
+    deviceId: Optional[str] = Field(default=None, max_length=_DEVICE_ID_MAX_LENGTH)
 
     @field_validator("fcmToken", mode="before")
     @classmethod
@@ -45,6 +49,20 @@ class FcmTokenUpdateRequest(BaseModel):
             raise ValueError("INVALID_FCM_TOKEN")
         if any(ch.isspace() for ch in text):
             raise ValueError("INVALID_FCM_TOKEN")
+        return text
+
+    @field_validator("deviceId", mode="before")
+    @classmethod
+    def validate_device_id(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        if not text:
+            return None
+        if len(text) > _DEVICE_ID_MAX_LENGTH:
+            raise ValueError("INVALID_DEVICE_ID")
+        if any(ord(ch) < 32 for ch in text):
+            raise ValueError("INVALID_DEVICE_ID")
         return text
     
 class User(TrimmedBaseModel):
@@ -261,6 +279,22 @@ class UserLogin(TrimmedBaseModel):
     userAppId : str
     password : str
     fcmToken : Optional[str] = None
+    # PR64 — optional install device id for related-party matching.
+    deviceId: Optional[str] = Field(default=None, max_length=_DEVICE_ID_MAX_LENGTH)
+
+    @field_validator("deviceId", mode="before")
+    @classmethod
+    def validate_login_device_id(cls, v):
+        if v is None:
+            return None
+        text = str(v).strip()
+        if not text:
+            return None
+        if len(text) > _DEVICE_ID_MAX_LENGTH:
+            raise ValueError("INVALID_DEVICE_ID")
+        if any(ord(ch) < 32 for ch in text):
+            raise ValueError("INVALID_DEVICE_ID")
+        return text
 
 
 class OtpVerifyRequest(TrimmedBaseModel):

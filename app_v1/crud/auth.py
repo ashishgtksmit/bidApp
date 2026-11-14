@@ -32,6 +32,7 @@ from ..schemas.user_table import (
     UserCreate,
     UserLogin,
 )
+from ..services.booking_integrity import upsert_user_device
 from ..utils.common import EmailErrorResponse
 from ..utils.rate_limit import enforce_rate_limit
 from ..utils.security import verify_and_update_password
@@ -180,6 +181,13 @@ def login_user_auth(
         incoming_fcm = (login_data.fcmToken or "").strip()
         if incoming_fcm:
             user.fcmToken = incoming_fcm
+        # PR64 — optional install device binding (related-party matching).
+        upsert_user_device(
+            db,
+            user_app_id,
+            getattr(login_data, "deviceId", None),
+            flush=True,
+        )
         ensure_auth_subject_id(user)
         user.tableTimestamp = func.current_timestamp()
         db.commit()

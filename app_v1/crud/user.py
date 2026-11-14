@@ -597,10 +597,13 @@ def fcm_token_update(
     user_id: str,
     fcm_token: str,
     auth_subject: str | None = None,
+    device_id: str | None = None,
 ):
     """PR36 — JWT-owned FCM token set. Does not bump tableTimestamp.
 
     PR38: rate-limit bucket uses hashed auth_subject when provided (never raw).
+    PR64: optional deviceId upsert for related-party matching (even when FCM
+    token is unchanged).
     """
     jwt_sub = str(user_id or "").strip()
     cleaned_token = str(fcm_token or "").strip()
@@ -613,6 +616,8 @@ def fcm_token_update(
         )
 
     try:
+        from ..services.booking_integrity import upsert_user_device
+
         user = (
             db.query(User)
             .filter(User.userAppId == jwt_sub)
@@ -628,6 +633,8 @@ def fcm_token_update(
 
         stored = (user.fcmToken or "").strip()
         if stored == cleaned_token:
+            upsert_user_device(db, jwt_sub, device_id, flush=True)
+            db.commit()
             _logger.info(
                 "fcm_token_update_same_value user_hash=%s",
                 _safe_user_hash(limit_identity),
@@ -649,6 +656,7 @@ def fcm_token_update(
             )
 
         user.fcmToken = cleaned_token
+        upsert_user_device(db, jwt_sub, device_id, flush=True)
         # FCM registration is infrastructure state — do not bump tableTimestamp.
         db.commit()
         db.refresh(user)

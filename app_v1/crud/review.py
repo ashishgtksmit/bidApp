@@ -39,6 +39,7 @@ from ..schemas.vendor_reviews import (
     ReviewInsertResponse,
     VendorReviewSummaryResponse,
 )
+from ..services.booking_integrity import assert_not_related_party
 from ..utils.vendor_snapshot_refresh import request_snapshot_refresh
 
 logger = logging.getLogger(__name__)
@@ -456,6 +457,9 @@ def create_vendor_review(
             )
         target_vendor_id = won_by
 
+        # PR64 — block review farming via related-party trips.
+        assert_not_related_party(db, reviewer, won_by)
+
         _assert_trip_eligible(request_row)
 
         existing = (
@@ -561,6 +565,9 @@ def insert_customer_review(
                 detail="TARGET_NOT_FOUND",
             )
         target_customer_id = customer_id
+
+        # PR64 — block review farming via related-party trips.
+        assert_not_related_party(db, customer_id, reviewer)
 
         _assert_trip_eligible(request_row)
 
