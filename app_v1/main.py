@@ -33,7 +33,12 @@ from .models import driver_otp as _driver_otp_models  # noqa: F401
 # Ensure PR63 vendor subscription tables are registered before create_all.
 from .models import vendor_subscription as _vendor_subscription_models  # noqa: F401
 # Ensure PR47 vendor wallet tables are registered before create_all.
-from .models import vendor_wallet as _vendor_wallet_models  # noqa: F401import traceback
+from .models import vendor_wallet as _vendor_wallet_models  # noqa: F401
+# Admin Console (/admin/v1): registers admin_users + admin_audit_log.
+from .admin import admin_router
+from .admin import models as _admin_models  # noqa: F401
+import os
+import traceback
 
 
 @asynccontextmanager
@@ -54,6 +59,11 @@ app = FastAPI(title="OpenBid", lifespan=_lifespan)
 origins = [
     "http://localhost:4200",   # Angular dev
     # add prod origins here later
+] + [
+    # Admin Console origin(s), comma-separated App Setting.
+    o.strip()
+    for o in os.getenv("ADMIN_CONSOLE_ORIGINS", "").split(",")
+    if o.strip()
 ]
 
 app.add_middleware(
@@ -79,6 +89,7 @@ app.include_router(chat_router, tags=['Chat'])
 app.include_router(vendor_wallet_router, tags=['Wallet'])
 app.include_router(customer_wallet_router, tags=['Wallet'])
 app.include_router(vendor_subscription_router, tags=['Subscription'])
+app.include_router(admin_router)
 
 Base.metadata.create_all(bind=engine)
 
